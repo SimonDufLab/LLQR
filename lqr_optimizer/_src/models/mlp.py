@@ -22,8 +22,8 @@ class DenseLogSoftmax(nn.Module):
     return x
 
 def create_mlp(num_classes: int) -> nn.Module:
-  layers = [DenseRelu(10),
-            DenseRelu(128),
+  layers = [DenseRelu(100),
+            DenseRelu(300),
             DenseLogSoftmax(num_classes)]
   return EnhancedSequential(layers)
 

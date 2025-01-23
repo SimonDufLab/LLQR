@@ -10,6 +10,7 @@ import optax
 import tensorflow as tf
 import tensorflow_datasets as tfds
 from flax.training import train_state
+from aim import Run
 
 from lqr_optimizer._src.models.mlp import create_mlp
 from lqr_optimizer._src.preconditioner import BasePreconditioner
@@ -87,16 +88,59 @@ def compute_batch_accuracy(params, apply_fn, x_batch, y_batch):
   accuracy = (correct_predictions / y_batch.shape[0]) * 100
   return accuracy
 
+def compute_accuracy(params, apply_fn, dataloader):
+  """
+  Computes accuracy for the given model parameters and dataloader.
+
+  Args:
+      params: Model parameters.
+      model: Flax model.
+      dataloader: DataLoader for the dataset.
+
+  Returns:
+      Accuracy as a percentage (float).
+  """
+  correct_predictions = 0
+  total_samples = 0
+
+  for x_batch, y_batch in dataloader:
+    # Compute model predictions
+    batch_size = y_batch.shape[0]
+    correct_predictions += compute_batch_accuracy(params, apply_fn, x_batch, y_batch) * batch_size
+    total_samples += batch_size
+    if total_samples >= 10000:
+      break
+
+  # Compute accuracy as a percentage
+  accuracy = (correct_predictions / total_samples)
+  return accuracy
+
 
 def main():
+  # Initialize aim for logging
+  run = Run()
   # Hyperparameters
   batch_size = 128
   learning_rate = 1e-2
   momentum = 0.9
-  t = 2000  # total training iterations
+  t = 5000  # total training iterations
   update_preconditioner_every = 500  # k: update the preconditioner every k steps
-  precond_steps = 20  # how many gradient steps to take on the preconditioner
-  precond_lr = 1e-3  # learning rate for the preconditioner's ADAM
+  precond_steps = 25  # how many gradient steps to take on the preconditioner
+  precond_lr = 1e-1  # learning rate for the preconditioner's ADAM
+  test_eval_freq = 500
+  use_preconditioner = True
+
+  run["hparams"] = {
+    "learning_rate": learning_rate,
+    "batch_size": batch_size,
+    "momentum": momentum,
+    "update_preconditioner_every": update_preconditioner_every,
+    "precond_steps": precond_steps,
+    "precond_lr": precond_lr,
+    "total_steps": t,
+    "test_eval_freq": test_eval_freq,
+    "use_preconditioner": use_preconditioner,
+  }
 
   # 1) Create MNIST data generator
   dataloader = prepare_dataloader(batch_size=batch_size, train=True)
@@ -114,6 +158,7 @@ def main():
 
   # 4) Create the main optimizer (SGD with momentum)
   model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
+  # model_optimizer = optax.adam(learning_rate=learning_rate)
 
   # Prepare the train state for the model parameters
   # (Using Flax's train_state for convenience)
@@ -126,9 +171,18 @@ def main():
   # 5) Create the BasePreconditioner
   block_structure = 'diagonal'
   block_structure_init = 'identity'
-  optax_solver_for_precond = optax.adam(precond_lr)
-  # optax_solver_for_precond = optax.sgd(precond_lr, momentum=momentum)
+  precond_solver = "adam"
+  if precond_solver == "adam":
+    optax_solver_for_precond = optax.adam(precond_lr)
+  elif precond_solver == "momentum":
+    optax_solver_for_precond = optax.sgd(precond_lr, momentum=momentum)
+  elif precond_solver == "sgd":
+    optax_solver_for_precond = optax.sgd(precond_lr)
   multibatch_training = False # Use multiple batches for a single preconditioner update or not
+
+  run["hparams"].update({"block_structure": block_structure,
+                         "block_structure_init": block_structure_init,
+                         "multibatch_training": multibatch_training})
 
   # Initialize BasePreconditioner
   preconditioner = BasePreconditioner(
@@ -139,7 +193,7 @@ def main():
     model=model,
     network_params=params,
     optax_solver=optax_solver_for_precond,
-    damping=1.0,
+    damping=0.0,
     divergence_args_index=-1
   )
 
@@ -159,7 +213,7 @@ def main():
 
   for step in range(t):
     # Possibly update the preconditioner every `update_preconditioner_every` steps
-    if step % update_preconditioner_every == 0:
+    if (step % update_preconditioner_every) == 0 and use_preconditioner:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
       preconditioner.update_preconditioner(state.params, precond_steps, data_iter, multibatch_training)
@@ -177,14 +231,22 @@ def main():
     state = state.apply_gradients(grads=precond_grads)
 
     # Logging or testing every so often
-    if step % 200 == 0:
+    if step % 10 == 0:
       # Simple logging
       train_loss = loss_to_params(state.params, model.apply, x_batch, y_batch)
       elapsed_time = time.time() - start_time  # Calculate elapsed time
-      print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
+      run.track(train_loss, name="train loss", step=step)
       # Compute batch accuracy
       batch_accuracy = compute_batch_accuracy(state.params, model.apply, x_batch, y_batch)
-      print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
+      run.track(batch_accuracy, name="train accuracy", step=step)
+      if step % 200 == 0:
+        # Print info
+        print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
+        print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
+    if step % test_eval_freq == 0:
+      test_accuracy = compute_accuracy(state.params, model.apply, test_dataloader)
+      run.track(test_accuracy, name="test accuracy", step=step)
+
 
   print("Training complete!")
   # End timer
