@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
-from pip._internal import network
 
 from lqr_optimizer._src.utils.utils import normalize_gradient
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
@@ -115,7 +114,7 @@ class BasePreconditioner(abc.ABC):
           precond_grad = jax.grad(lqr_cost, argnums=0)(preconditioner)
           _update, opt_state = optax_solver.update(precond_grad, opt_state)
           preconditioner = optax.apply_updates(preconditioner, _update)
-        return preconditioner
+        return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), preconditioner)
 
     return evaluate_lqr
 
@@ -132,7 +131,7 @@ class BasePreconditioner(abc.ABC):
         # precond_grad = jax.grad(lqr_loss_fn, argnums=0)(self._block_structure.blocks)
         updates, opt_state = self._optax_solver.update(precond_grad, opt_state)
         self._block_structure.update_blocks(optax.apply_updates(self._block_structure.blocks, updates))
-        print(_cost)
+        # print(_cost)
     else:
       update_preconditioner_fn = jax.vmap(self._get_evaluate_lqr(params, self._optax_solver, steps, multibatch), in_axes=(None, (0,0)))
       self._block_structure.update_blocks(jax.tree_map(Partial(jnp.mean, axis=0),

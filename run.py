@@ -121,7 +121,7 @@ def main():
   run = Run()
   # Hyperparameters
   batch_size = 128
-  learning_rate = 1e-2
+  learning_rate = 1e-3
   momentum = 0.9
   t = 5000  # total training iterations
   update_preconditioner_every = 500  # k: update the preconditioner every k steps
@@ -157,8 +157,8 @@ def main():
   print(jax.tree_map(jnp.shape, params))
 
   # 4) Create the main optimizer (SGD with momentum)
-  model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
-  # model_optimizer = optax.adam(learning_rate=learning_rate)
+  # model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
+  model_optimizer = optax.adam(learning_rate=learning_rate)
 
   # Prepare the train state for the model parameters
   # (Using Flax's train_state for convenience)
