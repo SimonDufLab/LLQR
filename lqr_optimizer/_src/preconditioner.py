@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
+from flax.core.frozen_dict import FrozenDict
 
 from lqr_optimizer._src.utils.utils import normalize_gradient
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
@@ -42,25 +43,31 @@ class BasePreconditioner(abc.ABC):
   def apply(self, update):
     return self._block_structure.matrix_product(self._block_structure.blocks, update)
 
-  def _get_evaluate_lqr(self, params, optax_solver=None, steps=1, multibatch=False):
+  def _get_evaluate_lqr(self, params, optax_solver=None, steps=1, multibatch=False, other_model_variables=FrozenDict({})):
     def compute_loss(_params, x, y):
-      return self._loss_fn(self._model_apply({'params': _params}, x), y)
+      return self._loss_fn(self._model_apply({'params': _params}|other_model_variables, x), y)
 
     if multibatch:
       @jax.jit
       def evaluate_lqr(preconditioner, datapoint):
         inputs, targets = datapoint
-        a, b, a_transpose, states =lqr_forward_matrices_and_states(inputs, params, self._layer_apply, self._layer_names)
+        a, b, a_transpose, states =lqr_forward_matrices_and_states(inputs, params, self._layer_apply, self._layer_names,
+                                                                   other_model_variables)
+        if self._divergence_args_index is not None:
+          div_arg = states[self._divergence_args_index]
+        else:
+          div_arg = None
         final_q, final_p, final_lin_cost = lqr_final_costs_and_adjoints(self._loss_fn, states[-1], targets,
                                                                         div_f=self._divergence_function,
-                                                                        div_arg=states[self._divergence_args_index])
+                                                                        div_arg=div_arg)
         final_lin_cost = jnp.atleast_1d(final_lin_cost)
         q_backward, r_backward, m_backward, m_transpose_backward = lqr_backward_matrices_and_adjoints(params, states,
                                                                                                       final_p,
                                                                                                       a_transpose,
                                                                                                       self._layer_apply,
                                                                                                       self._layer_names,
-                                                                                                      self._damping)
+                                                                                                      self._damping,
+                                                                                                      other_model_variables)
         gradients = jax.grad(compute_loss, argnums=0)(params, inputs, targets)
         gradients = normalize_gradient(gradients)
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
@@ -81,17 +88,22 @@ class BasePreconditioner(abc.ABC):
       def evaluate_lqr(preconditioner, datapoint):
         inputs, targets = datapoint
         a, b, a_transpose, states = lqr_forward_matrices_and_states(inputs, params, self._layer_apply,
-                                                                    self._layer_names)
+                                                                    self._layer_names, other_model_variables)
+        if self._divergence_args_index is not None:
+          div_arg = states[self._divergence_args_index]
+        else:
+          div_arg = None
         final_q, final_p, final_lin_cost = lqr_final_costs_and_adjoints(self._loss_fn, states[-1], targets,
                                                                         div_f=self._divergence_function,
-                                                                        div_arg=states[self._divergence_args_index])
+                                                                        div_arg=div_arg)
         final_lin_cost = jnp.atleast_1d(final_lin_cost)
         q_backward, r_backward, m_backward, m_transpose_backward = lqr_backward_matrices_and_adjoints(params, states,
                                                                                                       final_p,
                                                                                                       a_transpose,
                                                                                                       self._layer_apply,
                                                                                                       self._layer_names,
-                                                                                                      self._damping)
+                                                                                                      self._damping,
+                                                                                                      other_model_variables)
         gradients = jax.grad(compute_loss, argnums=0)(params, inputs, targets)
         gradients = normalize_gradient(gradients)
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
@@ -118,10 +130,10 @@ class BasePreconditioner(abc.ABC):
 
     return evaluate_lqr
 
-  def update_preconditioner(self, params, steps, dataloader, multibatch=False):
+  def update_preconditioner(self, params, steps, dataloader, multibatch=False, other_model_variables=FrozenDict({})):
     """params is the current weights of the NN"""
     if multibatch:
-      lqr_loss_fn = lambda x, y : jnp.mean(jax.vmap(self._get_evaluate_lqr(params, multibatch=True), in_axes=(None, (0,0)))(x, y))
+      lqr_loss_fn = lambda x, y : jnp.mean(jax.vmap(self._get_evaluate_lqr(params, multibatch=True, other_model_variables=other_model_variables), in_axes=(None, (0,0)))(x, y))
       # lqr_loss_fn = lambda x: jnp.mean(jax.vmap(self._get_evaluate_lqr, in_axes=(None, (0,0)))(params, next(dataloader))(x))
       # reinitialize the optimizer state every time:
       opt_state = self._optax_solver.init(self._block_structure.blocks)
@@ -133,9 +145,10 @@ class BasePreconditioner(abc.ABC):
         self._block_structure.update_blocks(optax.apply_updates(self._block_structure.blocks, updates))
         # print(_cost)
     else:
-      update_preconditioner_fn = jax.vmap(self._get_evaluate_lqr(params, self._optax_solver, steps, multibatch), in_axes=(None, (0,0)))
+      update_preconditioner_fn = jax.vmap(self._get_evaluate_lqr(params, self._optax_solver, steps, multibatch=multibatch, other_model_variables=other_model_variables), in_axes=(None, (0,0)))
       self._block_structure.update_blocks(jax.tree_map(Partial(jnp.mean, axis=0),
                                                        update_preconditioner_fn(self._block_structure.blocks,
                                                                                 next(dataloader))))
 
-    print(self._block_structure.blocks["layers_2"])
+    # print(self._block_structure.blocks["layers_2"])
+    # print(self._block_structure.blocks)

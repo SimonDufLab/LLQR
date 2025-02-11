@@ -1,0 +1,158 @@
+"""Python script to run experiments on single layer function to test the validity of the lqr approximation"""
+import os
+import time
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
+
+import jax
+import jax.numpy as jnp
+import optax
+from flax.training import train_state
+from aim import Run
+from jax.tree_util import Partial
+
+from lqr_optimizer._src.models.single_layer_functions import *
+from lqr_optimizer._src.preconditioner import BasePreconditioner
+
+def loss_fn(y, target):
+  return jnp.sum(y)
+
+def loss_to_params(params, apply_fn, x, y):
+  return loss_fn(apply_fn({'params': params}, x), y)
+
+model_dict = {"rosenbrock": get_rosenbrock_model_and_datagen,
+              "ackley": get_ackley_model_and_datagen,
+              "goldstein_price": get_goldsteinprice_model_and_datagen}
+
+def main():
+  # Initialize aim for logging
+  problem_type = "rosenbrock"
+
+  log_path = "./single-layer-test"
+  run = Run(repo=log_path, experiment=problem_type)
+  # Hyperparameters
+  batch_size = 1
+  learning_rate = 1e-3
+  momentum = 0.0
+  optimizer = "sgd"
+  t = 5000  # total training iterations
+  update_preconditioner_every = 500  # k: update the preconditioner every k steps
+  precond_steps = 25  # how many gradient steps to take on the preconditioner
+  precond_lr = 1e-1  # learning rate for the preconditioner's ADAM
+  test_eval_freq = 500
+  use_preconditioner = True
+
+  optimizer_dict = {"sgd": Partial(optax.sgd, momentum=momentum),
+                    "adam": optax.adam, }
+
+  # Create model
+  model, dataloader = model_dict[problem_type]()
+
+  # Initialize model parameters
+  rng = jax.random.PRNGKey(42)
+  dummy_x = jnp.ones((1, 28 * 28))  # dummy input for shape inference
+  params = model.init(rng, dummy_x)['params']
+  print(jax.tree_map(jnp.shape, params))
+
+  # Create the optimizer
+  model_optimizer = optimizer_dict[optimizer](learning_rate)
+
+  # Prepare the train state for the model parameters
+  # (Using Flax's train_state for convenience)
+  state = train_state.TrainState.create(
+    apply_fn=model.apply,
+    params=params,
+    tx=model_optimizer
+  )
+
+  # 5) Create the BasePreconditioner
+  block_structure = 'dense'
+  block_structure_init = 'identity'
+  precond_solver = "adam"
+  if precond_solver == "adam":
+    optax_solver_for_precond = optax.adam(precond_lr)
+  elif precond_solver == "momentum":
+    optax_solver_for_precond = optax.sgd(precond_lr, momentum=momentum)
+  elif precond_solver == "sgd":
+    optax_solver_for_precond = optax.sgd(precond_lr)
+  multibatch_training = False  # Use multiple batches for a single preconditioner update or not
+
+  run["hparams"] = {
+    "learning_rate": learning_rate,
+    "batch_size": batch_size,
+    "momentum": momentum,
+    "update_preconditioner_every": update_preconditioner_every,
+    "precond_steps": precond_steps,
+    "precond_lr": precond_lr,
+    "total_steps": t,
+    "test_eval_freq": test_eval_freq,
+    "use_preconditioner": use_preconditioner,
+    "precond_solver": precond_solver,
+    "block_structure": block_structure,
+    "block_structure_init": block_structure_init,
+    "multibatch_training": multibatch_training,
+  }
+
+  # Initialize BasePreconditioner
+  preconditioner = BasePreconditioner(
+    divergence_function=None,
+    loss_fn=loss_fn,
+    block_structure=block_structure,
+    block_structure_init=block_structure_init,
+    model=model,
+    network_params=params,
+    optax_solver=optax_solver_for_precond,
+    damping=0.0,
+    divergence_args_index=None
+  )
+
+  # ---------------------------------------------------------------------------------
+  # Training loop
+  # ---------------------------------------------------------------------------------
+
+  @jax.jit
+  def compute_grad(_params, x, y):
+    """Compute standard gradient of the cross entropy loss."""
+    return jax.grad(loss_to_params, argnums=0)(_params, model.apply, x, y)
+
+  # Start timer
+  start_time = time.time()
+  # We'll keep a local dataloader iterator
+  data_iter = dataloader  # generator
+
+  for step in range(t):
+    # Possibly update the preconditioner every `update_preconditioner_every` steps
+    if (step % update_preconditioner_every) == 0 and use_preconditioner:
+      # The preconditioner update can be run on a mini-batch from the dataloader
+      # We do multiple steps (precond_steps) of "preconditioner training"
+      preconditioner.update_preconditioner(state.params, precond_steps, data_iter, multibatch_training)
+
+    # Grab the next batch for normal training
+    x_batch, y_batch = next(data_iter)
+
+    # 1) Compute the raw gradient
+    grads = compute_grad(state.params, x_batch, y_batch)
+
+    # 2) Apply the preconditioner on the gradient
+    precond_grads = preconditioner.apply(grads)
+
+    # 3) Use the preconditioned gradient to update the model with normal SGD
+    state = state.apply_gradients(grads=precond_grads)
+
+    # Logging or testing every so often
+    if step % 10 == 0:
+      # Simple logging
+      train_loss = loss_to_params(state.params, model.apply, x_batch, y_batch)
+      elapsed_time = time.time() - start_time  # Calculate elapsed time
+      run.track(train_loss, name="train loss", step=step)
+      if step % 200 == 0:
+        # Print info
+        print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
+
+  print("Training complete!")
+  # End timer
+  total_time = time.time() - start_time
+  print(f"Training complete! Total Time Elapsed: {total_time:.2f} seconds")
+
+if __name__ == "__main__":
+  main()

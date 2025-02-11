@@ -12,6 +12,14 @@ class DenseRelu(nn.Module):
     x = nn.Dense(self.channels)(x)
     return nn.relu(x)
 
+class InitDenseRelu(nn.Module):
+  channels: int
+
+  @nn.compact
+  def __call__(self, x):
+    x = x.reshape((x.shape[0], -1))  # Flatten
+    return DenseRelu(self.channels)(x)
+
 class DenseLogSoftmax(nn.Module):
   channels: int
 
@@ -22,7 +30,7 @@ class DenseLogSoftmax(nn.Module):
     return x
 
 def create_mlp(num_classes: int) -> nn.Module:
-  layers = [DenseRelu(100),
+  layers = [InitDenseRelu(100),
             DenseRelu(300),
             DenseLogSoftmax(num_classes)]
   return EnhancedSequential(layers)
