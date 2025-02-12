@@ -1,5 +1,6 @@
 import flax.linen as nn
 import jax.numpy as jnp
+from typing import Tuple
 
 from lqr_optimizer._src.utils.utils import EnhancedSequential
 
@@ -101,7 +102,7 @@ class GlobalAvgPool(nn.Module):
   """Global average pooling over spatial dimensions."""
 
   def __call__(self, x):
-    return jnp.mean(x, axis=(-3, -2))
+    return jnp.mean(x, axis=(-3, -2)) # Using negative index for compatibility in preconditioner vmap
 
 class GPoolDenseLogSoftmax(nn.Module):
   channels: int
@@ -152,40 +153,43 @@ class GPoolDenseLogSoftmax(nn.Module):
 # second half-block.
 # ============================================================================
 
-STARTING_FEATURES = 1 # Lowering down when debugging
+STARTING_FEATURES = 1 # Lowering down when debugging #TODO make configurable with hydra
 
-def create_resnet18(num_classes: int, inference: bool = False ) -> nn.Module:
-  layers = []
-  # Stem and max-pooling
-  layers.append(StemBlock(inference=inference))
-  # layers.append(MaxPool())
+def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
+  def inference_mode(inference: bool):
+    layers = []
+    # Stem and max-pooling
+    layers.append(StemBlock(inference=inference))
+    # layers.append(MaxPool())
 
-  # Group 1: two basic blocks with 64 filters (no downsampling)
-  layers.append(ResidualBlockPart1(features=STARTING_FEATURES, stride=1, inference=inference))
-  layers.append(ResidualBlockPart2(features=STARTING_FEATURES, stride=1, inference=inference))
-  layers.append(ResidualBlockPart1(features=STARTING_FEATURES, stride=1, inference=inference))
-  layers.append(ResidualBlockPart2(features=STARTING_FEATURES, stride=1, inference=inference))
+    # Group 1: two basic blocks with 64 filters (no downsampling)
+    layers.append(ResidualBlockPart1(features=STARTING_FEATURES, stride=1, inference=inference))
+    layers.append(ResidualBlockPart2(features=STARTING_FEATURES, stride=1, inference=inference))
+    layers.append(ResidualBlockPart1(features=STARTING_FEATURES, stride=1, inference=inference))
+    layers.append(ResidualBlockPart2(features=STARTING_FEATURES, stride=1, inference=inference))
 
-  # Group 2: two basic blocks with 128 filters (first block downsamples)
-  layers.append(ResidualBlockPart1(features=STARTING_FEATURES*2, stride=2, inference=inference))
-  layers.append(ResidualBlockPart2(features=STARTING_FEATURES*2, stride=2, inference=inference))
-  layers.append(ResidualBlockPart1(features=STARTING_FEATURES*2, stride=1, inference=inference))
-  layers.append(ResidualBlockPart2(features=STARTING_FEATURES*2, stride=1, inference=inference))
+    # Group 2: two basic blocks with 128 filters (first block downsamples)
+    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*2, stride=2, inference=inference))
+    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*2, stride=2, inference=inference))
+    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*2, stride=1, inference=inference))
+    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*2, stride=1, inference=inference))
 
-  # Group 3: two basic blocks with 256 filters (first block downsamples)
-  layers.append(ResidualBlockPart1(features=STARTING_FEATURES*4, stride=2, inference=inference))
-  layers.append(ResidualBlockPart2(features=STARTING_FEATURES*4, stride=2, inference=inference))
-  layers.append(ResidualBlockPart1(features=STARTING_FEATURES*4, stride=1, inference=inference))
-  layers.append(ResidualBlockPart2(features=STARTING_FEATURES*4, stride=1, inference=inference))
+    # Group 3: two basic blocks with 256 filters (first block downsamples)
+    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*4, stride=2, inference=inference))
+    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*4, stride=2, inference=inference))
+    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*4, stride=1, inference=inference))
+    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*4, stride=1, inference=inference))
 
-  # Group 4: two basic blocks with 512 filters (first block downsamples)
-  layers.append(ResidualBlockPart1(features=STARTING_FEATURES*8, stride=2, inference=inference))
-  layers.append(ResidualBlockPart2(features=STARTING_FEATURES*8, stride=2, inference=inference))
-  layers.append(ResidualBlockPart1(features=STARTING_FEATURES*8, stride=1, inference=inference))
-  layers.append(ResidualBlockPart2(features=STARTING_FEATURES*8, stride=1, inference=inference))
+    # Group 4: two basic blocks with 512 filters (first block downsamples)
+    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*8, stride=2, inference=inference))
+    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*8, stride=2, inference=inference))
+    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*8, stride=1, inference=inference))
+    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*8, stride=1, inference=inference))
 
-  # Global average pooling and final classification layer.
-  # layers.append(GlobalAvgPool())
-  layers.append(GPoolDenseLogSoftmax(num_classes))
+    # Global average pooling and final classification layer.
+    # layers.append(GlobalAvgPool())
+    layers.append(GPoolDenseLogSoftmax(num_classes))
 
-  return EnhancedSequential(layers)
+    return EnhancedSequential(layers)
+
+  return inference_mode(False), inference_mode(True)

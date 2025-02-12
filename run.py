@@ -136,7 +136,7 @@ def main():
   precond_lr = 1e-1  # learning rate for the preconditioner's ADAM
   test_eval_freq = 500
   use_preconditioner = True
-  architecture = "resnet-18" # Currently: mlp or resnet-18
+  architecture = "mlp" # Currently: mlp or resnet-18
 
   run["hparams"] = {
     "learning_rate": learning_rate,
@@ -157,8 +157,9 @@ def main():
 
   # 2) Define model
   num_classes = 10
-  model = model_choice[architecture](num_classes=num_classes)
-  inf_model = model_choice[architecture](num_classes=num_classes, inference=True)
+  model, inf_model = model_choice[architecture](num_classes=num_classes)
+  if inf_model is None:
+    inf_model = model
 
   # 3) Initialize model parameters
   rng = jax.random.PRNGKey(42)
@@ -166,12 +167,13 @@ def main():
   # params = model.init(rng, dummy_x)#['params']
   variables = model.init(rng, dummy_x)
   params = variables['params']
-  batch_stats = variables.get('batch_stats')
+  batch_stats = variables.get('batch_stats', {})
   print(jax.tree_map(jnp.shape, params))
+  print(jax.tree_map(jnp.shape, batch_stats))
 
   # 4) Create the main optimizer (SGD with momentum)
-  # model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
-  model_optimizer = optax.adam(learning_rate=learning_rate)
+  model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
+  # model_optimizer = optax.adam(learning_rate=learning_rate)
 
   # Prepare the train state for the model parameters
   # (Using Flax's train_state for convenience)
