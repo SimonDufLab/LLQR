@@ -127,7 +127,7 @@ def main():
   # Initialize aim for logging
   run = Run()
   # Hyperparameters
-  batch_size = 16
+  batch_size = 128
   learning_rate = 1e-3
   momentum = 0.9
   t = 5000  # total training iterations
@@ -136,7 +136,7 @@ def main():
   precond_lr = 1e-1  # learning rate for the preconditioner's ADAM
   test_eval_freq = 500
   use_preconditioner = True
-  architecture = "mlp" # Currently: mlp or resnet-18
+  architecture = "resnet-18" # Currently: mlp or resnet-18
 
   run["hparams"] = {
     "learning_rate": learning_rate,

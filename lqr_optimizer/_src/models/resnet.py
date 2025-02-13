@@ -153,7 +153,7 @@ class GPoolDenseLogSoftmax(nn.Module):
 # second half-block.
 # ============================================================================
 
-STARTING_FEATURES = 1 # Lowering down when debugging #TODO make configurable with hydra
+STARTING_FEATURES = 64 # Lowering down when debugging #TODO make configurable with hydra
 
 def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
   def inference_mode(inference: bool):
