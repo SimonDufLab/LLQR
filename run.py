@@ -1,6 +1,7 @@
 """Python script to run experiments"""
 import os
 import time
+from platform import architecture
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 
@@ -10,9 +11,10 @@ import optax
 import tensorflow as tf
 import tensorflow_datasets as tfds
 from flax.training import train_state
+from typing import Any, Callable
 from aim import Run
 
-from lqr_optimizer._src.models.mlp import create_mlp
+from lqr_optimizer._src.configs.config import model_choice
 from lqr_optimizer._src.preconditioner import BasePreconditioner
 
 
@@ -33,17 +35,21 @@ def cross_entropy_loss(log_probs, y): #TODO only with respect to output
   nll = -jnp.mean(jnp.sum(jax.nn.one_hot(y, log_probs.shape[-1]) * log_probs, axis=-1))
   return nll
 
-def loss_to_params(params, apply_fn, x, y):
+def loss_eval(state, x, y):
   """
   params: parameters of the model
   apply_fn: function to apply model (Flax typically provides model.apply)
   x: input data
   y: integer class labels
   """
-  log_probs = apply_fn({'params': params}, x)  # shape [batch_size, num_classes]
+  log_probs, new_model_state = state.apply_inf_fn(
+    {'params': state.params, 'batch_stats': state.batch_stats},
+    x,
+    mutable=False
+  )  # shape [batch_size, num_classes]
   # We expect the final layer to produce log-softmax output (as defined in MLP),
 
-  return cross_entropy_loss(log_probs, y)
+  return cross_entropy_loss(log_probs, y), new_model_state
 
 # A small utility to batch the MNIST dataset
 def prepare_dataloader(batch_size=128, train=True):
@@ -59,10 +65,10 @@ def prepare_dataloader(batch_size=128, train=True):
 
   for x_batch, y_batch in ds:
     # Convert TF Tensors -> NumPy arrays (JAX can handle them, but let's be explicit)
-    yield (jnp.array(x_batch.numpy().reshape(-1, 28 * 28)/255, dtype=jnp.float32),
+    yield (jnp.array(x_batch.numpy()/255, dtype=jnp.float32),
            jnp.array(y_batch.numpy(), dtype=jnp.int32))
 
-def compute_batch_accuracy(params, apply_fn, x_batch, y_batch):
+def compute_batch_accuracy(state, x_batch, y_batch):
   """
   Computes accuracy for a single batch.
 
@@ -76,7 +82,8 @@ def compute_batch_accuracy(params, apply_fn, x_batch, y_batch):
       Accuracy for the batch as a percentage (float).
   """
   # Forward pass to compute logits
-  log_probs = apply_fn({'params': params}, x_batch)  # shape [batch_size, num_classes]
+  variables = {'params': state.params, 'batch_stats': state.batch_stats}
+  log_probs = state.apply_inf_fn(variables, x_batch, mutable=False)  # shape [batch_size, num_classes]
 
   # Predicted class (argmax of logits)
   predictions = jnp.argmax(jnp.exp(log_probs), axis=1)
@@ -88,7 +95,7 @@ def compute_batch_accuracy(params, apply_fn, x_batch, y_batch):
   accuracy = (correct_predictions / y_batch.shape[0]) * 100
   return accuracy
 
-def compute_accuracy(params, apply_fn, dataloader):
+def compute_accuracy(state, dataloader):
   """
   Computes accuracy for the given model parameters and dataloader.
 
@@ -106,7 +113,7 @@ def compute_accuracy(params, apply_fn, dataloader):
   for x_batch, y_batch in dataloader:
     # Compute model predictions
     batch_size = y_batch.shape[0]
-    correct_predictions += compute_batch_accuracy(params, apply_fn, x_batch, y_batch) * batch_size
+    correct_predictions += compute_batch_accuracy(state, x_batch, y_batch) * batch_size
     total_samples += batch_size
     if total_samples >= 10000:
       break
@@ -120,7 +127,7 @@ def main():
   # Initialize aim for logging
   run = Run()
   # Hyperparameters
-  batch_size = 128
+  batch_size = 16
   learning_rate = 1e-3
   momentum = 0.9
   t = 5000  # total training iterations
@@ -129,6 +136,7 @@ def main():
   precond_lr = 1e-1  # learning rate for the preconditioner's ADAM
   test_eval_freq = 500
   use_preconditioner = True
+  architecture = "mlp" # Currently: mlp or resnet-18
 
   run["hparams"] = {
     "learning_rate": learning_rate,
@@ -140,6 +148,7 @@ def main():
     "total_steps": t,
     "test_eval_freq": test_eval_freq,
     "use_preconditioner": use_preconditioner,
+    "architecture": architecture,
   }
 
   # 1) Create MNIST data generator
@@ -148,24 +157,36 @@ def main():
 
   # 2) Define model
   num_classes = 10
-  model = create_mlp(num_classes=num_classes)
+  model, inf_model = model_choice[architecture](num_classes=num_classes)
+  if inf_model is None:
+    inf_model = model
 
   # 3) Initialize model parameters
   rng = jax.random.PRNGKey(42)
-  dummy_x = jnp.ones((1, 28 * 28))  # dummy input for shape inference
-  params = model.init(rng, dummy_x)#['params']
+  dummy_x = jnp.ones((1, 28, 28, 1))  # dummy input for shape inference
+  # params = model.init(rng, dummy_x)#['params']
+  variables = model.init(rng, dummy_x)
+  params = variables['params']
+  batch_stats = variables.get('batch_stats', {})
   print(jax.tree_map(jnp.shape, params))
+  print(jax.tree_map(jnp.shape, batch_stats))
 
   # 4) Create the main optimizer (SGD with momentum)
-  # model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
-  model_optimizer = optax.adam(learning_rate=learning_rate)
+  model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
+  # model_optimizer = optax.adam(learning_rate=learning_rate)
 
   # Prepare the train state for the model parameters
   # (Using Flax's train_state for convenience)
-  state = train_state.TrainState.create(
+  class TrainState(train_state.TrainState):
+    apply_inf_fn: Callable
+    batch_stats: Any
+
+  state = TrainState.create(
     apply_fn=model.apply,
+    apply_inf_fn=inf_model.apply,
     params=params,
-    tx=model_optimizer
+    tx=model_optimizer,
+    batch_stats = batch_stats
   )
 
   # 5) Create the BasePreconditioner
@@ -190,7 +211,7 @@ def main():
     loss_fn=cross_entropy_loss,
     block_structure=block_structure,
     block_structure_init=block_structure_init,
-    model=model,
+    model=inf_model,
     network_params=params,
     optax_solver=optax_solver_for_precond,
     damping=0.0,
@@ -201,10 +222,44 @@ def main():
   # Training loop
   # ---------------------------------------------------------------------------------
 
+  # @jax.jit
+  def loss_fn(params, apply_fn, _batch_stats, x, y):
+    # Pass both params and batch_stats, and mark batch_stats as mutable.
+    (log_probs, new_model_state) = apply_fn(
+      {'params': params, 'batch_stats': batch_stats},
+      x,
+      mutable=['batch_stats']
+    )
+    loss = cross_entropy_loss(log_probs, y)
+    return loss, new_model_state
+
   @jax.jit
-  def compute_grad(params, x, y):
+  def compute_updates(params, _batch_stats, x, y):
     """Compute standard gradient of the cross entropy loss."""
-    return jax.grad(loss_to_params, argnums=0)(params, model.apply, x, y)
+    return jax.value_and_grad(loss_fn, argnums=0, has_aux=True)(params, model.apply, _batch_stats, x, y)
+
+  # @jax.jit
+  def train_step(state, x, y):
+    # @jax.jit
+    # def loss_fn(params):
+    #   # Pass both params and batch_stats, and mark batch_stats as mutable.
+    #   (log_probs, new_model_state) = state.apply_fn(
+    #     {'params': params, 'batch_stats': state.batch_stats},
+    #     x,
+    #     mutable=['batch_stats']
+    #   )
+    #   loss = cross_entropy_loss(log_probs, y)
+    #   return loss, new_model_state
+
+    # Compute the loss and gradients. Note: we use has_aux=True to get new_model_state.
+    # (loss, new_model_state), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    (loss, new_model_state), grads = compute_updates(state.params, state.batch_stats, x, y)
+
+    # 2) Apply the preconditioner on the gradient
+    precond_grads = preconditioner.apply(grads)
+
+    new_state = state.apply_gradients(grads=precond_grads, batch_stats=new_model_state['batch_stats'])
+    return new_state, loss
 
   # Start timer
   start_time = time.time()
@@ -216,35 +271,39 @@ def main():
     if (step % update_preconditioner_every) == 0 and use_preconditioner:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
-      preconditioner.update_preconditioner(state.params, precond_steps, data_iter, multibatch_training)
+      preconditioner.update_preconditioner(state.params, precond_steps, data_iter, multibatch_training,
+                                           other_model_variables={'batch_stats': batch_stats})
 
     # Grab the next batch for normal training
     x_batch, y_batch = next(data_iter)
 
-    # 1) Compute the raw gradient
-    grads = compute_grad(state.params, x_batch, y_batch)
+    state, loss = train_step(state, x_batch, y_batch)
 
-    # 2) Apply the preconditioner on the gradient
-    precond_grads = preconditioner.apply(grads)
-
-    # 3) Use the preconditioned gradient to update the model with normal SGD
-    state = state.apply_gradients(grads=precond_grads)
+    # # 1) Compute the raw gradient
+    # (loss, new_model_state), grads = compute_grad(state.params, x_batch, y_batch)
+    #
+    # # 2) Apply the preconditioner on the gradient
+    # precond_grads = preconditioner.apply(grads)
+    #
+    # # 3) Use the preconditioned gradient to update the model with normal SGD
+    # state = state.apply_gradients(grads=precond_grads, batch_stats=new_model_state['batch_stats'])
 
     # Logging or testing every so often
     if step % 10 == 0:
       # Simple logging
-      train_loss = loss_to_params(state.params, model.apply, x_batch, y_batch)
+      # train_loss = loss_eval(state, x_batch, y_batch)
+      train_loss = loss
       elapsed_time = time.time() - start_time  # Calculate elapsed time
       run.track(train_loss, name="train loss", step=step)
       # Compute batch accuracy
-      batch_accuracy = compute_batch_accuracy(state.params, model.apply, x_batch, y_batch)
+      batch_accuracy = compute_batch_accuracy(state, x_batch, y_batch)
       run.track(batch_accuracy, name="train accuracy", step=step)
       if step % 200 == 0:
         # Print info
         print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
     if step % test_eval_freq == 0:
-      test_accuracy = compute_accuracy(state.params, model.apply, test_dataloader)
+      test_accuracy = compute_accuracy(state, test_dataloader)
       run.track(test_accuracy, name="test accuracy", step=step)
 
 

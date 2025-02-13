@@ -91,9 +91,9 @@ class EnhancedSequential(nn.Module):
         - layer_names: An ordered list of layer names from the params dictionary.
     """
     # Call the original init method to get parameters
-    params = super().init(rng, *args, **kwargs)
+    variables = super().init(rng, *args, **kwargs)
 
-    return params["params"]
+    return variables
 
   # def apply_block(self, block_name: str, x: Any, params: FrozenDict) -> Any:
   #   """Applies a specific block using its parameters."""

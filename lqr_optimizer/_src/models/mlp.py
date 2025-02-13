@@ -1,6 +1,7 @@
 import jax
 import flax.linen as nn
 import jax.numpy as jnp
+from typing import Tuple
 
 from lqr_optimizer._src.utils.utils import EnhancedSequential
 
@@ -12,6 +13,14 @@ class DenseRelu(nn.Module):
     x = nn.Dense(self.channels)(x)
     return nn.relu(x)
 
+class InitDenseRelu(nn.Module):
+  channels: int
+
+  @nn.compact
+  def __call__(self, x):
+    x = x.reshape((x.shape[0], -1)) if x.ndim == 4 else x.reshape((-1,))  # Flatten, assume BHWC images as input
+    return DenseRelu(self.channels)(x)
+
 class DenseLogSoftmax(nn.Module):
   channels: int
 
@@ -21,11 +30,11 @@ class DenseLogSoftmax(nn.Module):
     x = nn.log_softmax(x)
     return x
 
-def create_mlp(num_classes: int) -> nn.Module:
-  layers = [DenseRelu(100),
+def create_mlp(num_classes: int) -> Tuple[nn.Module, None]:
+  layers = [InitDenseRelu(100),
             DenseRelu(300),
             DenseLogSoftmax(num_classes)]
-  return EnhancedSequential(layers)
+  return EnhancedSequential(layers), None
 
 # class MLP(nn.Module):
 #   num_classes: int

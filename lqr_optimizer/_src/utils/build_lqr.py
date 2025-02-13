@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
+from flax.core.frozen_dict import FrozenDict
 
 from lqr_optimizer._src.utils.utils import vjp_f, add_f
 
@@ -11,7 +12,7 @@ def diag_r(penalty):
   return lambda v: penalty * v  # Equivalent to having R_i as an identity matrix x constant
 
 
-def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names):
+def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, other_model_variables=FrozenDict({})):
   """ Function calculating the A and B matrices (jvp + vjp) of the linear transition layers of the LQR.
   Also store the state variables for each layer application, to use as primal
   """
@@ -21,21 +22,22 @@ def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names):
     # unravel the layers params so that the jacobians have the right dimension, same for state
     layer_params, unravel_params_fn = ravel_pytree(params[layer_name])
     layer_state, unravel_state = ravel_pytree(states[i])
+    layer_other_vars = {k: v.get(layer_name, {}) for k, v in other_model_variables.items()}
 
     # Define a simpler state transition function (layer propagation) for jacobians retrieval
     def simpler_apply(parameters, x):
       # return trans_fn.apply({'params': unravel_params_fn(parameters)}, unravel_state(x))
-      return layers_apply({'params': unravel_params_fn(parameters)}, unravel_state(x), i)
+      return layers_apply({'params': unravel_params_fn(parameters)}|layer_other_vars, unravel_state(x), i)
 
     # Recover next state
     states.append(simpler_apply(layer_params, layer_state))
 
     # Retrieve the vjp and jvp expressions of the jacobians (w/r to state and to controls)
     def partial_apply_inputs(state):
-      return simpler_apply(layer_params, state).ravel()
+      return ravel_pytree(simpler_apply(layer_params, state))[0]
 
     def partial_apply_params(params):
-      return simpler_apply(params, layer_state).ravel()
+      return ravel_pytree(simpler_apply(params, layer_state))[0]
 
     # JVPs
     _, b_fn = jax.linearize(partial_apply_params, layer_params)
@@ -55,11 +57,11 @@ def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_
   """Handle a divergence function, for steepest descent
   """
   if div_f: assert div_arg is not None, "div_arg must not be None when a divergence function is specified"
-  if targets is not None:
-    def loss_fn(outputs):
-      return loss_f(outputs, targets)
-  else:
-    loss_fn = lambda v: loss_f(v)
+  # if targets is not None:
+  def loss_fn(outputs):
+    return loss_f(outputs, targets)
+  # else:
+  #   loss_fn = lambda v: loss_f(v)
 
   grad_fn = jax.grad(loss_fn)
   final_lin_cost = grad_fn(final_states)
@@ -83,7 +85,8 @@ def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_
     return final_q, final_lin_cost, final_lin_cost
 
 
-def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, a_transpose, layers_apply, layer_names, damping):
+def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, a_transpose, layers_apply, layer_names, damping,
+                                       other_model_variables=FrozenDict({})):
   """ Retrieve, in backward order, the Q_i R_i and M_i matrices needed for the resolution of the Riccati equation
   """
   p_backward = [jnp.atleast_1d(final_adjoint)]
@@ -97,14 +100,15 @@ def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, a_transpos
     # unravel the layers params so that the jacobians have the right dimension, same for state
     layer_params, unravel_fn = ravel_pytree(params[layer_name])
     layer_state, unravel_state = ravel_pytree(states[j])
+    layer_other_vars = {k: v.get(layer_name, {}) for k, v in other_model_variables.items()}
 
     # Define a simpler state transition function (layer propagation) for jacobians retrieval
     def simpler_apply(parameters, x):
       # return trans_fn.apply({'params': unravel_fn(parameters)}, unravel_state(x))
-      return layers_apply({'params': unravel_fn(parameters)}, unravel_state(x), j)
+      return layers_apply({'params': unravel_fn(parameters)}|layer_other_vars, unravel_state(x), j)
 
     def hamiltonian(parameters, p_i, x_i):
-      return jnp.dot(simpler_apply(parameters, x_i).ravel(), p_i)
+      return jnp.dot(ravel_pytree(simpler_apply(parameters, x_i))[0], p_i)
 
     p_backward.append(a_transpose[j](p_backward[-1]))
 
