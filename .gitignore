@@ -145,3 +145,7 @@ static
 
 # Logger file from aim
 .aim/
+
+# Cluster slurm files and venv
+slurm*
+py310jax_tf/*
