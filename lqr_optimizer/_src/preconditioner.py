@@ -132,8 +132,9 @@ class BasePreconditioner(abc.ABC):
         local_precond_grad = jax.grad(lqr_cost, argnums=0)(preconditioner)
         return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), local_precond_grad)
 
+      vmapped_evaluate_lqr_grad = jax.vmap(evaluate_lqr_grad, in_axes=(None, (0, 0)))
       def get_precond_grad(preconditioner, datapoint):
-        return jax.tree_map(Partial(jnp.mean, axis=0), jax.vmap(evaluate_lqr_grad, in_axes=(None, (0, 0)))(preconditioner, datapoint))
+        return jax.tree_map(Partial(jnp.mean, axis=0), vmapped_evaluate_lqr_grad(preconditioner, datapoint))
 
       @jax.jit
       def get_update(preconditioner, datapoint):
