@@ -128,7 +128,7 @@ def main():
   run = Run()
   # Hyperparameters
   batch_size = 128
-  learning_rate = 1e-3
+  learning_rate = 1e-2
   momentum = 0.9
   t = 5000  # total training iterations
   update_preconditioner_every = 500  # k: update the preconditioner every k steps
