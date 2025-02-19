@@ -42,14 +42,14 @@ def loss_eval(state, x, y):
   x: input data
   y: integer class labels
   """
-  log_probs, new_model_state = state.apply_inf_fn(
+  log_probs = state.apply_inf_fn(
     {'params': state.params, 'batch_stats': state.batch_stats},
     x,
     mutable=False
   )  # shape [batch_size, num_classes]
   # We expect the final layer to produce log-softmax output (as defined in MLP),
 
-  return cross_entropy_loss(log_probs, y), new_model_state
+  return cross_entropy_loss(log_probs, y)
 
 # A small utility to batch the MNIST dataset
 def prepare_dataloader(batch_size=128, train=True):
@@ -167,9 +167,9 @@ def main():
   # params = model.init(rng, dummy_x)#['params']
   variables = model.init(rng, dummy_x)
   params = variables['params']
-  batch_stats = variables.get('batch_stats', {})
+  init_batch_stats = variables.get('batch_stats', {})
   print(jax.tree_map(jnp.shape, params))
-  print(jax.tree_map(jnp.shape, batch_stats))
+  print(jax.tree_map(jnp.shape, init_batch_stats))
 
   # 4) Create the main optimizer (SGD with momentum)
   model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
@@ -186,7 +186,7 @@ def main():
     apply_inf_fn=inf_model.apply,
     params=params,
     tx=model_optimizer,
-    batch_stats = batch_stats
+    batch_stats = init_batch_stats
   )
 
   # 5) Create the BasePreconditioner
@@ -214,6 +214,8 @@ def main():
     model=inf_model,
     network_params=params,
     optax_solver=optax_solver_for_precond,
+    preconditioner_update_steps=precond_steps,
+    multibatch=multibatch_training,
     damping=0.0,
     divergence_args_index=-1
   )
@@ -226,7 +228,7 @@ def main():
   def loss_fn(params, apply_fn, _batch_stats, x, y):
     # Pass both params and batch_stats, and mark batch_stats as mutable.
     (log_probs, new_model_state) = apply_fn(
-      {'params': params, 'batch_stats': batch_stats},
+      {'params': params, 'batch_stats': _batch_stats},
       x,
       mutable=['batch_stats']
     )
@@ -271,8 +273,8 @@ def main():
     if (step % update_preconditioner_every) == 0 and use_preconditioner:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
-      preconditioner.update_preconditioner(state.params, precond_steps, data_iter, multibatch_training,
-                                           other_model_variables={'batch_stats': batch_stats})
+      preconditioner.update_preconditioner(state.params, data_iter,
+                                           other_model_variables={'batch_stats': state.batch_stats})
 
     # Grab the next batch for normal training
     x_batch, y_batch = next(data_iter)
@@ -304,7 +306,15 @@ def main():
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
     if step % test_eval_freq == 0:
       test_accuracy = compute_accuracy(state, test_dataloader)
+      x_test, y_test = next(test_dataloader)
+      test_loss = loss_eval(state, x_test, y_test)
+      elapsed_time = time.time() - start_time
       run.track(test_accuracy, name="test accuracy", step=step)
+      run.track(test_loss, name="test loss", step=step)
+      print("============================")
+      print(f"Step {step} | Test Loss: {test_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
+      print(f"Step {step} | Test Accuracy: {test_accuracy:.2f}%")
+      print("============================")
 
 
   print("Training complete!")
