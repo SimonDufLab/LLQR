@@ -1,4 +1,5 @@
 """ Various utilities functions for LQR optimization"""
+import time
 import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
@@ -124,3 +125,22 @@ class EnhancedSequential(nn.Module):
   def apply_block_from_params(self, block_params: FrozenDict, x: Any, index) -> Any:
     block = self.layers[index]
     return block.apply(block_params, x)
+
+  ##################################
+  # XLA debugging util
+  ##################################
+def timed_jit(f):
+  """Wraps a function with JIT and times recompilation."""
+  cache = {}
+
+  def wrapped(*args):
+    key = tuple(type(arg) for arg in args)  # Simple caching key based on input types
+    if key not in cache:
+      start_time = time.time()
+      compiled_f = jax.jit(f)  # JIT compilation
+      end_time = time.time()
+      cache[key] = compiled_f
+      print(f"Recompilation took {end_time - start_time:.6f} seconds")
+    return cache[key](*args)
+
+  return wrapped

@@ -8,7 +8,7 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
-from lqr_optimizer._src.utils.utils import normalize_gradient
+from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints,
                              lqr_backward_matrices_and_adjoints)
@@ -43,6 +43,8 @@ class BasePreconditioner(abc.ABC):
     self._divergence_args_index = divergence_args_index
     self._preconditioner_update_steps = preconditioner_update_steps
     self._multibatch = multibatch
+
+    self._update_preconditioner_fn = self._get_evaluate_lqr(self._optax_solver, self._preconditioner_update_steps, multibatch=self._multibatch)
 
   def apply(self, update):
     return self._block_structure.matrix_product(self._block_structure.blocks, update)
@@ -141,7 +143,8 @@ class BasePreconditioner(abc.ABC):
         return jax.tree_map(Partial(jnp.mean, axis=0),
                             vmapped_evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint))
 
-      @jax.jit
+      @timed_jit # switch back to jax.jit after debugging
+      # jax.jit
       def get_update(preconditioner, params, other_model_variables, datapoint):
         opt_state = optax_solver.init(preconditioner)
         for _ in range(steps):
@@ -152,9 +155,9 @@ class BasePreconditioner(abc.ABC):
 
       return get_update
 
-  def _update_preconditioner_fn(self, preconditioner, params, other_model_variables, datapoint):
-    return self._get_evaluate_lqr(self._optax_solver, self._preconditioner_update_steps, multibatch=self._multibatch)(
-      preconditioner, params, other_model_variables, datapoint)
+  # def _update_preconditioner_fn(self, preconditioner, params, other_model_variables, datapoint):
+  #   return self._get_evaluate_lqr(self._optax_solver, self._preconditioner_update_steps, multibatch=self._multibatch)(
+  #     preconditioner, params, other_model_variables, datapoint)
 
   def update_preconditioner(self, params, dataloader, other_model_variables=FrozenDict({})):
     """params is the current weights of the NN"""
