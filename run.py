@@ -4,6 +4,7 @@ import time
 from platform import architecture
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
+# os.environ["XLA_FLAGS"] = "--xla_dump_hlo_as_text --xla_force_host_platform_device_count=1"  # Logging XLA compilation, for debugging
 
 import jax
 import jax.numpy as jnp
@@ -273,8 +274,10 @@ def main():
     if (step % update_preconditioner_every) == 0 and use_preconditioner:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
+      precond_update_start_time = time.time()
       preconditioner.update_preconditioner(state.params, data_iter,
                                            other_model_variables={'batch_stats': state.batch_stats})
+      print(f"Preconditioner was updated in {time.time()-precond_update_start_time:.2f} seconds")
 
     # Grab the next batch for normal training
     x_batch, y_batch = next(data_iter)
@@ -305,6 +308,7 @@ def main():
         print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
     if step % test_eval_freq == 0:
+      test_time_start = time.time()
       test_accuracy = compute_accuracy(state, test_dataloader)
       x_test, y_test = next(test_dataloader)
       test_loss = loss_eval(state, x_test, y_test)
@@ -314,6 +318,7 @@ def main():
       print("============================")
       print(f"Step {step} | Test Loss: {test_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
       print(f"Step {step} | Test Accuracy: {test_accuracy:.2f}%")
+      print(f"Test accuracy across entire dataset computed in {time.time() - test_time_start:.2f} seconds")
       print("============================")
 
 
