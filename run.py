@@ -135,6 +135,7 @@ def main():
   update_preconditioner_every = 500  # k: update the preconditioner every k steps
   precond_steps = 25  # how many gradient steps to take on the preconditioner
   precond_lr = 1e-1  # learning rate for the preconditioner's ADAM
+  precond_clip_norm = 5.0
   test_eval_freq = 500
   use_preconditioner = True
   architecture = "resnet-18" # Currently: mlp or resnet-18
@@ -215,6 +216,7 @@ def main():
     model=inf_model,
     network_params=params,
     optax_solver=optax_solver_for_precond,
+    precond_clip_norm=precond_clip_norm,
     preconditioner_update_steps=precond_steps,
     multibatch=multibatch_training,
     damping=0.0,

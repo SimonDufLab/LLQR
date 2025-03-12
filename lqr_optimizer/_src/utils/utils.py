@@ -33,6 +33,16 @@ def normalize_gradient(gradient):
 
   return normalized_gradient
 
+def clip_norm_single_example(_grad, clip_norm):
+  """Apply clipping norm to a single example within a batch"""
+  ravel_grad, unravel_fn = ravel_pytree(_grad)
+  example_norm = jnp.linalg.norm(ravel_grad, ord=2)
+  clipped_grad = ravel_grad * (clip_norm / jnp.maximum(example_norm, clip_norm))
+  return unravel_fn(clipped_grad)
+
+vmapped_clip_norm = jax.vmap(clip_norm_single_example, in_axes=(0, None))
+
+
 ##################################
 # Flax utils
 ##################################
