@@ -52,7 +52,6 @@ def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, ot
 
   return a, b, a_transpose, states
 
-
 def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_arg=None):
   """Handle a divergence function, for steepest descent
   """

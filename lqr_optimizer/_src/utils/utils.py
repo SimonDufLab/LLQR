@@ -21,6 +21,7 @@ def add_f(f, g):
   """
   return lambda x: f(x) + g(x)
 
+
 def normalize_gradient(gradient):
   # Compute the total L2 norm of the gradient using jnp.linalg.norm
   total_norm = jnp.linalg.norm(ravel_pytree(gradient)[0], ord=2)
@@ -33,6 +34,7 @@ def normalize_gradient(gradient):
 
   return normalized_gradient
 
+
 def clip_norm_single_example(_grad, clip_norm):
   """Apply clipping norm to a single example within a batch"""
   ravel_grad, unravel_fn = ravel_pytree(_grad)
@@ -41,6 +43,18 @@ def clip_norm_single_example(_grad, clip_norm):
   return unravel_fn(clipped_grad)
 
 vmapped_clip_norm = jax.vmap(clip_norm_single_example, in_axes=(0, None))
+
+
+def pytree_max_min(pytree):
+  leaves = jax.tree_util.tree_leaves(pytree)  # Extract leaves
+  leaves = [jnp.ravel(leaf) for leaf in leaves if jnp.issubdtype(leaf.dtype, jnp.number)]  # Flatten each array
+  return (jnp.max(jnp.concatenate(leaves)), jnp.min(jnp.concatenate(leaves))) if leaves else (None, None)  # Get max if non-empty
+
+
+def pytree_l2_norm(pytree):
+  leaves = jax.tree_util.tree_leaves(pytree)  # Extract leaves
+  leaves = [jnp.ravel(leaf) for leaf in leaves if jnp.issubdtype(leaf.dtype, jnp.number)]  # Flatten each array
+  return jnp.linalg.norm(jnp.concatenate(leaves)) if leaves else jnp.array(0.0)  # Compute L2 norm
 
 
 ##################################
