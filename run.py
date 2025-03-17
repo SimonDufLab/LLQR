@@ -135,6 +135,7 @@ def main():
   update_preconditioner_every = 500  # k: update the preconditioner every k steps
   precond_steps = 25  # how many gradient steps to take on the preconditioner
   precond_lr = 1e-1  # learning rate for the preconditioner's ADAM
+  precond_clip_norm = 5.0
   test_eval_freq = 500
   use_preconditioner = True
   architecture = "resnet-18" # Currently: mlp or resnet-18
@@ -215,6 +216,7 @@ def main():
     model=inf_model,
     network_params=params,
     optax_solver=optax_solver_for_precond,
+    precond_clip_norm=precond_clip_norm,
     preconditioner_update_steps=precond_steps,
     multibatch=multibatch_training,
     damping=0.0,
@@ -277,6 +279,10 @@ def main():
       precond_update_start_time = time.time()
       preconditioner.update_preconditioner(state.params, data_iter,
                                            other_model_variables={'batch_stats': state.batch_stats})
+      precond_max, precond_min, precond_norm = preconditioner.get_stats()
+      run.track(precond_max, name="Maximum across preconditioner", step=step)
+      run.track(precond_min, name="Minimum across preconditioner", step=step)
+      run.track(precond_norm, name="Preconditioner l2 norm", step=step)
       print(f"Preconditioner was updated in {time.time()-precond_update_start_time:.2f} seconds")
 
     # Grab the next batch for normal training
