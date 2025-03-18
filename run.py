@@ -52,22 +52,41 @@ def loss_eval(state, x, y):
 
   return cross_entropy_loss(log_probs, y)
 
-# A small utility to batch the MNIST dataset
-def prepare_dataloader(batch_size=128, train=True):
+
+def prepare_dataloader(batch_size=128, train=True, dataset='mnist'):
   """
-  Creates a generator that yields (x, y) from the MNIST dataset.
+  Creates a generator that yields (x, y) from the specified dataset (MNIST or CIFAR-10).
   Each iteration yields a single batch (numpy arrays).
   """
-  ds, info = tfds.load('mnist', split='train' if train else 'test', as_supervised=True, with_info=True)
+  if dataset == 'mnist':
+    ds_name = 'mnist'
+    mean = 0.1307  # Mean of MNIST dataset
+    std = 0.3081  # Std of MNIST dataset
+  elif dataset == 'cifar-10':
+    ds_name = 'cifar10'
+    mean = jnp.array([0.4914, 0.4822, 0.4465])  # CIFAR-10 mean per channel
+    std = jnp.array([0.2470, 0.2435, 0.2616])  # CIFAR-10 std per channel
+  else:
+    raise ValueError("Unsupported dataset. Choose either 'mnist' or 'cifar-10' for now")
+
+  ds, info = tfds.load(ds_name, split='train' if train else 'test', as_supervised=True, with_info=True)
 
   # Shuffle, batch, repeat
   ds = ds.shuffle(10_000).batch(batch_size).repeat()
   ds = ds.prefetch(tf.data.AUTOTUNE)
 
   for x_batch, y_batch in ds:
-    # Convert TF Tensors -> NumPy arrays (JAX can handle them, but let's be explicit)
-    yield (jnp.array(x_batch.numpy()/255, dtype=jnp.float32),
-           jnp.array(y_batch.numpy(), dtype=jnp.int32))
+    x_batch = x_batch.numpy()
+    y_batch = y_batch.numpy()
+
+    if dataset == 'mnist':
+      x_batch = x_batch.astype(jnp.float32) / 255.0  # Normalize to [0,1]
+      x_batch = (x_batch - mean) / std  # Standardize
+    elif dataset == 'cifar-10':
+      x_batch = x_batch.astype(jnp.float32) / 255.0  # Normalize to [0,1]
+      x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]  # Standardize per channel
+
+    yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch, dtype=jnp.int32)
 
 def compute_batch_accuracy(state, x_batch, y_batch):
   """
@@ -131,31 +150,37 @@ def main():
   batch_size = 128
   learning_rate = 1e-2
   momentum = 0.9
+  main_optimizer = "polyak"
   t = 5000  # total training iterations
   update_preconditioner_every = 500  # k: update the preconditioner every k steps
   precond_steps = 25  # how many gradient steps to take on the preconditioner
-  precond_lr = 1e-1  # learning rate for the preconditioner's ADAM
+  precond_lr = 1e-1  # learning rate for the preconditioner's optimizer
+  precond_solver = "momentum"
   precond_clip_norm = 5.0
   test_eval_freq = 500
   use_preconditioner = True
   architecture = "resnet-18" # Currently: mlp or resnet-18
+  dataset = "cifar-10"
 
   run["hparams"] = {
     "learning_rate": learning_rate,
     "batch_size": batch_size,
     "momentum": momentum,
+    "main_optimizer": main_optimizer,
     "update_preconditioner_every": update_preconditioner_every,
     "precond_steps": precond_steps,
     "precond_lr": precond_lr,
+    "precond_solver": precond_solver,
     "total_steps": t,
     "test_eval_freq": test_eval_freq,
     "use_preconditioner": use_preconditioner,
     "architecture": architecture,
+    "dataset": dataset,
   }
 
-  # 1) Create MNIST data generator
-  dataloader = prepare_dataloader(batch_size=batch_size, train=True)
-  test_dataloader = prepare_dataloader(batch_size=batch_size, train=False)
+  # 1) Create the data generator
+  dataloader = prepare_dataloader(batch_size=batch_size, train=True, dataset=dataset)
+  test_dataloader = prepare_dataloader(batch_size=batch_size, train=False, dataset=dataset)
 
   # 2) Define model
   num_classes = 10
@@ -165,7 +190,12 @@ def main():
 
   # 3) Initialize model parameters
   rng = jax.random.PRNGKey(42)
-  dummy_x = jnp.ones((1, 28, 28, 1))  # dummy input for shape inference
+  if dataset == "mnist":
+    dummy_x = jnp.ones((1, 28, 28, 1))  # dummy input for shape inference
+  elif dataset == "cifar-10":
+    dummy_x = jnp.ones((1, 32, 32, 3))
+  else:
+    raise ValueError("Unknown dataset. Choose either 'mnist' or 'cifar-10' for now")
   # params = model.init(rng, dummy_x)#['params']
   variables = model.init(rng, dummy_x)
   params = variables['params']
@@ -174,8 +204,14 @@ def main():
   print(jax.tree_map(jnp.shape, init_batch_stats))
 
   # 4) Create the main optimizer (SGD with momentum)
-  model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
-  # model_optimizer = optax.adam(learning_rate=learning_rate)
+  if main_optimizer == "polyak":
+    model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
+  elif main_optimizer == "adam":
+    model_optimizer = optax.adam(learning_rate=learning_rate)
+  elif main_optimizer == "sgd":
+    model_optimizer = optax.sgd(learning_rate=learning_rate)
+  else:
+    raise ValueError("Unknown optimizer")
 
   # Prepare the train state for the model parameters
   # (Using Flax's train_state for convenience)
@@ -194,7 +230,6 @@ def main():
   # 5) Create the BasePreconditioner
   block_structure = 'diagonal'
   block_structure_init = 'identity'
-  precond_solver = "adam"
   if precond_solver == "adam":
     optax_solver_for_precond = optax.adam(precond_lr)
   elif precond_solver == "momentum":
@@ -280,6 +315,7 @@ def main():
       preconditioner.update_preconditioner(state.params, data_iter,
                                            other_model_variables={'batch_stats': state.batch_stats})
       precond_max, precond_min, precond_norm = preconditioner.get_stats()
+      # !!Remove below when timing against non-2nd order methods!! (Affect computation time)
       run.track(precond_max, name="Maximum across preconditioner", step=step)
       run.track(precond_min, name="Minimum across preconditioner", step=step)
       run.track(precond_norm, name="Preconditioner l2 norm", step=step)
