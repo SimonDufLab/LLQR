@@ -45,12 +45,14 @@ def clip_norm_single_example(_grad, clip_norm):
 vmapped_clip_norm = jax.vmap(clip_norm_single_example, in_axes=(0, None))
 
 
+@jax.jit
 def pytree_max_min(pytree):
   leaves = jax.tree_util.tree_leaves(pytree)  # Extract leaves
   leaves = [jnp.ravel(leaf) for leaf in leaves if jnp.issubdtype(leaf.dtype, jnp.number)]  # Flatten each array
   return (jnp.max(jnp.concatenate(leaves)), jnp.min(jnp.concatenate(leaves))) if leaves else (None, None)  # Get max if non-empty
 
 
+@jax.jit
 def pytree_l2_norm(pytree):
   leaves = jax.tree_util.tree_leaves(pytree)  # Extract leaves
   leaves = [jnp.ravel(leaf) for leaf in leaves if jnp.issubdtype(leaf.dtype, jnp.number)]  # Flatten each array
