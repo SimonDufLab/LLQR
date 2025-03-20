@@ -16,6 +16,7 @@ from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
 BLOCK_STRUCTURE_DICT = {
   'dense': block_structures.DenseBlock,
   'diagonal': block_structures.DiagonalBlock,
+  'scalar': block_structures.ScalarBlock,
 }
 
 class BasePreconditioner(abc.ABC):
