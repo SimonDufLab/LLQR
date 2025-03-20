@@ -55,19 +55,26 @@ def loss_eval(state, x, y):
 
 def prepare_dataloader(batch_size=128, train=True, dataset='mnist'):
   """
-  Creates a generator that yields (x, y) from the specified dataset (MNIST or CIFAR-10).
-  Each iteration yields a single batch (numpy arrays).
+  Creates a generator that yields (x, y) from the specified dataset (MNIST, CIFAR-10, or CIFAR-100).
+  Returns the generator along with the number of classes in the dataset.
   """
   if dataset == 'mnist':
     ds_name = 'mnist'
-    mean = 0.1307  # Mean of MNIST dataset
-    std = 0.3081  # Std of MNIST dataset
+    mean = 0.1307  # MNIST mean
+    std = 0.3081   # MNIST std
+    num_classes = 10
   elif dataset == 'cifar-10':
     ds_name = 'cifar10'
     mean = jnp.array([0.4914, 0.4822, 0.4465])  # CIFAR-10 mean per channel
-    std = jnp.array([0.2470, 0.2435, 0.2616])  # CIFAR-10 std per channel
+    std = jnp.array([0.2470, 0.2435, 0.2616])   # CIFAR-10 std per channel
+    num_classes = 10
+  elif dataset == 'cifar-100':
+    ds_name = 'cifar100'
+    mean = jnp.array([0.5071, 0.4867, 0.4408])  # CIFAR-100 mean per channel
+    std = jnp.array([0.2675, 0.2565, 0.2761])   # CIFAR-100 std per channel
+    num_classes = 100
   else:
-    raise ValueError("Unsupported dataset. Choose either 'mnist' or 'cifar-10' for now")
+    raise ValueError("Unsupported dataset. Choose either 'mnist', 'cifar-10', or 'cifar-100'")
 
   ds, info = tfds.load(ds_name, split='train' if train else 'test', as_supervised=True, with_info=True)
 
@@ -75,18 +82,22 @@ def prepare_dataloader(batch_size=128, train=True, dataset='mnist'):
   ds = ds.shuffle(10_000).batch(batch_size).repeat()
   ds = ds.prefetch(tf.data.AUTOTUNE)
 
-  for x_batch, y_batch in ds:
-    x_batch = x_batch.numpy()
-    y_batch = y_batch.numpy()
+  def generator():
+    for x_batch, y_batch in ds:
+      x_batch = x_batch.numpy()
+      y_batch = y_batch.numpy()
 
-    if dataset == 'mnist':
-      x_batch = x_batch.astype(jnp.float32) / 255.0  # Normalize to [0,1]
-      x_batch = (x_batch - mean) / std  # Standardize
-    elif dataset == 'cifar-10':
-      x_batch = x_batch.astype(jnp.float32) / 255.0  # Normalize to [0,1]
-      x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]  # Standardize per channel
+      if dataset == 'mnist':
+        x_batch = x_batch.astype(jnp.float32) / 255.0  # Normalize to [0,1]
+        x_batch = (x_batch - mean) / std  # Standardize
+      else:  # CIFAR-10 or CIFAR-100
+        x_batch = x_batch.astype(jnp.float32) / 255.0  # Normalize to [0,1]
+        x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]  # Standardize per channel
 
-    yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch, dtype=jnp.int32)
+      yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch, dtype=jnp.int32)
+
+  return generator(), num_classes
+
 
 def compute_batch_accuracy(state, x_batch, y_batch):
   """
@@ -148,19 +159,20 @@ def main():
   run = Run()
   # Hyperparameters
   batch_size = 128
-  learning_rate = 1e-2
+  learning_rate = 1e-1
   momentum = 0.9
-  main_optimizer = "polyak"
-  t = 5000  # total training iterations
-  update_preconditioner_every = 500  # k: update the preconditioner every k steps
-  precond_steps = 25  # how many gradient steps to take on the preconditioner
-  precond_lr = 1e-1  # learning rate for the preconditioner's optimizer
+  main_optimizer = "sgd"
+  t = 97656  # total training iterations
+  update_preconditioner_every = 1000  # k: update the preconditioner every k steps
+  precond_steps = 50  # how many gradient steps to take on the preconditioner
+  precond_lr = 1e-2  # learning rate for the preconditioner's optimizer
   precond_solver = "momentum"
   precond_clip_norm = 5.0
-  test_eval_freq = 500
+  test_eval_freq = 2000
   use_preconditioner = True
   architecture = "resnet-18" # Currently: mlp or resnet-18
-  dataset = "cifar-10"
+  dataset = "cifar-100"
+  init_key = 42
 
   run["hparams"] = {
     "learning_rate": learning_rate,
@@ -176,28 +188,21 @@ def main():
     "use_preconditioner": use_preconditioner,
     "architecture": architecture,
     "dataset": dataset,
+    "init_key": init_key,
   }
 
   # 1) Create the data generator
-  dataloader = prepare_dataloader(batch_size=batch_size, train=True, dataset=dataset)
-  test_dataloader = prepare_dataloader(batch_size=batch_size, train=False, dataset=dataset)
+  dataloader, num_classes = prepare_dataloader(batch_size=batch_size, train=True, dataset=dataset)
+  test_dataloader, _ = prepare_dataloader(batch_size=batch_size, train=False, dataset=dataset)
 
   # 2) Define model
-  num_classes = 10
   model, inf_model = model_choice[architecture](num_classes=num_classes)
   if inf_model is None:
     inf_model = model
 
   # 3) Initialize model parameters
-  rng = jax.random.PRNGKey(42)
-  if dataset == "mnist":
-    dummy_x = jnp.ones((1, 28, 28, 1))  # dummy input for shape inference
-  elif dataset == "cifar-10":
-    dummy_x = jnp.ones((1, 32, 32, 3))
-  else:
-    raise ValueError("Unknown dataset. Choose either 'mnist' or 'cifar-10' for now")
-  # params = model.init(rng, dummy_x)#['params']
-  variables = model.init(rng, dummy_x)
+  rng = jax.random.PRNGKey(init_key)
+  variables = model.init(rng, next(dataloader)[0])
   params = variables['params']
   init_batch_stats = variables.get('batch_stats', {})
   print(jax.tree_map(jnp.shape, params))
