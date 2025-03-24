@@ -3,6 +3,7 @@ import time
 import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
+import optax
 
 import flax.linen as nn
 from flax.linen import Sequential
@@ -170,3 +171,35 @@ def timed_jit(f):
     return cache[key](*args)
 
   return wrapped
+
+
+##################################
+# Loading utils
+##################################
+def load_main_optimizer(cfg):
+  if cfg.main_optimizer == "polyak":
+    model_optimizer = optax.sgd(learning_rate=cfg.learning_rate, momentum=cfg.momentum)
+  elif cfg.main_optimizer == "adam":
+    model_optimizer = optax.adam(learning_rate=cfg.learning_rate)
+  elif cfg.main_optimizer == "sgd":
+    model_optimizer = optax.sgd(learning_rate=cfg.learning_rate)
+  else:
+    raise ValueError("Unknown main optimizer")
+  return model_optimizer
+
+
+def load_precond_optimizer(cfg):
+  if cfg.precond_solver == "adam":
+    optax_solver_for_precond = optax.adam(cfg.precond_lr)
+  elif cfg.precond_solver == "momentum":
+    optax_solver_for_precond = optax.sgd(cfg.precond_lr, momentum=cfg.momentum)
+  elif cfg.precond_solver == "sgd":
+    optax_solver_for_precond = optax.sgd(cfg.precond_lr)
+  else:
+    raise ValueError("Unknown precond optimizer")
+  return optax_solver_for_precond
+
+
+##################################
+# Training utils
+##################################

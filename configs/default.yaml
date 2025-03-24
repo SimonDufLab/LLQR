@@ -1,0 +1,21 @@
+batch_size: 128
+learning_rate: 0.1
+momentum: 0.9
+main_optimizer: sgd
+
+total_steps: 97656
+update_preconditioner_every: 1000
+precond_steps: 50
+precond_lr: 0.001
+precond_solver: momentum
+precond_clip_norm: 5.0
+test_eval_freq: 2000
+use_preconditioner: true
+architecture: mlp
+dataset: mnist
+init_key: 42
+
+block_structure: diagonal
+block_structure_init: identity
+multibatch_training: false
+damping: 0.0

@@ -1,7 +1,6 @@
 """Python script to run experiments"""
 import os
 import time
-from platform import architecture
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 # os.environ["XLA_FLAGS"] = "--xla_dump_hlo_as_text --xla_force_host_platform_device_count=1"  # Logging XLA compilation, for debugging
@@ -13,13 +12,17 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 from flax.training import train_state
 from typing import Any, Callable
+
+import hydra
 from aim import Run
+from omegaconf import DictConfig, OmegaConf
 
 from lqr_optimizer._src.configs.config import model_choice
 from lqr_optimizer._src.preconditioner import BasePreconditioner
+from lqr_optimizer._src.utils.utils import load_main_optimizer, load_precond_optimizer
 
 
-# Divergence function (given in the prompt):
+# Divergence function (for NGD):
 def divergence_f(px, px_):
   # Taking into account we return log-softmax
   return (-px * jnp.log(px_)).sum()
@@ -154,69 +157,34 @@ def compute_accuracy(state, dataloader):
   return accuracy
 
 
-def main():
+@hydra.main(config_path="configs", config_name="config", version_base="1.3")
+def main(cfg: DictConfig):
+  # Print the loaded config
+  print(OmegaConf.to_yaml(cfg))
+
   # Initialize aim for logging
   run = Run()
-  # Hyperparameters
-  batch_size = 128
-  learning_rate = 1e-1
-  momentum = 0.9
-  main_optimizer = "sgd"
-  t = 97656  # total training iterations
-  update_preconditioner_every = 1000  # k: update the preconditioner every k steps
-  precond_steps = 50  # how many gradient steps to take on the preconditioner
-  precond_lr = 1e-2  # learning rate for the preconditioner's optimizer
-  precond_solver = "momentum"
-  precond_clip_norm = 5.0
-  test_eval_freq = 2000
-  use_preconditioner = True
-  architecture = "resnet-18" # Currently: mlp or resnet-18
-  dataset = "cifar-100"
-  init_key = 42
-
-  run["hparams"] = {
-    "learning_rate": learning_rate,
-    "batch_size": batch_size,
-    "momentum": momentum,
-    "main_optimizer": main_optimizer,
-    "update_preconditioner_every": update_preconditioner_every,
-    "precond_steps": precond_steps,
-    "precond_lr": precond_lr,
-    "precond_solver": precond_solver,
-    "total_steps": t,
-    "test_eval_freq": test_eval_freq,
-    "use_preconditioner": use_preconditioner,
-    "architecture": architecture,
-    "dataset": dataset,
-    "init_key": init_key,
-  }
+  run["config"] = OmegaConf.to_container(cfg)
 
   # 1) Create the data generator
-  dataloader, num_classes = prepare_dataloader(batch_size=batch_size, train=True, dataset=dataset)
-  test_dataloader, _ = prepare_dataloader(batch_size=batch_size, train=False, dataset=dataset)
+  dataloader, num_classes = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset)
+  test_dataloader, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset)
 
   # 2) Define model
-  model, inf_model = model_choice[architecture](num_classes=num_classes)
+  model, inf_model = model_choice[cfg.architecture](num_classes=num_classes)
   if inf_model is None:
     inf_model = model
 
   # 3) Initialize model parameters
-  rng = jax.random.PRNGKey(init_key)
+  rng = jax.random.PRNGKey(cfg.init_key)
   variables = model.init(rng, next(dataloader)[0])
   params = variables['params']
   init_batch_stats = variables.get('batch_stats', {})
   print(jax.tree_map(jnp.shape, params))
   print(jax.tree_map(jnp.shape, init_batch_stats))
 
-  # 4) Create the main optimizer (SGD with momentum)
-  if main_optimizer == "polyak":
-    model_optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
-  elif main_optimizer == "adam":
-    model_optimizer = optax.adam(learning_rate=learning_rate)
-  elif main_optimizer == "sgd":
-    model_optimizer = optax.sgd(learning_rate=learning_rate)
-  else:
-    raise ValueError("Unknown optimizer")
+  # 4) Create the main optimizer
+  model_optimizer = load_main_optimizer(cfg)
 
   # Prepare the train state for the model parameters
   # (Using Flax's train_state for convenience)
@@ -233,33 +201,22 @@ def main():
   )
 
   # 5) Create the BasePreconditioner
-  block_structure = 'diagonal'
-  block_structure_init = 'identity'
-  if precond_solver == "adam":
-    optax_solver_for_precond = optax.adam(precond_lr)
-  elif precond_solver == "momentum":
-    optax_solver_for_precond = optax.sgd(precond_lr, momentum=momentum)
-  elif precond_solver == "sgd":
-    optax_solver_for_precond = optax.sgd(precond_lr)
-  multibatch_training = False # Use multiple batches for a single preconditioner update or not
 
-  run["hparams"].update({"block_structure": block_structure,
-                         "block_structure_init": block_structure_init,
-                         "multibatch_training": multibatch_training})
+  precond_optimizer = load_precond_optimizer(cfg)
 
   # Initialize BasePreconditioner
   preconditioner = BasePreconditioner(
     divergence_function=divergence_f,
     loss_fn=cross_entropy_loss,
-    block_structure=block_structure,
-    block_structure_init=block_structure_init,
+    block_structure=cfg.block_structure,
+    block_structure_init=cfg.block_structure_init,
     model=inf_model,
     network_params=params,
-    optax_solver=optax_solver_for_precond,
-    precond_clip_norm=precond_clip_norm,
-    preconditioner_update_steps=precond_steps,
-    multibatch=multibatch_training,
-    damping=0.0,
+    optax_solver=precond_optimizer,
+    precond_clip_norm=cfg.precond_clip_norm,
+    preconditioner_update_steps=cfg.precond_steps,
+    multibatch=cfg.multibatch_training,
+    damping=cfg.damping,
     divergence_args_index=-1
   )
 
@@ -311,9 +268,9 @@ def main():
   # We'll keep a local dataloader iterator
   data_iter = dataloader  # generator
 
-  for step in range(t):
+  for step in range(cfg.total_steps):
     # Possibly update the preconditioner every `update_preconditioner_every` steps
-    if (step % update_preconditioner_every) == 0 and use_preconditioner:
+    if (step % cfg.update_preconditioner_every) == 0 and cfg.use_preconditioner:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
       precond_update_start_time = time.time()
@@ -331,15 +288,6 @@ def main():
 
     state, loss = train_step(state, x_batch, y_batch)
 
-    # # 1) Compute the raw gradient
-    # (loss, new_model_state), grads = compute_grad(state.params, x_batch, y_batch)
-    #
-    # # 2) Apply the preconditioner on the gradient
-    # precond_grads = preconditioner.apply(grads)
-    #
-    # # 3) Use the preconditioned gradient to update the model with normal SGD
-    # state = state.apply_gradients(grads=precond_grads, batch_stats=new_model_state['batch_stats'])
-
     # Logging or testing every so often
     if step % 10 == 0:
       # Simple logging
@@ -354,7 +302,7 @@ def main():
         # Print info
         print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
-    if step % test_eval_freq == 0:
+    if step % cfg.test_eval_freq == 0:
       test_time_start = time.time()
       test_accuracy = compute_accuracy(state, test_dataloader)
       x_test, y_test = next(test_dataloader)

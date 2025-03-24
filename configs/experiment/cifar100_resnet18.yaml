@@ -1,0 +1,2 @@
+architecture: resnet-18
+dataset: cifar-100
