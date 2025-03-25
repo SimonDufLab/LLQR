@@ -30,7 +30,7 @@ def main(cfg: DictConfig):
   run["config"] = OmegaConf.to_container(cfg)
 
   # 1) Create the data generator
-  dataloader, num_classes = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset)
+  dataloader, num_classes = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset, augment_dataset=cfg.augment_dataset)
   test_dataloader, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset)
 
   # 2) Define model

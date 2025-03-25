@@ -233,46 +233,58 @@ def loss_eval(state, x, y):
   return cross_entropy_loss(log_probs, y)
 
 
-def prepare_dataloader(batch_size=128, train=True, dataset='mnist'):
+def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_dataset=False):
   """
   Creates a generator that yields (x, y) from the specified dataset (MNIST, CIFAR-10, or CIFAR-100).
+  Applies specified data augmentation to CIFAR datasets if augment_dataset=True.
   Returns the generator along with the number of classes in the dataset.
   """
   if dataset == 'mnist':
     ds_name = 'mnist'
-    mean = 0.1307  # MNIST mean
-    std = 0.3081   # MNIST std
+    mean = 0.1307
+    std = 0.3081
     num_classes = 10
   elif dataset == 'cifar-10':
     ds_name = 'cifar10'
-    mean = jnp.array([0.4914, 0.4822, 0.4465])  # CIFAR-10 mean per channel
-    std = jnp.array([0.2470, 0.2435, 0.2616])   # CIFAR-10 std per channel
+    mean = jnp.array([0.4914, 0.4822, 0.4465])
+    std = jnp.array([0.2470, 0.2435, 0.2616])
     num_classes = 10
   elif dataset == 'cifar-100':
     ds_name = 'cifar100'
-    mean = jnp.array([0.5071, 0.4867, 0.4408])  # CIFAR-100 mean per channel
-    std = jnp.array([0.2675, 0.2565, 0.2761])   # CIFAR-100 std per channel
+    mean = jnp.array([0.5071, 0.4867, 0.4408])
+    std = jnp.array([0.2675, 0.2565, 0.2761])
     num_classes = 100
   else:
     raise ValueError("Unsupported dataset. Choose either 'mnist', 'cifar-10', or 'cifar-100'")
 
   ds, info = tfds.load(ds_name, split='train' if train else 'test', as_supervised=True, with_info=True)
 
-  # Shuffle, batch, repeat
-  ds = ds.shuffle(10_000).batch(batch_size).repeat()
-  ds = ds.prefetch(tf.data.AUTOTUNE)
+  ds_size = int(ds.cardinality())
+  ds = ds.cache()
+  ds = ds.shuffle(ds_size, seed=0, reshuffle_each_iteration=True)
+  ds = ds.batch(batch_size)
+
+  if augment_dataset and train and dataset in ['cifar-10', 'cifar-100']:
+    ReflectionPadding2D = tf.keras.layers.Lambda(lambda x: tf.pad(x, [[0, 0], [4, 4], [4, 4], [0, 0]], 'REFLECT'))
+    augmentation_pipeline = tf.keras.Sequential([
+      ReflectionPadding2D,
+      tf.keras.layers.RandomCrop(height=32, width=32),
+      tf.keras.layers.RandomFlip('horizontal')
+    ])
+    ds = ds.map(lambda x, y: (augmentation_pipeline(x), y), num_parallel_calls=tf.data.AUTOTUNE)
+
+  ds = ds.repeat().prefetch(tf.data.AUTOTUNE)
 
   def generator():
     for x_batch, y_batch in ds:
       x_batch = x_batch.numpy()
       y_batch = y_batch.numpy()
 
+      x_batch = x_batch.astype(jnp.float32) / 255.0
       if dataset == 'mnist':
-        x_batch = x_batch.astype(jnp.float32) / 255.0  # Normalize to [0,1]
-        x_batch = (x_batch - mean) / std  # Standardize
-      else:  # CIFAR-10 or CIFAR-100
-        x_batch = x_batch.astype(jnp.float32) / 255.0  # Normalize to [0,1]
-        x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]  # Standardize per channel
+        x_batch = (x_batch - mean) / std
+      else:
+        x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]
 
       yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch, dtype=jnp.int32)
 

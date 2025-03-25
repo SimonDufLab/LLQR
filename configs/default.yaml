@@ -13,6 +13,7 @@ test_eval_freq: 2000
 use_preconditioner: true
 architecture: mlp
 dataset: mnist
+augment_dataset: false
 init_key: 42
 
 divergence: ngd
