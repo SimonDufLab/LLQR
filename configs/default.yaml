@@ -15,6 +15,7 @@ architecture: mlp
 dataset: mnist
 init_key: 42
 
+divergence: ngd
 block_structure: diagonal
 block_structure_init: identity
 multibatch_training: false
