@@ -1,0 +1,5 @@
+experiment_name: cifar-100_resnet18
+
+
+architecture: resnet-18
+dataset: cifar-100

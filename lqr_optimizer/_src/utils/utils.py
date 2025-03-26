@@ -1,13 +1,21 @@
 """ Various utilities functions for LQR optimization"""
 import time
+import os
+import pickle
+import signal
 import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
+import optax
+import tensorflow as tf
+import tensorflow_datasets as tfds
 
 import flax.linen as nn
 from flax.linen import Sequential
 from flax.core.frozen_dict import FrozenDict
-from typing import List, Tuple, Any, Dict
+from typing import List, Tuple, Any, Dict, Optional, TypedDict
+from types import FrameType
+from pathlib import Path
 
 def vjp_f(f, x):
   """ Return the vjp in a form that can be applied directly over a vector
@@ -170,3 +178,298 @@ def timed_jit(f):
     return cache[key](*args)
 
   return wrapped
+
+
+##################################
+# Loading utils
+##################################
+def load_main_optimizer(cfg):
+  if cfg.main_optimizer == "polyak":
+    model_optimizer = optax.sgd(learning_rate=cfg.learning_rate, momentum=cfg.momentum)
+  elif cfg.main_optimizer == "adam":
+    model_optimizer = optax.adam(learning_rate=cfg.learning_rate)
+  elif cfg.main_optimizer == "sgd":
+    model_optimizer = optax.sgd(learning_rate=cfg.learning_rate)
+  else:
+    raise ValueError("Unknown main optimizer")
+  return model_optimizer
+
+
+def load_precond_optimizer(cfg):
+  if cfg.precond_solver == "adam":
+    optax_solver_for_precond = optax.adam(cfg.precond_lr)
+  elif cfg.precond_solver == "momentum":
+    optax_solver_for_precond = optax.sgd(cfg.precond_lr, momentum=cfg.momentum)
+  elif cfg.precond_solver == "sgd":
+    optax_solver_for_precond = optax.sgd(cfg.precond_lr)
+  else:
+    raise ValueError("Unknown precond optimizer")
+  return optax_solver_for_precond
+
+
+##################################
+# Training utils
+##################################
+# Simple cross-entropy loss for classification
+def cross_entropy_loss(log_probs, y): #TODO only with respect to output
+  """
+  log_probs: network outputs, the per-class log probabilities
+  y: integer class labels
+  """
+
+  # Cross-entropy using negative log-likelihood
+  nll = -jnp.mean(jnp.sum(jax.nn.one_hot(y, log_probs.shape[-1]) * log_probs, axis=-1))
+  return nll
+
+def loss_eval(state, x, y):
+  """
+  params: parameters of the model
+  apply_fn: function to apply model (Flax typically provides model.apply)
+  x: input data
+  y: integer class labels
+  """
+  log_probs = state.apply_inf_fn(
+    {'params': state.params, 'batch_stats': state.batch_stats},
+    x,
+    mutable=False
+  )  # shape [batch_size, num_classes]
+  # We expect the final layer to produce log-softmax output (as defined in MLP),
+
+  return cross_entropy_loss(log_probs, y)
+
+
+def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_dataset=False):
+  """
+  Creates a generator that yields (x, y) from the specified dataset (MNIST, CIFAR-10, or CIFAR-100).
+  Applies specified data augmentation to CIFAR datasets if augment_dataset=True.
+  Returns the generator along with the number of classes in the dataset.
+  """
+  if dataset == 'mnist':
+    ds_name = 'mnist'
+    mean = 0.1307
+    std = 0.3081
+    num_classes = 10
+  elif dataset == 'cifar-10':
+    ds_name = 'cifar10'
+    mean = jnp.array([0.4914, 0.4822, 0.4465])
+    std = jnp.array([0.2470, 0.2435, 0.2616])
+    num_classes = 10
+  elif dataset == 'cifar-100':
+    ds_name = 'cifar100'
+    mean = jnp.array([0.5071, 0.4867, 0.4408])
+    std = jnp.array([0.2675, 0.2565, 0.2761])
+    num_classes = 100
+  else:
+    raise ValueError("Unsupported dataset. Choose either 'mnist', 'cifar-10', or 'cifar-100'")
+
+  ds, info = tfds.load(ds_name, split='train' if train else 'test', as_supervised=True, with_info=True)
+
+  ds_size = int(ds.cardinality())
+  ds = ds.cache()
+  ds = ds.shuffle(ds_size, seed=0, reshuffle_each_iteration=True)
+  ds = ds.batch(batch_size)
+
+  if augment_dataset and train and dataset in ['cifar-10', 'cifar-100']:
+    ReflectionPadding2D = tf.keras.layers.Lambda(lambda x: tf.pad(x, [[0, 0], [4, 4], [4, 4], [0, 0]], 'REFLECT'))
+    augmentation_pipeline = tf.keras.Sequential([
+      ReflectionPadding2D,
+      tf.keras.layers.RandomCrop(height=32, width=32),
+      tf.keras.layers.RandomFlip('horizontal')
+    ])
+    ds = ds.map(lambda x, y: (augmentation_pipeline(x), y), num_parallel_calls=tf.data.AUTOTUNE)
+
+  ds = ds.repeat().prefetch(tf.data.AUTOTUNE)
+
+  def generator():
+    for x_batch, y_batch in ds:
+      x_batch = x_batch.numpy()
+      y_batch = y_batch.numpy()
+
+      x_batch = x_batch.astype(jnp.float32) / 255.0
+      if dataset == 'mnist':
+        x_batch = (x_batch - mean) / std
+      else:
+        x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]
+
+      yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch, dtype=jnp.int32)
+
+  return generator(), num_classes, ds_size
+
+
+def compute_batch_accuracy(state, x_batch, y_batch):
+  """
+  Computes accuracy for a single batch.
+
+  Args:
+      params: Model parameters.
+      model: Flax model.
+      x_batch: Input data for the batch.
+      y_batch: Ground truth labels for the batch.
+
+  Returns:
+      Accuracy for the batch as a percentage (float).
+  """
+  # Forward pass to compute logits
+  variables = {'params': state.params, 'batch_stats': state.batch_stats}
+  log_probs = state.apply_inf_fn(variables, x_batch, mutable=False)  # shape [batch_size, num_classes]
+
+  # Predicted class (argmax of logits)
+  predictions = jnp.argmax(jnp.exp(log_probs), axis=1)
+
+  # Compare predictions with ground truth
+  correct_predictions = jnp.sum(predictions == y_batch)
+
+  # Compute accuracy
+  accuracy = (correct_predictions / y_batch.shape[0]) * 100
+  return accuracy
+
+def compute_accuracy(state, dataloader):
+  """
+  Computes accuracy for the given model parameters and dataloader.
+
+  Args:
+      params: Model parameters.
+      model: Flax model.
+      dataloader: DataLoader for the dataset.
+
+  Returns:
+      Accuracy as a percentage (float).
+  """
+  correct_predictions = 0
+  total_samples = 0
+
+  for x_batch, y_batch in dataloader:
+    # Compute model predictions
+    batch_size = y_batch.shape[0]
+    correct_predictions += compute_batch_accuracy(state, x_batch, y_batch) * batch_size
+    total_samples += batch_size
+    if total_samples >= 10000:
+      break
+
+  # Compute accuracy as a percentage
+  accuracy = (correct_predictions / total_samples)
+  return accuracy
+
+# Preemption handling on cluster
+class RunState(TypedDict):  # Taken from https://docs.mila.quebec/examples/good_practices/checkpointing/index.html
+  """Typed dictionary containing the state of the training run which is saved at each epoch.
+
+  Using type hints helps prevent bugs and makes your code easier to read for both humans and
+  machines (e.g. Copilot). This leads to less time spent debugging and better code suggestions.
+  """
+
+  epoch: int
+  training_step: int
+  model_dir: str  # Parent dir containing trainstate and preconditioner pytrees in separate children dir
+  aim_hash: Optional[str]  # Unique hash identifying experiment in aim (logger)
+  slurm_jobid: str  # Unique experiment identifier attributed by SLURM
+  exp_name: str
+  dropout_key: Optional[jax.random.PRNGKey]
+  best_accuracy: float  # Best accuracy so far
+  training_time: Optional[Any]  # Total training time for the run
+
+
+def load_run_state(checkpoint_dir: Path) -> Optional[
+  RunState]:  # Taken from https://docs.mila.quebec/examples/good_practices/checkpointing/index.html
+  """Loads the latest checkpoint if possible, otherwise returns `None`."""
+  checkpoint_file = checkpoint_dir / "checkpoint_run_state.pkl"
+  restart_count = int(os.environ.get("SLURM_RESTART_COUNT", 0))
+  if restart_count:
+    print(f"NOTE: This job has been restarted {restart_count} times by SLURM.")
+
+  if not checkpoint_file.exists():
+    print(f"No checkpoint found in checkpoints dir ({checkpoint_dir}).")
+    if restart_count:
+      raise RuntimeWarning(
+        f"This job has been restarted {restart_count} times by SLURM, but no "
+        "checkpoint was found! This either means that your checkpointing code is "
+        "broken, or that the job did not reach the checkpointing portion of your "
+        "training loop."
+      )
+    return None
+
+  with open(checkpoint_file, "rb") as f:
+    checkpoint_state = pickle.load(f)
+
+  print(f"Resuming from the checkpoint file at {checkpoint_file}:")
+  print(checkpoint_state)
+  print()
+  state: RunState = checkpoint_state  # type: ignore
+  return state
+
+
+def save_pytree_state(ckpt_dir: str, state) -> None:
+  # Save the numpy arrays (parameters) to disk
+  with open(os.path.join(ckpt_dir, "arrays.npy"), "wb") as f:
+    for x in jax.tree_util.tree_leaves(state):
+      jnp.save(f, x, allow_pickle=True)
+
+  # Save the structure of the state tree
+  tree_struct = jax.tree_map(lambda t: 0, state)
+  with open(os.path.join(ckpt_dir, "tree.pkl"), "wb") as f:
+    pickle.dump(tree_struct, f)
+
+
+def restore_pytree_state(ckpt_dir, verbose=False):
+  # Load the structure of the state tree
+  with open(os.path.join(ckpt_dir, "tree.pkl"), "rb") as f:
+    tree_struct = pickle.load(f)
+
+  if verbose:
+    print(jax.tree_map(jnp.shape, tree_struct))
+
+  # Load the flat state (parameters) from disk
+  leaves, treedef = jax.tree_util.tree_flatten(tree_struct)
+  with open(os.path.join(ckpt_dir, "arrays.npy"), "rb") as f:
+    flat_state = [jnp.load(f, allow_pickle=True) for _ in leaves]
+
+  # Reconstruct the state tree from its structure and parameters
+  return jax.tree_util.tree_unflatten(treedef, flat_state)
+
+
+def save_trainstate_and_precond(parent_dir: str, trainstate, preconditioner_blocks) -> None:
+  # Create directories for params, state, and opt_state
+  trainstate_dir = os.path.join(parent_dir, "trainstate")
+  precond_dir = os.path.join(parent_dir, "preconditioner")
+  os.makedirs(trainstate_dir, exist_ok=True)
+  os.makedirs(precond_dir, exist_ok=True)
+
+  # Use the existing save function
+  save_pytree_state(trainstate_dir, trainstate)
+  save_pytree_state(precond_dir, preconditioner_blocks)
+
+
+def restore_trainstate_and_precond(parent_dir: str):
+  # Directories for params, state, and opt_state
+  trainstate_dir = os.path.join(parent_dir, "trainstate")
+  precond_dir = os.path.join(parent_dir, "preconditioner")
+
+  # Use the existing restore function
+  restored_trainstate = restore_pytree_state(trainstate_dir)
+  restored_preconditioner_blocks = restore_pytree_state(precond_dir)
+
+  return restored_trainstate, restored_preconditioner_blocks
+
+def checkpoint_exp(run_state: RunState, trainstate, precond_blocks, curr_epoch: int, curr_step: int,
+                   dropout_key, best_acc, training_time):
+  run_state["epoch"] = curr_epoch
+  run_state["training_step"] = curr_step
+  run_state["dropout_key"] = dropout_key
+  run_state["best_accuracy"] = best_acc
+  run_state["training_time"] = training_time
+
+  with open(os.path.join(run_state["model_dir"], "checkpoint_run_state.pkl"), "wb") as f:
+    pickle.dump(run_state, f)
+
+  # Update weights
+  save_trainstate_and_precond(run_state["model_dir"], trainstate, precond_blocks)
+
+
+def signal_handler(signum: int, frame: Optional[
+  FrameType]):  # Taken from: https://docs.mila.quebec/examples/good_practices/checkpointing/index.html
+  """Called before the job gets pre-empted or reaches the time-limit.
+
+  This should run quickly. Performing a full checkpoint here mid-epoch is not recommended.
+  """
+  signal_enum = signal.Signals(signum)
+  print(f"Job received a {signal_enum.name} signal!")

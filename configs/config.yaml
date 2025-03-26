@@ -1,0 +1,7 @@
+defaults:
+  - default
+  - experiment: null
+
+experiment_name: default_experiment
+logging:
+  aim: true

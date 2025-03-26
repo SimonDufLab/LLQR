@@ -205,3 +205,9 @@ class BasePreconditioner(abc.ABC):
 
     # print(self._block_structure.blocks["layers_2"])
     # print(self._block_structure.blocks)
+
+  def expose_blocks(self):
+    return self._block_structure.blocks
+
+  def load_blocks(self, saved_blocks):
+    self._block_structure.update_blocks(saved_blocks)

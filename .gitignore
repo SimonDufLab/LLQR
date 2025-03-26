@@ -146,6 +146,9 @@ static
 # Logger file from aim
 .aim/
 
+# Logger file from hydra
+outputs/
+
 # Cluster slurm files and venv
 slurm*
 py310jax_tf/*
