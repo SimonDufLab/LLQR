@@ -1,23 +1,31 @@
+experiment_name: mnist_mlp_default
+
 batch_size: 128
 learning_rate: 0.1
 momentum: 0.9
 main_optimizer: sgd
-
 total_steps: 97656
+test_eval_freq: 2000
+checkpoint_freq: 1000
+architecture: mlp
+dataset: mnist
+augment_dataset: false
+init_key: 42
+rng_seed: 123 # For dropout, etc.
+
 update_preconditioner_every: 1000
 precond_steps: 50
 precond_lr: 0.001
 precond_solver: momentum
 precond_clip_norm: 5.0
-test_eval_freq: 2000
 use_preconditioner: true
-architecture: mlp
-dataset: mnist
-augment_dataset: false
-init_key: 42
 
 divergence: ngd
 block_structure: diagonal
 block_structure_init: identity
 multibatch_training: false
 damping: 0.0
+
+# Cluster options
+preempt_handling: false
+jobid: None  # To manually restart a previous job

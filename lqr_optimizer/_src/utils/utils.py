@@ -1,5 +1,8 @@
 """ Various utilities functions for LQR optimization"""
 import time
+import os
+import pickle
+import signal
 import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
@@ -10,7 +13,9 @@ import tensorflow_datasets as tfds
 import flax.linen as nn
 from flax.linen import Sequential
 from flax.core.frozen_dict import FrozenDict
-from typing import List, Tuple, Any, Dict
+from typing import List, Tuple, Any, Dict, Optional, TypedDict
+from types import FrameType
+from pathlib import Path
 
 def vjp_f(f, x):
   """ Return the vjp in a form that can be applied directly over a vector
@@ -288,7 +293,7 @@ def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_data
 
       yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch, dtype=jnp.int32)
 
-  return generator(), num_classes
+  return generator(), num_classes, ds_size
 
 
 def compute_batch_accuracy(state, x_batch, y_batch):
@@ -344,3 +349,127 @@ def compute_accuracy(state, dataloader):
   # Compute accuracy as a percentage
   accuracy = (correct_predictions / total_samples)
   return accuracy
+
+# Preemption handling on cluster
+class RunState(TypedDict):  # Taken from https://docs.mila.quebec/examples/good_practices/checkpointing/index.html
+  """Typed dictionary containing the state of the training run which is saved at each epoch.
+
+  Using type hints helps prevent bugs and makes your code easier to read for both humans and
+  machines (e.g. Copilot). This leads to less time spent debugging and better code suggestions.
+  """
+
+  epoch: int
+  training_step: int
+  model_dir: str  # Parent dir containing trainstate and preconditioner pytrees in separate children dir
+  aim_hash: Optional[str]  # Unique hash identifying experiment in aim (logger)
+  slurm_jobid: str  # Unique experiment identifier attributed by SLURM
+  exp_name: str
+  dropout_key: Optional[jax.random.PRNGKey]
+  best_accuracy: float  # Best accuracy so far
+  training_time: Optional[Any]  # Total training time for the run
+
+
+def load_run_state(checkpoint_dir: Path) -> Optional[
+  RunState]:  # Taken from https://docs.mila.quebec/examples/good_practices/checkpointing/index.html
+  """Loads the latest checkpoint if possible, otherwise returns `None`."""
+  checkpoint_file = checkpoint_dir / "checkpoint_run_state.pkl"
+  restart_count = int(os.environ.get("SLURM_RESTART_COUNT", 0))
+  if restart_count:
+    print(f"NOTE: This job has been restarted {restart_count} times by SLURM.")
+
+  if not checkpoint_file.exists():
+    print(f"No checkpoint found in checkpoints dir ({checkpoint_dir}).")
+    if restart_count:
+      raise RuntimeWarning(
+        f"This job has been restarted {restart_count} times by SLURM, but no "
+        "checkpoint was found! This either means that your checkpointing code is "
+        "broken, or that the job did not reach the checkpointing portion of your "
+        "training loop."
+      )
+    return None
+
+  with open(checkpoint_file, "rb") as f:
+    checkpoint_state = pickle.load(f)
+
+  print(f"Resuming from the checkpoint file at {checkpoint_file}:")
+  print(checkpoint_state)
+  print()
+  state: RunState = checkpoint_state  # type: ignore
+  return state
+
+
+def save_pytree_state(ckpt_dir: str, state) -> None:
+  # Save the numpy arrays (parameters) to disk
+  with open(os.path.join(ckpt_dir, "arrays.npy"), "wb") as f:
+    for x in jax.tree_util.tree_leaves(state):
+      jnp.save(f, x, allow_pickle=True)
+
+  # Save the structure of the state tree
+  tree_struct = jax.tree_map(lambda t: 0, state)
+  with open(os.path.join(ckpt_dir, "tree.pkl"), "wb") as f:
+    pickle.dump(tree_struct, f)
+
+
+def restore_pytree_state(ckpt_dir, verbose=False):
+  # Load the structure of the state tree
+  with open(os.path.join(ckpt_dir, "tree.pkl"), "rb") as f:
+    tree_struct = pickle.load(f)
+
+  if verbose:
+    print(jax.tree_map(jnp.shape, tree_struct))
+
+  # Load the flat state (parameters) from disk
+  leaves, treedef = jax.tree_util.tree_flatten(tree_struct)
+  with open(os.path.join(ckpt_dir, "arrays.npy"), "rb") as f:
+    flat_state = [jnp.load(f, allow_pickle=True) for _ in leaves]
+
+  # Reconstruct the state tree from its structure and parameters
+  return jax.tree_util.tree_unflatten(treedef, flat_state)
+
+
+def save_trainstate_and_precond(parent_dir: str, trainstate, preconditioner_blocks) -> None:
+  # Create directories for params, state, and opt_state
+  trainstate_dir = os.path.join(parent_dir, "trainstate")
+  precond_dir = os.path.join(parent_dir, "preconditioner")
+  os.makedirs(trainstate_dir, exist_ok=True)
+  os.makedirs(precond_dir, exist_ok=True)
+
+  # Use the existing save function
+  save_pytree_state(trainstate_dir, trainstate)
+  save_pytree_state(precond_dir, preconditioner_blocks)
+
+
+def restore_trainstate_and_precond(parent_dir: str):
+  # Directories for params, state, and opt_state
+  trainstate_dir = os.path.join(parent_dir, "trainstate")
+  precond_dir = os.path.join(parent_dir, "preconditioner")
+
+  # Use the existing restore function
+  restored_trainstate = restore_pytree_state(trainstate_dir)
+  restored_preconditioner_blocks = restore_pytree_state(precond_dir)
+
+  return restored_trainstate, restored_preconditioner_blocks
+
+def checkpoint_exp(run_state: RunState, trainstate, precond_blocks, curr_epoch: int, curr_step: int,
+                   dropout_key, best_acc, training_time):
+  run_state["epoch"] = curr_epoch
+  run_state["training_step"] = curr_step
+  run_state["dropout_key"] = dropout_key
+  run_state["best_accuracy"] = best_acc
+  run_state["training_time"] = training_time
+
+  with open(os.path.join(run_state["model_dir"], "checkpoint_run_state.pkl"), "wb") as f:
+    pickle.dump(run_state, f)
+
+  # Update weights
+  save_trainstate_and_precond(run_state["model_dir"], trainstate, precond_blocks)
+
+
+def signal_handler(signum: int, frame: Optional[
+  FrameType]):  # Taken from: https://docs.mila.quebec/examples/good_practices/checkpointing/index.html
+  """Called before the job gets pre-empted or reaches the time-limit.
+
+  This should run quickly. Performing a full checkpoint here mid-epoch is not recommended.
+  """
+  signal_enum = signal.Signals(signum)
+  print(f"Job received a {signal_enum.name} signal!")

@@ -1,2 +1,4 @@
+experiment_name: cifar-10_resnet18
+
 architecture: resnet-18
 dataset: cifar-10
