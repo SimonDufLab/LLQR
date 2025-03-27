@@ -33,7 +33,7 @@ def main(cfg: DictConfig):
   if cfg.preempt_handling:
     SCRATCH = Path(os.environ["SCRATCH"])
     if cfg.jobid:
-      SLURM_JOBID = cfg.jobid
+      SLURM_JOBID = str(cfg.jobid) # ensure string format, avoid int
     else:
       SLURM_JOBID = os.environ["SLURM_JOBID"]
       cfg.jobid = SLURM_JOBID
