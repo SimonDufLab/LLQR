@@ -9,8 +9,6 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 
 import jax
 import jax.numpy as jnp
-from flax.training import train_state
-from typing import Any, Callable
 
 import hydra
 from aim import Run
@@ -85,21 +83,23 @@ def main(cfg: DictConfig):
   # 4) Create the main optimizer
   model_optimizer = utl.load_main_optimizer(cfg)
 
-  # Prepare the train state for the model parameters
-  # (Using Flax's train_state for convenience)
-  class TrainState(train_state.TrainState):
-    apply_inf_fn: Callable
-    batch_stats: Any
-
   if load_from_preexisting_model_state:
     state, precond_blocks = utl.restore_trainstate_and_precond(run_state["model_dir"])
+    state = utl.TrainState.create(
+      apply_fn=model.apply,
+      apply_inf_fn=inf_model.apply,
+      params=state["params"],
+      tx=model_optimizer,
+      opt_state=state["opt_state"],
+      batch_stats=state["batch_stats"],
+    )
   else:
-    state = TrainState.create(
+    state = utl.TrainState.create(
       apply_fn=model.apply,
       apply_inf_fn=inf_model.apply,
       params=params,
       tx=model_optimizer,
-      batch_stats = init_batch_stats
+      batch_stats=init_batch_stats
     )
 
   # 5) Create the BasePreconditioner

@@ -5,6 +5,7 @@ import pickle
 import signal
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.flatten_util import ravel_pytree
 import optax
 import tensorflow as tf
@@ -13,7 +14,9 @@ import tensorflow_datasets as tfds
 import flax.linen as nn
 from flax.linen import Sequential
 from flax.core.frozen_dict import FrozenDict
-from typing import List, Tuple, Any, Dict, Optional, TypedDict
+from flax.training import train_state
+from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
+from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable
 from types import FrameType
 from pathlib import Path
 
@@ -350,6 +353,31 @@ def compute_accuracy(state, dataloader):
   accuracy = (correct_predictions / total_samples)
   return accuracy
 
+
+ # Prepare the train state for the model parameters
+  # (Using Flax's train_state for convenience)
+class TrainState(train_state.TrainState):
+  apply_inf_fn: Callable
+  batch_stats: Any
+
+  @classmethod
+  def create(cls, *, apply_fn, params, tx, opt_state=None, **kwargs):
+    """Creates a new instance with ``step=0`` and initialized ``opt_state``."""
+    # We exclude OWG params when present because they do not need opt states.
+    params_with_opt = (
+      params['params'] if OVERWRITE_WITH_GRADIENT in params else params
+    )
+    if not opt_state:
+      opt_state = tx.init(params_with_opt)
+    return cls(
+      step=0,
+      apply_fn=apply_fn,
+      params=params,
+      tx=tx,
+      opt_state=opt_state,
+      **kwargs,
+    )
+
 # Preemption handling on cluster
 class RunState(TypedDict):  # Taken from https://docs.mila.quebec/examples/good_practices/checkpointing/index.html
   """Typed dictionary containing the state of the training run which is saved at each epoch.
@@ -398,44 +426,83 @@ def load_run_state(checkpoint_dir: Path) -> Optional[
   return state
 
 
-def save_pytree_state(ckpt_dir: str, state) -> None:
-  # Save the numpy arrays (parameters) to disk
-  with open(os.path.join(ckpt_dir, "arrays.npy"), "wb") as f:
-    for x in jax.tree_util.tree_leaves(state):
-      jnp.save(f, x, allow_pickle=True)
+# def save_pytree_state(ckpt_dir: str, state) -> None:
+#   # Save the numpy arrays (parameters) to disk
+#   with open(os.path.join(ckpt_dir, "arrays.npy"), "wb") as f:
+#     for x in jax.tree_util.tree_leaves(state):
+#       jnp.save(f, x, allow_pickle=True)
+#
+#   # Save the structure of the state tree
+#   tree_struct = jax.tree_map(lambda t: 0, state)
+#   with open(os.path.join(ckpt_dir, "tree.pkl"), "wb") as f:
+#     pickle.dump(tree_struct, f)
 
-  # Save the structure of the state tree
-  tree_struct = jax.tree_map(lambda t: 0, state)
-  with open(os.path.join(ckpt_dir, "tree.pkl"), "wb") as f:
-    pickle.dump(tree_struct, f)
+def save_pytree_state(ckpt_dir: str, pytree) -> None:
+  os.makedirs(ckpt_dir, exist_ok=True)
 
+  # Flatten the pytree into leaves and treedef
+  leaves, treedef = jax.tree_util.tree_flatten(pytree)
+
+  # Convert leaves to numpy arrays explicitly and save
+  with open(os.path.join(ckpt_dir, "arrays.npz"), "wb") as f:
+    np.savez(f, *[np.array(leaf) for leaf in leaves])
+
+  # Save the treedef structure separately
+  with open(os.path.join(ckpt_dir, "treedef.pkl"), "wb") as f:
+    pickle.dump(treedef, f)
+
+
+# def restore_pytree_state(ckpt_dir, verbose=False):
+#   # Load the structure of the state tree
+#   with open(os.path.join(ckpt_dir, "tree.pkl"), "rb") as f:
+#     tree_struct = pickle.load(f)
+#
+#   if verbose:
+#     print(jax.tree_map(jnp.shape, tree_struct))
+#
+#   # Load the flat state (parameters) from disk
+#   leaves, treedef = jax.tree_util.tree_flatten(tree_struct)
+#   with open(os.path.join(ckpt_dir, "arrays.npy"), "rb") as f:
+#     flat_state = [jnp.load(f, allow_pickle=True) for _ in leaves]
+#
+#   # Reconstruct the state tree from its structure and parameters
+#   return jax.tree_util.tree_unflatten(treedef, flat_state)
 
 def restore_pytree_state(ckpt_dir, verbose=False):
-  # Load the structure of the state tree
-  with open(os.path.join(ckpt_dir, "tree.pkl"), "rb") as f:
-    tree_struct = pickle.load(f)
+  # Load treedef
+  with open(os.path.join(ckpt_dir, "treedef.pkl"), "rb") as f:
+    treedef = pickle.load(f)
+
+  # Load arrays
+  with np.load(os.path.join(ckpt_dir, "arrays.npz"), allow_pickle=False) as data:
+    leaves = [data[key] for key in data.files]
+
+  restored_tree = jax.tree_util.tree_unflatten(treedef, leaves)
 
   if verbose:
-    print(jax.tree_map(jnp.shape, tree_struct))
+    print(jax.tree_map(lambda x: x.shape, restored_tree))
 
-  # Load the flat state (parameters) from disk
-  leaves, treedef = jax.tree_util.tree_flatten(tree_struct)
-  with open(os.path.join(ckpt_dir, "arrays.npy"), "rb") as f:
-    flat_state = [jnp.load(f, allow_pickle=True) for _ in leaves]
-
-  # Reconstruct the state tree from its structure and parameters
-  return jax.tree_util.tree_unflatten(treedef, flat_state)
+  return restored_tree
 
 
 def save_trainstate_and_precond(parent_dir: str, trainstate, preconditioner_blocks) -> None:
   # Create directories for params, state, and opt_state
   trainstate_dir = os.path.join(parent_dir, "trainstate")
+  params_dirs = os.path.join(trainstate_dir, "params")
+  opt_state_dir = os.path.join(trainstate_dir, "opt_state")
+  batch_stats_dir = os.path.join(trainstate_dir, "batch_stats")
+
   precond_dir = os.path.join(parent_dir, "preconditioner")
   os.makedirs(trainstate_dir, exist_ok=True)
+  os.makedirs(params_dirs, exist_ok=True)
+  os.makedirs(opt_state_dir, exist_ok=True)
+  os.makedirs(batch_stats_dir, exist_ok=True)
   os.makedirs(precond_dir, exist_ok=True)
 
   # Use the existing save function
-  save_pytree_state(trainstate_dir, trainstate)
+  save_pytree_state(params_dirs, trainstate.params)
+  save_pytree_state(opt_state_dir, trainstate.opt_state)
+  save_pytree_state(batch_stats_dir, trainstate.batch_stats)
   save_pytree_state(precond_dir, preconditioner_blocks)
 
 
@@ -443,12 +510,17 @@ def restore_trainstate_and_precond(parent_dir: str):
   # Directories for params, state, and opt_state
   trainstate_dir = os.path.join(parent_dir, "trainstate")
   precond_dir = os.path.join(parent_dir, "preconditioner")
+  params_dirs = os.path.join(trainstate_dir, "params")
+  opt_state_dir = os.path.join(trainstate_dir, "opt_state")
+  batch_stats_dir = os.path.join(trainstate_dir, "batch_stats")
 
   # Use the existing restore function
-  restored_trainstate = restore_pytree_state(trainstate_dir)
+  restored_params = restore_pytree_state(params_dirs)
+  restored_opt_state = restore_pytree_state(opt_state_dir)
+  restored_batch_stats = restore_pytree_state(batch_stats_dir)
   restored_preconditioner_blocks = restore_pytree_state(precond_dir)
 
-  return restored_trainstate, restored_preconditioner_blocks
+  return {"params": restored_params, "opt_state": restored_opt_state, "batch_stats":restored_batch_stats}, restored_preconditioner_blocks
 
 def checkpoint_exp(run_state: RunState, trainstate, precond_blocks, curr_epoch: int, curr_step: int,
                    dropout_key, best_acc, training_time):
