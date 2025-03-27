@@ -23,4 +23,4 @@ damping: 0.0
 
 # Cluster options
 preempt_handling: false
-jobid: None  # To manually restart a previous job
+jobid: null  # To manually restart a previous job
