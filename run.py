@@ -27,6 +27,8 @@ import lqr_optimizer._src.utils.utils as utl
 def main(cfg: DictConfig):
   # Print the loaded config
   print(OmegaConf.to_yaml(cfg))
+  experiment_name = cfg.dataset.name + "_" + cfg.architecture.name
+  print("Experiment name: {}".format(experiment_name))
 
   # Check for checkpoints
   load_from_preexisting_model_state = False
@@ -37,7 +39,7 @@ def main(cfg: DictConfig):
     else:
       SLURM_JOBID = os.environ["SLURM_JOBID"]
       cfg.jobid = SLURM_JOBID
-    saving_dir = SCRATCH / cfg.experiment_name / SLURM_JOBID
+    saving_dir = SCRATCH / experiment_name / SLURM_JOBID
 
     # Create the directory if it does not exist
     os.makedirs(saving_dir, exist_ok=True)
@@ -48,7 +50,7 @@ def main(cfg: DictConfig):
       load_from_preexisting_model_state = True
     else:  # Initialize the run_state
       run_state = utl.RunState(epoch=0, training_step=0, model_dir=saving_dir,
-                               aim_hash=None, slurm_jobid=SLURM_JOBID, exp_name=cfg.experiment_name,
+                               aim_hash=None, slurm_jobid=SLURM_JOBID, exp_name=experiment_name,
                                dropout_key=jax.random.PRNGKey(cfg.rng_seed),
                                best_accuracy=0.0, training_time=0.0)
 
@@ -57,18 +59,18 @@ def main(cfg: DictConfig):
     aim_hash = None
 
   # Initialize aim for logging
-  run = Run(experiment=cfg.experiment_name, run_hash=aim_hash, force_resume=True)
+  run = Run(experiment=experiment_name, run_hash=aim_hash, force_resume=True)
   run["config"] = OmegaConf.to_container(cfg)
   if cfg.preempt_handling:
     run_state["aim_hash"] = run.hash
 
   # 1) Create the data generator
-  dataloader, num_classes, train_ds_size = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset, augment_dataset=cfg.augment_dataset)
-  test_dataloader, _, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset)
-  steps_per_epoch = train_ds_size // cfg.train_batch_size
+  dataloader, num_classes, train_ds_size = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset)
+  test_dataloader, _, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name)
+  steps_per_epoch = train_ds_size // cfg.batch_size
 
   # 2) Define model
-  model, inf_model = model_choice[cfg.architecture](num_classes=num_classes)
+  model, inf_model = model_choice[cfg.architecture.name](num_classes=num_classes)
   if inf_model is None:
     inf_model = model
 
@@ -77,8 +79,8 @@ def main(cfg: DictConfig):
   variables = model.init(rng, next(dataloader)[0])
   params = variables['params']
   init_batch_stats = variables.get('batch_stats', {})
-  print(jax.tree_map(jnp.shape, params))
-  print(jax.tree_map(jnp.shape, init_batch_stats))
+  print(jax.tree_util.tree_map(jnp.shape, params))
+  print(jax.tree_util.tree_map(jnp.shape, init_batch_stats))
 
   # 4) Create the main optimizer
   model_optimizer = utl.load_main_optimizer(cfg)
@@ -174,8 +176,9 @@ def main(cfg: DictConfig):
   # We'll keep a local dataloader iterator
   data_iter = dataloader  # generator
 
-  dropout_key = run_state["dropout_key"]
+  dropout_key = jax.random.PRNGKey(cfg.rng_seed)
   if load_from_preexisting_model_state:
+    dropout_key = run_state["dropout_key"]
     starting_step = run_state["training_step"]
     best_acc = run_state["best_accuracy"]
     prev_elapsed_time = run_state["training_time"]

@@ -1,0 +1,4 @@
+name: resnet-18
+
+activation: relu
+size: null # TODO: later implementation
