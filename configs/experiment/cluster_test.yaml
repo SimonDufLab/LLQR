@@ -1,4 +1,0 @@
-experiment_name: mnist_mlp_default_cluster
-
-total_steps: 32552
-preempt_handling: true

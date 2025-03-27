@@ -1,0 +1,3 @@
+name: mnist
+
+augment_dataset: false
