@@ -17,6 +17,7 @@ BLOCK_STRUCTURE_DICT = {
   'dense': block_structures.DenseBlock,
   'diagonal': block_structures.DiagonalBlock,
   'scalar': block_structures.ScalarBlock,
+  'kfac': block_structures.KroneckerBlock
 }
 
 class BasePreconditioner(abc.ABC):

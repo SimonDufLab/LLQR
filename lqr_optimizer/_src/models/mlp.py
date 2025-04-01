@@ -19,7 +19,8 @@ class InitDenseRelu(nn.Module):
   @nn.compact
   def __call__(self, x):
     x = x.reshape((x.shape[0], -1)) if x.ndim == 4 else x.reshape((-1,))  # Flatten, assume BHWC images as input
-    return DenseRelu(self.channels)(x)
+    x = nn.Dense(self.channels)(x)
+    return nn.relu(x)
 
 class DenseLogSoftmax(nn.Module):
   channels: int
