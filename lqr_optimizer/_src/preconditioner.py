@@ -32,6 +32,7 @@ class BasePreconditioner(abc.ABC):
                precond_clip_norm,
                preconditioner_update_steps,
                multibatch: bool = False,
+               normalize_grad_for_lqr = True,
                damping:float = 0.0,
                divergence_args_index = -1):
     self._divergence_function = divergence_function
@@ -47,6 +48,14 @@ class BasePreconditioner(abc.ABC):
     self._divergence_args_index = divergence_args_index
     self._preconditioner_update_steps = preconditioner_update_steps
     self._multibatch = multibatch
+    if normalize_grad_for_lqr:
+      self._normalize_grad_for_lqr_fn = normalize_gradient
+    else:
+      self._normalize_grad_for_lqr_fn = lambda _: _  # Nothing, identity fn
+    if precond_clip_norm:
+      self._clip_norm_fn = vmapped_clip_norm
+    else:
+      self._clip_norm_fn = lambda x, _: x # Nothing, identity fn
 
     self._update_preconditioner_fn = self._get_evaluate_lqr(self._optax_solver, self._preconditioner_update_steps, multibatch=self._multibatch)
 
@@ -60,6 +69,8 @@ class BasePreconditioner(abc.ABC):
 
   def _get_evaluate_lqr(self, optax_solver=None, steps=1, multibatch=False):
     def compute_loss(_params, _other_model_variables, x, y):
+      if type(_other_model_variables) is FrozenDict:
+        _other_model_variables = dict(_other_model_variables)
       return self._loss_fn(self._model_apply({'params': _params}|_other_model_variables, x), y)
 
     if multibatch:
@@ -84,7 +95,7 @@ class BasePreconditioner(abc.ABC):
                                                                                                       self._damping,
                                                                                                       other_model_variables)
         gradients = jax.grad(compute_loss, argnums=0)(params, other_model_variables, inputs, targets)
-        gradients = normalize_gradient(gradients)
+        gradients = self._normalize_grad_for_lqr_fn(gradients)
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
         cost = 0
         x = jnp.zeros(states[0].size)
@@ -121,7 +132,7 @@ class BasePreconditioner(abc.ABC):
                                                                                                       self._damping,
                                                                                                       other_model_variables)
         gradients = jax.grad(compute_loss, argnums=0)(params, other_model_variables, inputs, targets)
-        gradients = normalize_gradient(gradients)
+        gradients = self._normalize_grad_for_lqr_fn(gradients)
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
 
         def lqr_cost(_preconditioner):
@@ -150,7 +161,7 @@ class BasePreconditioner(abc.ABC):
       vmapped_evaluate_lqr_grad = jax.vmap(evaluate_lqr_grad, in_axes=(None, None, None, (0, 0)))
       def get_precond_grad(preconditioner, params, other_model_variables, datapoint):
         grads = vmapped_evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint)
-        grads = vmapped_clip_norm(grads, self._clip_norm)
+        grads = self._clip_norm_fn(grads, self._clip_norm)
         return jax.tree_map(Partial(jnp.mean, axis=0), grads)
 
       # @timed_jit # switch back to jax.jit after debugging
@@ -205,7 +216,7 @@ class BasePreconditioner(abc.ABC):
         self._update_preconditioner_fn(self._block_structure.blocks, params, other_model_variables, next(dataloader)))
 
     # print(self._block_structure.blocks["layers_2"])
-    # print(self._block_structure.blocks)
+    print(self._block_structure.blocks)
 
   def expose_blocks(self):
     return self._block_structure.blocks

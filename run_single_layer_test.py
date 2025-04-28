@@ -41,6 +41,8 @@ def main():
   precond_lr = 1e-1  # learning rate for the preconditioner's ADAM
   test_eval_freq = 500
   use_preconditioner = True
+  precond_clip_norm = None
+  normalize_grad_for_lqr = True
 
   optimizer_dict = {"sgd": Partial(optax.sgd, momentum=momentum),
                     "adam": optax.adam, }
@@ -64,6 +66,7 @@ def main():
     params=params,
     tx=model_optimizer
   )
+  print(type(state.params))
 
   # 5) Create the BasePreconditioner
   block_structure = 'dense'
@@ -84,6 +87,7 @@ def main():
     "update_preconditioner_every": update_preconditioner_every,
     "precond_steps": precond_steps,
     "precond_lr": precond_lr,
+    "precond_clip_norm": precond_clip_norm,
     "total_steps": t,
     "test_eval_freq": test_eval_freq,
     "use_preconditioner": use_preconditioner,
@@ -91,6 +95,7 @@ def main():
     "block_structure": block_structure,
     "block_structure_init": block_structure_init,
     "multibatch_training": multibatch_training,
+    "normalize_grad_for_lqr": normalize_grad_for_lqr,
   }
 
   # Initialize BasePreconditioner
@@ -103,7 +108,10 @@ def main():
     network_params=params,
     optax_solver=optax_solver_for_precond,
     damping=0.0,
-    divergence_args_index=None
+    divergence_args_index=None,
+    precond_clip_norm = precond_clip_norm,
+    normalize_grad_for_lqr= normalize_grad_for_lqr,
+    preconditioner_update_steps = precond_steps,
   )
 
   # ---------------------------------------------------------------------------------
@@ -125,7 +133,7 @@ def main():
     if (step % update_preconditioner_every) == 0 and use_preconditioner:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
-      preconditioner.update_preconditioner(state.params, precond_steps, data_iter, multibatch_training)
+      preconditioner.update_preconditioner(state.params, data_iter)
 
     # Grab the next batch for normal training
     x_batch, y_batch = next(data_iter)
