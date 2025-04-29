@@ -247,7 +247,7 @@ def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_data
   Applies specified data augmentation to CIFAR datasets if augment_dataset=True.
   Returns the generator along with the number of classes in the dataset.
   """
-  if dataset == 'mnist':
+  if dataset == 'mnist' or dataset == 'truncated_mnist':
     ds_name = 'mnist'
     mean = 0.1307
     std = 0.3081
@@ -263,9 +263,14 @@ def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_data
     std = jnp.array([0.2675, 0.2565, 0.2761])
     num_classes = 100
   else:
-    raise ValueError("Unsupported dataset. Choose either 'mnist', 'cifar-10', or 'cifar-100'")
+    raise ValueError("Unsupported dataset. Choose either 'mnist', 'truncated_mnist', 'cifar-10', or 'cifar-100'")
 
   ds, info = tfds.load(ds_name, split='train' if train else 'test', as_supervised=True, with_info=True)
+
+  if dataset == 'truncated_mnist' and train:
+    # Shuffle and take a subset of 10,000 examples
+    ds = ds.shuffle(buffer_size=info.splits['train'].num_examples, seed=0)
+    ds = ds.take(10_000)
 
   ds_size = int(ds.cardinality())
   ds = ds.cache()
