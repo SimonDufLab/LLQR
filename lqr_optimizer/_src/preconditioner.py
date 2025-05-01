@@ -42,6 +42,7 @@ class BasePreconditioner(abc.ABC):
     self._clip_norm = precond_clip_norm
     self._layer_names = list(network_params.keys())
     self._block_structure = BLOCK_STRUCTURE_DICT[block_structure](network_params, self._layer_names, block_structure_init)
+    self._block_structure_name = block_structure
     # self._block_structure.make_blocks(network_params, model.layer_names)
     self._layer_apply = model.apply_block_from_params
     self._model_apply = model.apply
@@ -215,8 +216,12 @@ class BasePreconditioner(abc.ABC):
       self._block_structure.update_blocks(
         self._update_preconditioner_fn(self._block_structure.blocks, params, other_model_variables, next(dataloader)))
 
+    if self._block_structure_name in ('scalar', "diagonal"):
+      # We clip to (almost) 0 those 2 structures to avoid gradient inversion
+      self._block_structure.clip_blocks(min_for_block=1e-8)
+
     # print(self._block_structure.blocks["layers_2"])
-    print(self._block_structure.blocks)
+    # print(self._block_structure.blocks)
 
   def expose_blocks(self):
     return self._block_structure.blocks

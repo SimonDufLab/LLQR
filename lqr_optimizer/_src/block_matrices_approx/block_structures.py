@@ -3,6 +3,7 @@ from typing import Tuple, Optional
 import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
+from jax.tree_util import Partial
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 
@@ -23,6 +24,10 @@ class BlockStructures(abc.ABC):
 
   def update_blocks(self, new_blocks):
     self.blocks.update(new_blocks)
+
+  def clip_blocks(self, min_for_block=None, max_for_block=None):
+    block_clip_fn = Partial(jnp.clip, min=min_for_block, max=max_for_block)
+    self.blocks = jax.tree_map(block_clip_fn, self.blocks)
 
   @abc.abstractmethod
   def identity_block_init(self, shape:Optional[Tuple[int, ...]]) -> jnp.ndarray:
