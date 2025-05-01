@@ -16,6 +16,7 @@ precond_clip_norm: 5.0
 use_preconditioner: true
 
 divergence: ngd
+divergence_order_param: 0.5
 block_structure: diagonal
 block_structure_init: identity
 multibatch_training: false

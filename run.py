@@ -9,6 +9,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 
 import jax
 import jax.numpy as jnp
+from jax.tree_util import Partial
 
 import hydra
 from aim import Run
@@ -106,7 +107,8 @@ def main(cfg: DictConfig):
   precond_optimizer = utl.load_precond_optimizer(cfg)
 
   # Initialize BasePreconditioner
-  divergence_f = divergence_choice[cfg.divergence]
+  divergence_kwarg = {"order":cfg.divergence_order_param}
+  divergence_f = Partial(divergence_choice[cfg.divergence], **divergence_kwarg)
   preconditioner = BasePreconditioner(
     divergence_function=divergence_f,
     loss_fn=cross_entropy_loss,
