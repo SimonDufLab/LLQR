@@ -197,11 +197,13 @@ def main(cfg: DictConfig):
       precond_update_start_time = time.time()
       preconditioner.update_preconditioner(state.params, data_iter,
                                            other_model_variables={'batch_stats': state.batch_stats})
-      precond_max, precond_min, precond_norm = preconditioner.get_stats()
+      precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
       # !!Remove below when timing against non-2nd order methods!! (Affect computation time)
       run.track(precond_max, name="Maximum across preconditioner", step=step)
       run.track(precond_min, name="Minimum across preconditioner", step=step)
       run.track(precond_norm, name="Preconditioner l2 norm", step=step)
+      for layer, l_norm in per_layer_norm.items():
+        run.track(l_norm, name=f"{layer} l2 norm", step=step)
       print(f"Preconditioner was updated in {time.time()-precond_update_start_time:.2f} seconds")
 
     # Grab the next batch for normal training

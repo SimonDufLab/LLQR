@@ -66,7 +66,8 @@ class BasePreconditioner(abc.ABC):
   def get_stats(self):
     precond_max, precond_min = pytree_max_min(self._block_structure.blocks)
     precond_norm = pytree_l2_norm(self._block_structure.blocks)
-    return precond_max, precond_min, precond_norm
+    per_layer_norm = jax.tree_map(jnp.linalg.norm, self._block_structure.blocks)
+    return precond_max, precond_min, precond_norm, per_layer_norm
 
   def _get_evaluate_lqr(self, optax_solver=None, steps=1, multibatch=False):
     def compute_loss(_params, _other_model_variables, x, y):
