@@ -70,6 +70,12 @@ def pytree_l2_norm(pytree):
   return jnp.linalg.norm(jnp.concatenate(leaves)) if leaves else jnp.array(0.0)  # Compute L2 norm
 
 
+@jax.jit
+def ravel_pytree_l2_norm(pytree):
+  vector, _ = ravel_pytree(pytree)
+  return jnp.linalg.norm(vector)
+
+
 ##################################
 # Flax utils
 ##################################

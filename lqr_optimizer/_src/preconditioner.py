@@ -8,7 +8,7 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
-from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, vmapped_clip_norm, pytree_max_min, pytree_l2_norm
+from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, vmapped_clip_norm, pytree_max_min, pytree_l2_norm, ravel_pytree_l2_norm
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints,
                              lqr_backward_matrices_and_adjoints)
@@ -66,7 +66,7 @@ class BasePreconditioner(abc.ABC):
   def get_stats(self):
     precond_max, precond_min = pytree_max_min(self._block_structure.blocks)
     precond_norm = pytree_l2_norm(self._block_structure.blocks)
-    per_layer_norm = jax.tree_map(jnp.linalg.norm, self._block_structure.blocks)
+    per_layer_norm = jax.tree_map(ravel_pytree_l2_norm, self._block_structure.blocks)
     return precond_max, precond_min, precond_norm, per_layer_norm
 
   def _get_evaluate_lqr(self, optax_solver=None, steps=1, multibatch=False):
