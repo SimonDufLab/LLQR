@@ -107,7 +107,10 @@ def main(cfg: DictConfig):
   precond_optimizer = utl.load_precond_optimizer(cfg)
 
   # Initialize BasePreconditioner
-  divergence_kwarg = {"order":cfg.divergence_order_param}
+  if cfg.divergence == "renyi":
+    divergence_kwarg = {"order":cfg.divergence_order_param}
+  else:
+    divergence_kwarg = {}
   divergence_f = Partial(divergence_choice[cfg.divergence], **divergence_kwarg)
   preconditioner = BasePreconditioner(
     divergence_function=divergence_f,
