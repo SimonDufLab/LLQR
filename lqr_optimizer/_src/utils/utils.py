@@ -76,6 +76,10 @@ def ravel_pytree_l2_norm(pytree):
   return jnp.linalg.norm(vector)
 
 
+@jax.jit
+def get_per_layer_norm(precond):
+  return {_layer: ravel_pytree_l2_norm(_block) for _layer, _block in precond.items()}
+
 ##################################
 # Flax utils
 ##################################
