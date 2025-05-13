@@ -3,6 +3,7 @@ import os
 import time
 from datetime import timedelta
 import signal
+import optax
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 # os.environ["XLA_FLAGS"] = "--xla_dump_hlo_as_text --xla_force_host_platform_device_count=1"  # Logging XLA compilation, for debugging
@@ -84,11 +85,15 @@ def main(cfg: DictConfig):
   print(jax.tree_util.tree_map(jnp.shape, init_batch_stats))
 
   # 4) Create the main optimizer
+  opt_chain = []
+  if cfg.weight_decay:
+    opt_chain.append(optax.add_decayed_weights(weight_decay=cfg.weight_decay))
   if cfg.lr_scheduler:
     lr_sched_kwargs = {_key:_value for _key, _value in cfg.lr_scheduler.items() if _key!='name'}
     lr_or_sched = lr_schedule_choice[cfg.lr_scheduler.name](base_lr=cfg.learning_rate, steps_per_epoch=steps_per_epoch, **lr_sched_kwargs)
   else: lr_or_sched = cfg.learning_rate
-  model_optimizer = utl.load_main_optimizer(cfg, lr_or_sched)
+  opt_chain.append(utl.load_main_optimizer(cfg, lr_or_sched))
+  model_optimizer = optax.chain(*opt_chain)
 
   if load_from_preexisting_model_state:
     state, precond_blocks = utl.restore_trainstate_and_precond(run_state["model_dir"])
