@@ -2,7 +2,7 @@ batch_size: 128
 learning_rate: 0.1
 momentum: 0.9
 main_optimizer: sgd
-total_steps: 97656
+total_epochs: 250 # used to be total_steps: 97656
 test_eval_freq: 2000
 checkpoint_freq: 1000
 init_key: 42

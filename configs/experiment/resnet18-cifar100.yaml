@@ -1,0 +1,16 @@
+# @package _global_
+defaults:
+  - /default        # includes default.yaml from default/
+  - /architecture: resnet18
+  - /dataset: cifar100
+  - /lr_scheduler: cosine_annealing
+
+batch_size: 128
+learning_rate: 0.1
+momentum: 0.9
+main_optimizer: polyak
+total_epochs: 300
+test_eval_freq: 2000
+checkpoint_freq: 1000
+init_key: 42
+rng_seed: 123 # For dropout, etc.

@@ -16,7 +16,7 @@ from aim import Run
 from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 
-from lqr_optimizer._src.configs.config import model_choice, divergence_choice
+from lqr_optimizer._src.configs.config import model_choice, divergence_choice, lr_schedule_choice
 from lqr_optimizer._src.preconditioner import BasePreconditioner
 from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, loss_eval, compute_accuracy, compute_batch_accuracy
 import lqr_optimizer._src.utils.utils as utl
@@ -57,16 +57,18 @@ def main(cfg: DictConfig):
   else:
     aim_hash = None
 
-  # Initialize aim for logging
+  # 1a) Create the data generator
+  dataloader, num_classes, train_ds_size = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset)
+  test_dataloader, _, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name)
+  steps_per_epoch_rounded = train_ds_size // cfg.batch_size
+  steps_per_epoch = train_ds_size / cfg.batch_size
+  total_steps = ((train_ds_size * cfg.total_epochs) // cfg.batch_size) + 1
+
+  # 1b) Initialize aim for logging
   run = Run(experiment=experiment_name, run_hash=aim_hash, force_resume=True)
   run["config"] = OmegaConf.to_container(cfg)
   if cfg.preempt_handling:
     run_state["aim_hash"] = run.hash
-
-  # 1) Create the data generator
-  dataloader, num_classes, train_ds_size = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset)
-  test_dataloader, _, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name)
-  steps_per_epoch = train_ds_size // cfg.batch_size
 
   # 2) Define model
   model, inf_model = model_choice[cfg.architecture.name](num_classes=num_classes)
@@ -82,7 +84,11 @@ def main(cfg: DictConfig):
   print(jax.tree_util.tree_map(jnp.shape, init_batch_stats))
 
   # 4) Create the main optimizer
-  model_optimizer = utl.load_main_optimizer(cfg)
+  if cfg.lr_scheduler:
+    lr_sched_kwargs = {_key:_value for _key, _value in cfg.lr_scheduler.items() if _key!='name'}
+    lr_or_sched = lr_schedule_choice[cfg.lr_scheduler.name](base_lr=cfg.learning_rate, steps_per_epoch=steps_per_epoch, **lr_sched_kwargs)
+  else: lr_or_sched = cfg.learning_rate
+  model_optimizer = utl.load_main_optimizer(cfg, lr_or_sched)
 
   if load_from_preexisting_model_state:
     state, precond_blocks = utl.restore_trainstate_and_precond(run_state["model_dir"])
@@ -194,7 +200,7 @@ def main(cfg: DictConfig):
     prev_elapsed_time = 0
 
   print(f"Continuing training from step {starting_step}")
-  for step in range(starting_step, cfg.total_steps):
+  for step in range(starting_step, total_steps):
     # Possibly update the preconditioner every `update_preconditioner_every` steps
     if (step % cfg.update_preconditioner_every) == 0 and cfg.use_preconditioner:
       # The preconditioner update can be run on a mini-batch from the dataloader
@@ -246,7 +252,7 @@ def main(cfg: DictConfig):
     if (step > 0) and cfg.preempt_handling and (step % cfg.checkpoint_freq == 0):
       chckpt_init_time = time.time()
       elapsed_time = time.time() - start_time + prev_elapsed_time
-      utl.checkpoint_exp(run_state, state, preconditioner.expose_blocks(), curr_epoch=step // steps_per_epoch,
+      utl.checkpoint_exp(run_state, state, preconditioner.expose_blocks(), curr_epoch=step // steps_per_epoch_rounded,
                          curr_step=step, dropout_key=dropout_key, best_acc=best_acc,
                          training_time=elapsed_time)
       print(

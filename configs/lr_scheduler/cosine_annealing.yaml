@@ -1,0 +1,4 @@
+name: cosine_annealing
+
+t_max: 280
+eta_min: 0.0

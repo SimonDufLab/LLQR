@@ -196,13 +196,13 @@ def timed_jit(f):
 ##################################
 # Loading utils
 ##################################
-def load_main_optimizer(cfg):
+def load_main_optimizer(cfg, lr_or_sched):
   if cfg.main_optimizer == "polyak":
-    model_optimizer = optax.sgd(learning_rate=cfg.learning_rate, momentum=cfg.momentum)
+    model_optimizer = optax.sgd(learning_rate=lr_or_sched, momentum=cfg.momentum)
   elif cfg.main_optimizer == "adam":
-    model_optimizer = optax.adam(learning_rate=cfg.learning_rate)
+    model_optimizer = optax.adam(learning_rate=lr_or_sched)
   elif cfg.main_optimizer == "sgd":
-    model_optimizer = optax.sgd(learning_rate=cfg.learning_rate)
+    model_optimizer = optax.sgd(learning_rate=lr_or_sched)
   else:
     raise ValueError("Unknown main optimizer")
   return model_optimizer
@@ -560,3 +560,39 @@ def signal_handler(signum: int, frame: Optional[
   """
   signal_enum = signal.Signals(signum)
   print(f"Job received a {signal_enum.name} signal!")
+
+
+  ##################################
+  # Hyperparam utils
+  ##################################
+def cosine_annealing_schedule_per_epoch(
+        base_lr: float,
+        t_max: int,
+        steps_per_epoch: float,
+        eta_min: float = 0.0,
+) -> optax.Schedule:
+  """
+  Optax-compatible schedule that mimics PyTorch's CosineAnnealingLR
+  behavior, where the learning rate is updated per epoch.
+
+  Args:
+      base_lr: Initial learning rate (maximum value).
+      t_max: Total number of epochs until eta_min is reached.
+      steps_per_epoch: Number of steps (batches) in one epoch.
+      eta_min: Final learning rate value (default: 0.0).
+
+  Returns:
+      A function that maps step counts to learning rates.
+  """
+  if t_max <= 0:
+    raise ValueError(f"T_max must be positive, got {t_max}")
+  if steps_per_epoch <= 0:
+    raise ValueError(f"steps_per_epoch must be positive, got {steps_per_epoch}")
+
+  def schedule(step_count):
+    t = jnp.floor_divide(step_count, steps_per_epoch).astype(jnp.float32)
+    # t = jnp.minimum(t, t_max)  # TODO: double check, but it seems that Pytorch implementation use warm restart ie lr grows back after t_max
+    cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / t_max))
+    return eta_min + (base_lr - eta_min) * cosine_decay
+
+  return schedule
