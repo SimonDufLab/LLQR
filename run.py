@@ -60,13 +60,14 @@ def main(cfg: DictConfig):
 
   # 1a) Create the data generator
   dataloader, num_classes, train_ds_size = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset)
+  precond_dataloader, _, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset)
   test_dataloader, _, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name)
   steps_per_epoch_rounded = train_ds_size // cfg.batch_size
   steps_per_epoch = train_ds_size / cfg.batch_size
   total_steps = ((train_ds_size * cfg.total_epochs) // cfg.batch_size) + 1
 
   # 1b) Initialize aim for logging
-  run = Run(experiment=experiment_name, run_hash=aim_hash, force_resume=True)
+  run = Run(repo=cfg.logging.aim_repo, experiment=experiment_name, run_hash=aim_hash, force_resume=True)
   run["config"] = OmegaConf.to_container(cfg)
   if cfg.preempt_handling:
     run_state["aim_hash"] = run.hash
@@ -190,7 +191,6 @@ def main(cfg: DictConfig):
   # Start timer
   start_time = time.time()
   # We'll keep a local dataloader iterator
-  data_iter = dataloader  # generator
 
   dropout_key = jax.random.PRNGKey(cfg.rng_seed)
   if load_from_preexisting_model_state:
@@ -211,7 +211,7 @@ def main(cfg: DictConfig):
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
       precond_update_start_time = time.time()
-      preconditioner.update_preconditioner(state.params, data_iter,
+      preconditioner.update_preconditioner(state.params, precond_dataloader,
                                            other_model_variables={'batch_stats': state.batch_stats})
       precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
       # !!Remove below when timing against non-2nd order methods!! (Affect computation time)
@@ -223,7 +223,7 @@ def main(cfg: DictConfig):
       print(f"Preconditioner was updated in {time.time()-precond_update_start_time:.2f} seconds")
 
     # Grab the next batch for normal training
-    x_batch, y_batch = next(data_iter)
+    x_batch, y_batch = next(dataloader)
 
     state, loss = train_step(state, x_batch, y_batch)
 

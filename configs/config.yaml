@@ -4,3 +4,4 @@ defaults:
 
 logging:
   aim: true
+  aim_repo: null

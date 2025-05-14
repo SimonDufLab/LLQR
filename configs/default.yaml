@@ -11,6 +11,7 @@ rng_seed: 123 # For dropout, etc.
 
 update_preconditioner_every: 1000
 precond_steps: 50
+precond_batch_size: 64
 precond_lr: 0.001
 precond_solver: momentum
 precond_clip_norm: 5.0
