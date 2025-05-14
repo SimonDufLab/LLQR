@@ -6,11 +6,11 @@ defaults:
   - /lr_scheduler: cosine_annealing
 
 batch_size: 128
-learning_rate: 0.1
+learning_rate: 0.05
 momentum: 0.9
 main_optimizer: polyak
 weight_decay: 5e-4
-total_epochs: 300
+total_epochs: 200
 test_eval_freq: 2000
 checkpoint_freq: 1000
 init_key: 42

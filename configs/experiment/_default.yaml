@@ -3,5 +3,6 @@ defaults:
   - /default        # includes default.yaml from default/
   - /dataset: mnist  # this now correctly maps to dataset/mnist.yaml
   - /architecture: mlp
+  - /lr_scheduler: null
 
 lr_scheduler: null

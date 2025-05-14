@@ -251,6 +251,32 @@ def loss_eval(state, x, y):
   return cross_entropy_loss(log_probs, y)
 
 
+def apply_cutout(image, size=16, p=0.5):
+  """
+  Randomly masks out a square patch in the image with probability `p`.
+  Works with TensorFlow tensors of shape [H, W, C].
+  """
+  def cutout_fn():
+    h, w = tf.shape(image)[0], tf.shape(image)[1]
+    center_x = tf.random.uniform([], 0, w, dtype=tf.int32)
+    center_y = tf.random.uniform([], 0, h, dtype=tf.int32)
+
+    half_size = size // 2
+    x1 = tf.clip_by_value(center_x - half_size, 0, w)
+    y1 = tf.clip_by_value(center_y - half_size, 0, h)
+    x2 = tf.clip_by_value(center_x + half_size, 0, w)
+    y2 = tf.clip_by_value(center_y + half_size, 0, h)
+
+    mask = tf.ones_like(image, dtype=image.dtype)
+    mask = tf.tensor_scatter_nd_update(mask,
+        indices=tf.reshape(tf.stack(tf.meshgrid(tf.range(y1, y2), tf.range(x1, x2), indexing='ij'), -1), [-1, 2]),
+        updates=tf.zeros([(y2 - y1) * (x2 - x1), tf.shape(image)[-1]], dtype=image.dtype)
+    )
+    return image * mask
+
+  return tf.cond(tf.random.uniform([]) < p, cutout_fn, lambda: image)
+
+
 def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_dataset=False):
   """
   Creates a generator that yields (x, y) from the specified dataset (MNIST, CIFAR-10, or CIFAR-100).
@@ -289,12 +315,20 @@ def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_data
 
   if augment_dataset and train and dataset in ['cifar-10', 'cifar-100']:
     ReflectionPadding2D = tf.keras.layers.Lambda(lambda x: tf.pad(x, [[0, 0], [4, 4], [4, 4], [0, 0]], 'REFLECT'))
-    augmentation_pipeline = tf.keras.Sequential([
-      ReflectionPadding2D,
-      tf.keras.layers.RandomCrop(height=32, width=32),
-      tf.keras.layers.RandomFlip('horizontal')
-    ])
-    ds = ds.map(lambda x, y: (augmentation_pipeline(x), y), num_parallel_calls=tf.data.AUTOTUNE)
+    # augmentation_pipeline = tf.keras.Sequential([
+    #   ReflectionPadding2D,
+    #   tf.keras.layers.RandomCrop(height=32, width=32),
+    #   tf.keras.layers.RandomFlip('horizontal')
+    # ])
+    # ds = ds.map(lambda x, y: (augmentation_pipeline(x), y), num_parallel_calls=tf.data.AUTOTUNE)
+    def augment_with_cutout(x, y):
+      x = ReflectionPadding2D(x)
+      x = tf.image.random_crop(x, size=[tf.shape(x)[0], 32, 32, 3])
+      x = tf.image.random_flip_left_right(x)
+      x = tf.map_fn(lambda img: apply_cutout(img, size=16, p=0.5), x)
+      return x, y
+
+    ds = ds.map(augment_with_cutout, num_parallel_calls=tf.data.AUTOTUNE)
 
   ds = ds.repeat().prefetch(tf.data.AUTOTUNE)
 
@@ -588,11 +622,13 @@ def cosine_annealing_schedule_per_epoch(
     raise ValueError(f"T_max must be positive, got {t_max}")
   if steps_per_epoch <= 0:
     raise ValueError(f"steps_per_epoch must be positive, got {steps_per_epoch}")
+  step_max = steps_per_epoch * t_max
 
   def schedule(step_count):
-    t = jnp.floor_divide(step_count, steps_per_epoch).astype(jnp.float32)
+    # t = jnp.floor_divide(step_count, steps_per_epoch).astype(jnp.float32)
+    t = step_count
     # t = jnp.minimum(t, t_max)  # TODO: double check, but it seems that Pytorch implementation use warm restart ie lr grows back after t_max
-    cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / t_max))
+    cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / step_max))
     return eta_min + (base_lr - eta_min) * cosine_decay
 
   return schedule

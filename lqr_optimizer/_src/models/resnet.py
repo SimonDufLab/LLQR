@@ -16,20 +16,30 @@ from lqr_optimizer._src.utils.utils import EnhancedSequential
 #     (if needed) projects identity before adding and applying relu.
 # ============================================================================
 
-class StemBlock(nn.Module):
-  """Initial stem: 7×7 conv, batch norm, ReLU and MaxPool."""
+# class StemBlock(nn.Module): # Original version, better suited to ImageNet
+#   """Initial stem: 7×7 conv, batch norm, ReLU and MaxPool."""
+#   inference: bool = False
+#
+#   @nn.compact
+#   def __call__(self, x):
+#     # One conv here (with bn and relu grouped) counts as one block.
+#     x = nn.Conv(features=64, kernel_size=(7, 7), strides=(2, 2),
+#                 padding='SAME', use_bias=False)(x)
+#     x = nn.BatchNorm(use_running_average=self.inference)(x)
+#     x = nn.relu(x)
+#     x = nn.max_pool(x, window_shape=(3,3),
+#                        strides=(2,2), padding='SAME')
+#     return x
+
+
+class StemBlock(nn.Module):  # Version  for  Cifar-10/100, better suited to smaller img resolution
   inference: bool = False
 
   @nn.compact
   def __call__(self, x):
-    # One conv here (with bn and relu grouped) counts as one block.
-    x = nn.Conv(features=64, kernel_size=(7, 7), strides=(2, 2),
-                padding='SAME', use_bias=False)(x)
+    x = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1), padding='SAME', use_bias=False)(x)
     x = nn.BatchNorm(use_running_average=self.inference)(x)
-    x = nn.relu(x)
-    x = nn.max_pool(x, window_shape=(3,3),
-                       strides=(2,2), padding='SAME')
-    return x
+    return nn.relu(x)
 
 
 # class MaxPool(nn.Module):
