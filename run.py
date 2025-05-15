@@ -89,7 +89,7 @@ def main(cfg: DictConfig):
   opt_chain = []
   if cfg.weight_decay:
     opt_chain.append(optax.add_decayed_weights(weight_decay=cfg.weight_decay))
-  if cfg.lr_scheduler:
+  if cfg.lr_scheduler and cfg.lr_scheduler.name != "constant":
     lr_sched_kwargs = {_key:_value for _key, _value in cfg.lr_scheduler.items() if _key!='name'}
     lr_or_sched = lr_schedule_choice[cfg.lr_scheduler.name](base_lr=cfg.learning_rate, steps_per_epoch=steps_per_epoch, **lr_sched_kwargs)
   else: lr_or_sched = cfg.learning_rate
@@ -135,6 +135,7 @@ def main(cfg: DictConfig):
     precond_clip_norm=cfg.precond_clip_norm,
     preconditioner_update_steps=cfg.precond_steps,
     multibatch=cfg.multibatch_training,
+    normalize_grad_for_lqr = cfg.normalize_grad_for_lqr,
     damping=cfg.damping,
     divergence_args_index=-1
   )

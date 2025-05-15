@@ -5,4 +5,4 @@ defaults:
   - /architecture: mlp
   - /lr_scheduler: null
 
-lr_scheduler: null
+lr_scheduler: null  # TODO: introduces a mismatch when overriding with default experiment
