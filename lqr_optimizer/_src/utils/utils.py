@@ -409,6 +409,41 @@ class TrainState(train_state.TrainState):
   apply_inf_fn: Callable
   batch_stats: Any
 
+  def apply_gradients_and_precond(self, *, grads, precond_apply, **kwargs):
+    """Same as original apply_gradients from Flax, but applies preconditiner on update instead of gradient
+    (i.e. after applying momentum for example)
+    """
+    # From original -->
+    if OVERWRITE_WITH_GRADIENT in grads:
+      grads_with_opt = grads['params']
+      params_with_opt = self.params['params']
+    else:
+      grads_with_opt = grads
+      params_with_opt = self.params
+
+    updates, new_opt_state = self.tx.update(
+      grads_with_opt, self.opt_state, params_with_opt
+    )
+    # <-- until here
+    new_params_with_opt = optax.apply_updates(params_with_opt, precond_apply(updates))
+    # And then again from original -->
+
+    # As implied by the OWG name, the gradients are used directly to update the
+    # parameters.
+    if OVERWRITE_WITH_GRADIENT in grads:
+      new_params = {
+        'params': new_params_with_opt,
+        OVERWRITE_WITH_GRADIENT: grads[OVERWRITE_WITH_GRADIENT],
+      }
+    else:
+      new_params = new_params_with_opt
+    return self.replace(
+      step=self.step + 1,
+      params=new_params,
+      opt_state=new_opt_state,
+      **kwargs,
+    )
+
   @classmethod
   def create(cls, *, apply_fn, params, tx, opt_state=None, **kwargs):
     """Creates a new instance with ``step=0`` and initialized ``opt_state``."""

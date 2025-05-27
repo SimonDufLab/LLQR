@@ -132,9 +132,11 @@ def main(cfg: DictConfig):
     model=inf_model,
     network_params=params,
     optax_solver=precond_optimizer,
+    trainstate_solver=state.tx,
     precond_clip_norm=cfg.precond_clip_norm,
     preconditioner_update_steps=cfg.precond_steps,
     multibatch=cfg.multibatch_training,
+    precond_on_update=cfg.precond_on_update,
     normalize_grad_for_lqr = cfg.normalize_grad_for_lqr,
     damping=cfg.damping,
     divergence_args_index=-1
@@ -168,25 +170,16 @@ def main(cfg: DictConfig):
 
   # @jax.jit
   def train_step(state, x, y):
-    # @jax.jit
-    # def loss_fn(params):
-    #   # Pass both params and batch_stats, and mark batch_stats as mutable.
-    #   (log_probs, new_model_state) = state.apply_fn(
-    #     {'params': params, 'batch_stats': state.batch_stats},
-    #     x,
-    #     mutable=['batch_stats']
-    #   )
-    #   loss = cross_entropy_loss(log_probs, y)
-    #   return loss, new_model_state
-
-    # Compute the loss and gradients. Note: we use has_aux=True to get new_model_state.
-    # (loss, new_model_state), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     (loss, new_model_state), grads = compute_updates(state.params, state.batch_stats, x, y)
 
-    # 2) Apply the preconditioner on the gradient
-    precond_grads = preconditioner.apply(grads)
+    if cfg.precond_on_update:
+      new_state = state.apply_gradients_and_precond(grads=grads, precond_apply=preconditioner.apply,
+                                                    batch_stats=new_model_state['batch_stats'])
+    else:
+      # Apply the preconditioner on the gradient
+      precond_grads = preconditioner.apply(grads)
+      new_state = state.apply_gradients(grads=precond_grads, batch_stats=new_model_state['batch_stats'])
 
-    new_state = state.apply_gradients(grads=precond_grads, batch_stats=new_model_state['batch_stats'])
     return new_state, loss
 
   # Start timer
@@ -212,7 +205,7 @@ def main(cfg: DictConfig):
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
       precond_update_start_time = time.time()
-      preconditioner.update_preconditioner(state.params, precond_dataloader,
+      preconditioner.update_preconditioner(state.params, precond_dataloader, state.opt_state,
                                            other_model_variables={'batch_stats': state.batch_stats})
       precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
       # !!Remove below when timing against non-2nd order methods!! (Affect computation time)

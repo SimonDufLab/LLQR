@@ -14,6 +14,7 @@ precond_steps: 50
 precond_batch_size: 64
 precond_lr: 0.001
 precond_solver: momentum
+precond_on_update: false
 precond_clip_norm: 5.0
 normalize_grad_for_lqr: true
 use_preconditioner: true

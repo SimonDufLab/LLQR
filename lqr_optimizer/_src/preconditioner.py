@@ -29,9 +29,11 @@ class BasePreconditioner(abc.ABC):
                model,
                network_params,
                optax_solver,
+               trainstate_solver,
                precond_clip_norm,
                preconditioner_update_steps,
                multibatch: bool = False,
+               precond_on_update: bool =False,
                normalize_grad_for_lqr = True,
                damping:float = 0.0,
                divergence_args_index = -1):
@@ -39,6 +41,7 @@ class BasePreconditioner(abc.ABC):
     self._damping =damping
     self._loss_fn = loss_fn
     self._optax_solver = optax_solver
+    self._trainstate_solver = trainstate_solver
     self._clip_norm = precond_clip_norm
     self._layer_names = list(network_params.keys())
     self._block_structure = BLOCK_STRUCTURE_DICT[block_structure](network_params, self._layer_names, block_structure_init)
@@ -49,6 +52,7 @@ class BasePreconditioner(abc.ABC):
     self._divergence_args_index = divergence_args_index
     self._preconditioner_update_steps = preconditioner_update_steps
     self._multibatch = multibatch
+    self._precond_on_update = precond_on_update
     if normalize_grad_for_lqr:
       self._normalize_grad_for_lqr_fn = normalize_gradient
     else:
@@ -58,7 +62,9 @@ class BasePreconditioner(abc.ABC):
     else:
       self._clip_norm_fn = lambda x, _: x # Nothing, identity fn
 
-    self._update_preconditioner_fn = self._get_evaluate_lqr(self._optax_solver, self._preconditioner_update_steps, multibatch=self._multibatch)
+    self._update_preconditioner_fn = self._get_evaluate_lqr(self._optax_solver, self._preconditioner_update_steps,
+                                                            multibatch=self._multibatch,
+                                                            precond_on_update=self._precond_on_update)
 
   def apply(self, update):
     return self._block_structure.matrix_product(self._block_structure.blocks, update)
@@ -69,7 +75,7 @@ class BasePreconditioner(abc.ABC):
     per_layer_norm = get_per_layer_norm(self._block_structure.blocks)
     return precond_max, precond_min, precond_norm, per_layer_norm
 
-  def _get_evaluate_lqr(self, optax_solver=None, steps=1, multibatch=False):
+  def _get_evaluate_lqr(self, optax_solver=None, steps=1, multibatch=False, precond_on_update=False):
     def compute_loss(_params, _other_model_variables, x, y):
       if type(_other_model_variables) is FrozenDict:
         _other_model_variables = dict(_other_model_variables)
@@ -114,7 +120,7 @@ class BasePreconditioner(abc.ABC):
 
     else:
       # @jax.jit
-      def evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint):
+      def evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
         a, b, a_transpose, states = lqr_forward_matrices_and_states(inputs, params, self._layer_apply,
                                                                     self._layer_names, other_model_variables)
@@ -134,6 +140,8 @@ class BasePreconditioner(abc.ABC):
                                                                                                       self._damping,
                                                                                                       other_model_variables)
         gradients = jax.grad(compute_loss, argnums=0)(params, other_model_variables, inputs, targets)
+        if precond_on_update:
+          gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state)
         gradients = self._normalize_grad_for_lqr_fn(gradients)
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
 
@@ -160,9 +168,9 @@ class BasePreconditioner(abc.ABC):
         local_precond_grad = jax.grad(lqr_cost, argnums=0)(preconditioner)
         return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), local_precond_grad)
 
-      vmapped_evaluate_lqr_grad = jax.vmap(evaluate_lqr_grad, in_axes=(None, None, None, (0, 0)))
-      def get_precond_grad(preconditioner, params, other_model_variables, datapoint):
-        grads = vmapped_evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint)
+      vmapped_evaluate_lqr_grad = jax.vmap(evaluate_lqr_grad, in_axes=(None, None, None, (0, 0), None))
+      def get_precond_grad(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state):
+        grads = vmapped_evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state)
         grads = self._clip_norm_fn(grads, self._clip_norm)
         return jax.tree_map(Partial(jnp.mean, axis=0), grads)
 
@@ -179,14 +187,14 @@ class BasePreconditioner(abc.ABC):
       # return get_update
 
       @jax.jit
-      def get_update(preconditioner, params, other_model_variables, datapoint):
+      def get_update(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state):
         # Initialize the optimizer state for the preconditioner.
         opt_state = optax_solver.init(preconditioner)
 
         # Define a single update step to be run in the compiled loop.
         def update_step(i, state):
           precond, opt_state = state
-          precond_grad = get_precond_grad(precond, params, other_model_variables, datapoint)
+          precond_grad = get_precond_grad(precond, params, other_model_variables, datapoint, trainstate_opt_state)
           updates, opt_state = optax_solver.update(precond_grad, opt_state)
           new_precond = optax.apply_updates(precond, updates)
           return (new_precond, opt_state)
@@ -199,7 +207,7 @@ class BasePreconditioner(abc.ABC):
 
       return get_update
 
-  def update_preconditioner(self, params, dataloader, other_model_variables=FrozenDict({})):
+  def update_preconditioner(self, params, dataloader, opt_state, other_model_variables=FrozenDict({})):
     """params is the current weights of the NN"""
     if self._multibatch:
       lqr_loss_fn = lambda x, y : jnp.mean(jax.vmap(self._get_evaluate_lqr(params, multibatch=True, other_model_variables=other_model_variables), in_axes=(None, (0,0)))(x, y))
@@ -215,7 +223,7 @@ class BasePreconditioner(abc.ABC):
         # print(_cost)
     else:
       self._block_structure.update_blocks(
-        self._update_preconditioner_fn(self._block_structure.blocks, params, other_model_variables, next(dataloader)))
+        self._update_preconditioner_fn(self._block_structure.blocks, params, other_model_variables, next(dataloader), opt_state))
 
     if self._block_structure_name in ('scalar', "diagonal"):
       # We clip to (almost) 0 those 2 structures to avoid gradient inversion
