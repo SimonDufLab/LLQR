@@ -141,7 +141,7 @@ class BasePreconditioner(abc.ABC):
                                                                                                     other_model_variables)
       gradients = jax.grad(compute_loss, argnums=0)(params, other_model_variables, inputs, targets)
       if precond_on_update:
-        gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state)
+        gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state, params)
       gradients = self._normalize_grad_for_lqr_fn(gradients)
       gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
 
