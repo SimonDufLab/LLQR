@@ -409,7 +409,53 @@ class TrainState(train_state.TrainState):
   apply_inf_fn: Callable
   batch_stats: Any
 
-  def apply_gradients_and_precond(self, *, grads, precond_apply, **kwargs):
+  def apply_gradients(self, *, grads, normalize_conv_params=False, **kwargs):
+    """Updates ``step``, ``params``, ``opt_state`` and ``**kwargs`` in return value.
+
+    Note that internally this function calls ``.tx.update()`` followed by a call
+    to ``optax.apply_updates()`` to update ``params`` and ``opt_state``.
+
+    Args:
+      grads: Gradients that have the same pytree structure as ``.params``.
+      normalize_conv_params: Whether to normalize conv kernel params before applying updates.
+      **kwargs: Additional dataclass attributes that should be ``.replace()``-ed.
+
+    Returns:
+      An updated instance of ``self`` with ``step`` incremented by one, ``params``
+      and ``opt_state`` updated by applying ``grads``, and additional attributes
+      replaced as specified by ``kwargs``.
+    """
+    if OVERWRITE_WITH_GRADIENT in grads:
+      grads_with_opt = grads['params']
+      params_with_opt = self.params['params']
+    else:
+      grads_with_opt = grads
+      params_with_opt = self.params
+
+    updates, new_opt_state = self.tx.update(
+      grads_with_opt, self.opt_state, params_with_opt
+    )
+    if normalize_conv_params:
+      params_with_opt = normalize_conv_params_l2(params_with_opt)
+    new_params_with_opt = optax.apply_updates(params_with_opt, updates)
+
+    # As implied by the OWG name, the gradients are used directly to update the
+    # parameters.
+    if OVERWRITE_WITH_GRADIENT in grads:
+      new_params = {
+        'params': new_params_with_opt,
+        OVERWRITE_WITH_GRADIENT: grads[OVERWRITE_WITH_GRADIENT],
+      }
+    else:
+      new_params = new_params_with_opt
+    return self.replace(
+      step=self.step + 1,
+      params=new_params,
+      opt_state=new_opt_state,
+      **kwargs,
+    )
+
+  def apply_gradients_and_precond(self, *, grads, precond_apply, normalize_conv_params=False, **kwargs):
     """Same as original apply_gradients from Flax, but applies preconditiner on update instead of gradient
     (i.e. after applying momentum for example)
     """
@@ -425,6 +471,8 @@ class TrainState(train_state.TrainState):
       grads_with_opt, self.opt_state, params_with_opt
     )
     # <-- until here
+    if normalize_conv_params:
+      params_with_opt = normalize_conv_params_l2(params_with_opt)
     new_params_with_opt = optax.apply_updates(params_with_opt, precond_apply(updates))
     # And then again from original -->
 
@@ -667,3 +715,27 @@ def cosine_annealing_schedule_per_epoch(
     return eta_min + (base_lr - eta_min) * cosine_decay
 
   return schedule
+
+
+##################################
+# "Trick" utils
+##################################
+def normalize_conv_params_l2(params):
+    """
+    Normalize parameter tensors to have L2 norm = sqrt(N) if they have >= 4 dimension.
+    Leaves with only 1 dimension (e.g. biases) are ignored.
+
+    Args:
+        params (PyTree): A nested dict of model parameters.
+
+    Returns:
+        PyTree with the same structure and normalized parameters.
+    """
+    def maybe_normalize_leaf(p):
+        if p.ndim < 4:
+            return p
+        norm = jnp.linalg.norm(p)
+        scale = jnp.sqrt(p.size) / jnp.maximum(norm, 1e-8)
+        return p * scale
+
+    return jax.tree_util.tree_map(maybe_normalize_leaf, params)

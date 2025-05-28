@@ -17,6 +17,7 @@ precond_solver: momentum
 precond_on_update: false
 precond_clip_norm: 5.0
 normalize_grad_for_lqr: true
+normalize_conv_params: false
 use_preconditioner: true
 
 divergence: ngd

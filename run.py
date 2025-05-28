@@ -174,11 +174,13 @@ def main(cfg: DictConfig):
 
     if cfg.precond_on_update:
       new_state = state.apply_gradients_and_precond(grads=grads, precond_apply=preconditioner.apply,
+                                                    normalize_conv_params=cfg.normalize_conv_params,
                                                     batch_stats=new_model_state['batch_stats'])
     else:
       # Apply the preconditioner on the gradient
       precond_grads = preconditioner.apply(grads)
-      new_state = state.apply_gradients(grads=precond_grads, batch_stats=new_model_state['batch_stats'])
+      new_state = state.apply_gradients(grads=precond_grads, normalize_conv_params=cfg.normalize_conv_params,
+                                        batch_stats=new_model_state['batch_stats'])
 
     return new_state, loss
 
