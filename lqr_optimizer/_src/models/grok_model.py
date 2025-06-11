@@ -111,13 +111,13 @@ class LastLayer(nn.Module):
 def create_grok_model(
     num_classes: int,
     vocab_size: int,
-    depth: int = 2 #16,
+    depth: int = 16,
 ) -> Tuple[EnhancedSequential, None]:
-    mlp_dim = 64 #512
+    mlp_dim = 512
     max_length = 5
-    heads = 2 #4
-    hidden_dim = 32 #128
-    attn_dim = 4 #32
+    heads = 4
+    hidden_dim = 128
+    attn_dim = 32
 
     layers = []
     layers.append(InitLayer(
