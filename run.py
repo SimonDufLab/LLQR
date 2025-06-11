@@ -58,10 +58,11 @@ def main(cfg: DictConfig):
   else:
     aim_hash = None
 
-  # 1a) Create the data generator
-  dataloader, num_classes, train_ds_size = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset)
-  precond_dataloader, _, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset)
-  test_dataloader, _, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name)
+  # 1a) Create the data generators
+  dataloader, ds_info = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset)
+  num_classes, train_ds_size = ds_info['num_classes'], ds_info['ds_size']
+  precond_dataloader, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset)
+  test_dataloader, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name)
   steps_per_epoch_rounded = train_ds_size // cfg.batch_size
   steps_per_epoch = train_ds_size / cfg.batch_size
   total_steps = ((train_ds_size * cfg.total_epochs) // cfg.batch_size) + 1
@@ -73,7 +74,10 @@ def main(cfg: DictConfig):
     run_state["aim_hash"] = run.hash
 
   # 2) Define model
-  model, inf_model = model_choice[cfg.architecture.name](num_classes=num_classes)
+  model_kwargs = {}
+  if "grok" in cfg.architecture.name:
+    model_kwargs["vocab_size"] = ds_info["vocab_size"]
+  model, inf_model = model_choice[cfg.architecture.name](num_classes=num_classes, **model_kwargs)
   if inf_model is None:
     inf_model = model
 
@@ -91,7 +95,7 @@ def main(cfg: DictConfig):
     opt_chain.append(optax.add_decayed_weights(weight_decay=cfg.weight_decay))
   if cfg.lr_scheduler and cfg.lr_scheduler.name != "constant":
     lr_sched_kwargs = {_key:_value for _key, _value in cfg.lr_scheduler.items() if _key!='name'}
-    lr_or_sched = lr_schedule_choice[cfg.lr_scheduler.name](base_lr=cfg.learning_rate, steps_per_epoch=steps_per_epoch, **lr_sched_kwargs)
+    lr_or_sched = lr_schedule_choice[cfg.lr_scheduler.name](base_lr=cfg.learning_rate, total_epochs=cfg.total_epochs ,steps_per_epoch=steps_per_epoch, **lr_sched_kwargs)
   else: lr_or_sched = cfg.learning_rate
   opt_chain.append(utl.load_main_optimizer(cfg, lr_or_sched))
   model_optimizer = optax.chain(*opt_chain)
@@ -224,17 +228,17 @@ def main(cfg: DictConfig):
     state, loss = train_step(state, x_batch, y_batch)
 
     # Logging or testing every so often
-    if step % 10 == 0:
+    if step % cfg.logging_freq == 0:
       # Simple logging
       # train_loss = loss_eval(state, x_batch, y_batch)
       train_loss = loss
-      elapsed_time = time.time() - start_time + prev_elapsed_time # Calculate elapsed time
       run.track(train_loss, name="train loss", step=step)
       # Compute batch accuracy
       batch_accuracy = compute_batch_accuracy(state, x_batch, y_batch)
       run.track(batch_accuracy, name="train accuracy", step=step)
-      if step % 200 == 0:
+      if step % cfg.report_freq == 0:
         # Print info
+        elapsed_time = time.time() - start_time + prev_elapsed_time  # Calculate elapsed time
         print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
     if step % cfg.test_eval_freq == 0:

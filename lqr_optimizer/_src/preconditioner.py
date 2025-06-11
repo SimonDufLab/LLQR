@@ -154,7 +154,7 @@ class BasePreconditioner(abc.ABC):
           cost += (x.T @ q_backward[-i - 1](x) + u.T @ r_backward[-i - 1](u)) / 2 + u.T @ m_backward[-i - 1](x)
           x = a[i](x) + b[i](u)
 
-        cost += x.T @ final_lin_cost + (x.T @ final_q(x)) / 2
+        cost += x.T @ jnp.squeeze(final_lin_cost) + (x.T @ final_q(x)) / 2
 
         return cost
 
@@ -170,6 +170,9 @@ class BasePreconditioner(abc.ABC):
 
     vmapped_evaluate_lqr_grad = jax.vmap(evaluate_lqr_grad, in_axes=(None, None, None, (0, 0), None))
     def get_precond_grad(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state):
+      # print(datapoint[0].shape)
+      datapoint = tuple(jnp.expand_dims(x, axis=1) for x in datapoint)
+      # print(datapoint[0].shape)
       grads = vmapped_evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state)
       grads = self._clip_norm_fn(grads, self._clip_norm)
       return jax.tree_map(Partial(jnp.mean, axis=0), grads)

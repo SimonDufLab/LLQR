@@ -1,4 +1,4 @@
 name: mlp
 
-activation: relu
+activation: relu # TODO: later implementation
 size: null # TODO: later implementation

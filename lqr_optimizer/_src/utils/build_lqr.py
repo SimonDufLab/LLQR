@@ -41,7 +41,7 @@ def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, ot
 
     # JVPs
     _, b_fn = jax.linearize(partial_apply_params, layer_params)
-    _, a_fn = jax.linearize(partial_apply_inputs, layer_state)
+    _, a_fn = jax.linearize(partial_apply_inputs, jnp.float32(layer_state))
     a.append(a_fn)
     b.append(b_fn)
     # VJPs
@@ -72,13 +72,13 @@ def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_
       # return jnp.sum(vmap(div_f)(div_arg, logits))
     grad_div_fn = jax.grad(div_fn)
     final_p = grad_div_fn(final_states)
-    _, final_q = jax.linearize(grad_div_fn, jnp.atleast_1d(final_states))
+    _, final_q = jax.linearize(grad_div_fn, jnp.ravel(jnp.atleast_1d(final_states)))
 
     return final_q, final_p, final_lin_cost
     # return add_f(Q_T, diag_Ri(1)), p_T, a_T
 
   else:  # Case where a_T = p_T  -> Newton's method
-    _, final_q = jax.linearize(grad_fn, jnp.atleast_1d(final_states))
+    _, final_q = jax.linearize(grad_fn, jnp.ravel(jnp.atleast_1d(final_states)))
     # Q_T = diag_Ri(1)  # Should be zero for true gradient descent
 
     return final_q, final_lin_cost, final_lin_cost
@@ -88,7 +88,7 @@ def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, a_transpos
                                        other_model_variables=FrozenDict({})):
   """ Retrieve, in backward order, the Q_i R_i and M_i matrices needed for the resolution of the Riccati equation
   """
-  p_backward = [jnp.atleast_1d(final_adjoint)]
+  p_backward = [jnp.ravel(jnp.atleast_1d(final_adjoint))]
   q_backward = []
   r_backward = []
   m_backward = []
@@ -109,19 +109,25 @@ def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, a_transpos
     def hamiltonian(parameters, p_i, x_i):
       return jnp.dot(ravel_pytree(simpler_apply(parameters, x_i))[0], p_i)
 
-    p_backward.append(a_transpose[j](p_backward[-1]))
+    p_backward.append(a_transpose[j](jnp.ravel(p_backward[-1])))
 
     # R and Q calculations can only be removed when using relu activations
     # Get Q matrices
     def hamiltonian_x(x_i):
-      return hamiltonian(layer_params, p_backward[i], x_i)
+      return hamiltonian(layer_params, jnp.ravel(p_backward[i]), x_i)
 
-    _, q_i = jax.linearize(jax.grad(hamiltonian_x), layer_state)
+    # _, q_i = jax.linearize(jax.grad(hamiltonian_x, allow_int=True), layer_state)
+    def vjp_func(x):
+      _, vjp_pullback = jax.vjp(hamiltonian_x, x)
+      return vjp_pullback(1.0)[0]  # For scalar-output, this is grad(hamiltonian_x)(x)
+
+    _, q_i = jax.linearize(vjp_func, jnp.float32(layer_state))
+
     q_backward.append(q_i)
 
     # Get R matrices
     def hamiltonian_u(parameters):
-      return hamiltonian(parameters, p_backward[i], layer_state)
+      return hamiltonian(parameters, jnp.ravel(p_backward[i]), layer_state)
 
     _, r_i = jax.linearize(jax.grad(hamiltonian_u), layer_params)
     r_i = add_f(r_i, diag_r(damping))  # Replaced by adaptive damping inserted at inversion of R + B^TKB
@@ -129,7 +135,7 @@ def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, a_transpos
 
     # Get M Matrices
     fn = Partial(jax.grad(hamiltonian), layer_params, p_backward[i])
-    _, m_i = jax.linearize(fn, layer_state)
+    _, m_i = jax.linearize(fn, jnp.float32(layer_state))
     m_i_transpose = vjp_f(fn, layer_state)
     m_backward.append(m_i)
     m_transpose_backward.append(m_i_transpose)

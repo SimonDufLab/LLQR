@@ -20,6 +20,8 @@ from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable
 from types import FrameType
 from pathlib import Path
 
+from lqr_optimizer._src.utils.grokking_dataset import ModSumDataset, ModDivisonDataset, ModSubtractDataset, PermutationGroup, load_grok_ds
+
 def vjp_f(f, x):
   """ Return the vjp in a form that can be applied directly over a vector
   """
@@ -203,6 +205,8 @@ def load_main_optimizer(cfg, lr_or_sched):
     model_optimizer = optax.adam(learning_rate=lr_or_sched)
   elif cfg.main_optimizer == "sgd":
     model_optimizer = optax.sgd(learning_rate=lr_or_sched)
+  elif cfg.main_optimizer == "adam_b2-98":
+    model_optimizer = optax.adam(learning_rate=lr_or_sched, b2=0.98)
   else:
     raise ValueError("Unknown main optimizer")
   return model_optimizer
@@ -283,69 +287,89 @@ def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_data
   Applies specified data augmentation to CIFAR datasets if augment_dataset=True.
   Returns the generator along with the number of classes in the dataset.
   """
-  if dataset == 'mnist' or dataset == 'truncated_mnist':
-    ds_name = 'mnist'
-    mean = 0.1307
-    std = 0.3081
-    num_classes = 10
-  elif dataset == 'cifar-10':
-    ds_name = 'cifar10'
-    mean = jnp.array([0.4914, 0.4822, 0.4465])
-    std = jnp.array([0.2470, 0.2435, 0.2616])
-    num_classes = 10
-  elif dataset == 'cifar-100':
-    ds_name = 'cifar100'
-    mean = jnp.array([0.5071, 0.4867, 0.4408])
-    std = jnp.array([0.2675, 0.2565, 0.2761])
-    num_classes = 100
+  grokking_datasets = {
+    'mod_sum': lambda: ModSumDataset(frac_train=0.9, p=97, k=5),
+    'mod_subtract': lambda: ModSubtractDataset(frac_train=0.9, p=97, k=5),
+    'mod_division': lambda: ModDivisonDataset(frac_train=0.9, p=97, k=5),
+    'permutation': lambda: PermutationGroup(frac_train=0.9, p=97, k=5),
+  }
+  if dataset in grokking_datasets:
+    split = 'train' if train else 'test'
+    ds = grokking_datasets[dataset]()
+    iterator, info = load_grok_ds(ds, split=split, batch_size=batch_size, with_info=True)
+
+    # Note: grokking data is already int32 and normalized
+    def generator():
+      for x_batch, y_batch in iterator:
+        yield x_batch, y_batch
+
+    return generator(), info
+
   else:
-    raise ValueError("Unsupported dataset. Choose either 'mnist', 'truncated_mnist', 'cifar-10', or 'cifar-100'")
+    info = {}
+    if dataset == 'mnist' or dataset == 'truncated_mnist':
+      ds_name = 'mnist'
+      mean = 0.1307
+      std = 0.3081
+      info["num_classes"] = 10
+    elif dataset == 'cifar-10':
+      ds_name = 'cifar10'
+      mean = jnp.array([0.4914, 0.4822, 0.4465])
+      std = jnp.array([0.2470, 0.2435, 0.2616])
+      info["num_classes"] = 10
+    elif dataset == 'cifar-100':
+      ds_name = 'cifar100'
+      mean = jnp.array([0.5071, 0.4867, 0.4408])
+      std = jnp.array([0.2675, 0.2565, 0.2761])
+      info["num_classes"] = 100
+    else:
+      raise ValueError("Unsupported dataset. Choose either 'mnist', 'truncated_mnist', 'cifar-10', or 'cifar-100'")
 
-  ds, info = tfds.load(ds_name, split='train' if train else 'test', as_supervised=True, with_info=True)
+    ds, _info = tfds.load(ds_name, split='train' if train else 'test', as_supervised=True, with_info=True)
 
-  if dataset == 'truncated_mnist' and train:
-    # Shuffle and take a subset of 10,000 examples
-    ds = ds.shuffle(buffer_size=info.splits['train'].num_examples, seed=0)
-    ds = ds.take(10_000)
+    if dataset == 'truncated_mnist' and train:
+      # Shuffle and take a subset of 10,000 examples
+      ds = ds.shuffle(buffer_size=_info.splits['train'].num_examples, seed=0)
+      ds = ds.take(10_000)
 
-  ds_size = int(ds.cardinality())
-  ds = ds.cache()
-  ds = ds.shuffle(ds_size, seed=0, reshuffle_each_iteration=True)
-  ds = ds.batch(batch_size)
+    info["ds_size"] = int(ds.cardinality())
+    ds = ds.cache()
+    ds = ds.shuffle(info["ds_size"], seed=0, reshuffle_each_iteration=True)
+    ds = ds.batch(batch_size)
 
-  if augment_dataset and train and dataset in ['cifar-10', 'cifar-100']:
-    ReflectionPadding2D = tf.keras.layers.Lambda(lambda x: tf.pad(x, [[0, 0], [4, 4], [4, 4], [0, 0]], 'REFLECT'))
-    # augmentation_pipeline = tf.keras.Sequential([
-    #   ReflectionPadding2D,
-    #   tf.keras.layers.RandomCrop(height=32, width=32),
-    #   tf.keras.layers.RandomFlip('horizontal')
-    # ])
-    # ds = ds.map(lambda x, y: (augmentation_pipeline(x), y), num_parallel_calls=tf.data.AUTOTUNE)
-    def augment_with_cutout(x, y):
-      x = ReflectionPadding2D(x)
-      x = tf.image.random_crop(x, size=[tf.shape(x)[0], 32, 32, 3])
-      x = tf.image.random_flip_left_right(x)
-      x = tf.map_fn(lambda img: apply_cutout(img, size=16, p=0.5), x)
-      return x, y
+    if augment_dataset and train and dataset in ['cifar-10', 'cifar-100']:
+      ReflectionPadding2D = tf.keras.layers.Lambda(lambda x: tf.pad(x, [[0, 0], [4, 4], [4, 4], [0, 0]], 'REFLECT'))
+      # augmentation_pipeline = tf.keras.Sequential([
+      #   ReflectionPadding2D,
+      #   tf.keras.layers.RandomCrop(height=32, width=32),
+      #   tf.keras.layers.RandomFlip('horizontal')
+      # ])
+      # ds = ds.map(lambda x, y: (augmentation_pipeline(x), y), num_parallel_calls=tf.data.AUTOTUNE)
+      def augment_with_cutout(x, y):
+        x = ReflectionPadding2D(x)
+        x = tf.image.random_crop(x, size=[tf.shape(x)[0], 32, 32, 3])
+        x = tf.image.random_flip_left_right(x)
+        x = tf.map_fn(lambda img: apply_cutout(img, size=16, p=0.5), x)
+        return x, y
 
-    ds = ds.map(augment_with_cutout, num_parallel_calls=tf.data.AUTOTUNE)
+      ds = ds.map(augment_with_cutout, num_parallel_calls=tf.data.AUTOTUNE)
 
-  ds = ds.repeat().prefetch(tf.data.AUTOTUNE)
+    ds = ds.repeat().prefetch(tf.data.AUTOTUNE)
 
-  def generator():
-    for x_batch, y_batch in ds:
-      x_batch = x_batch.numpy()
-      y_batch = y_batch.numpy()
+    def generator():
+      for x_batch, y_batch in ds:
+        x_batch = x_batch.numpy()
+        y_batch = y_batch.numpy()
 
-      x_batch = x_batch.astype(jnp.float32) / 255.0
-      if dataset == 'mnist':
-        x_batch = (x_batch - mean) / std
-      else:
-        x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]
+        x_batch = x_batch.astype(jnp.float32) / 255.0
+        if dataset == 'mnist':
+          x_batch = (x_batch - mean) / std
+        else:
+          x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]
 
-      yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch, dtype=jnp.int32)
+        yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch, dtype=jnp.int32)
 
-  return generator(), num_classes, ds_size
+    return generator(), info
 
 
 def compute_batch_accuracy(state, x_batch, y_batch):
@@ -684,8 +708,9 @@ def signal_handler(signum: int, frame: Optional[
   ##################################
 def cosine_annealing_schedule_per_epoch(
         base_lr: float,
-        t_max: int,
+        total_epochs: int,
         steps_per_epoch: float,
+        t_max: int,
         eta_min: float = 0.0,
 ) -> optax.Schedule:
   """
@@ -717,6 +742,15 @@ def cosine_annealing_schedule_per_epoch(
   return schedule
 
 
+def step_warmup(
+        base_lr: float,
+        total_epochs: int,
+        steps_per_epoch: float,
+        warmup_ratio: float=1e-5,
+) -> optax.Schedule:
+  """ A simple linear warmup at the beginning, implemented for the small grokking experiments"""
+  warmup_steps = total_epochs * steps_per_epoch * warmup_ratio
+  return lambda s: base_lr * jnp.minimum(s / warmup_steps, 1)
 ##################################
 # "Trick" utils
 ##################################
