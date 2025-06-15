@@ -8,9 +8,9 @@ defaults:
 batch_size: 512
 learning_rate: 1e-3
 momentum: 0.9
-main_optimizer: adam_b2-98
-weight_decay: 0.05
-total_epochs: 6500
+main_optimizer: adamw_b2-98
+weight_decay: 0
+total_epochs: 6050
 test_eval_freq: 1000
 checkpoint_freq: 2500
 logging_freq: 250 # Base logging freq for training losses etc. with aim

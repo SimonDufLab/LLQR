@@ -11,59 +11,71 @@ from typing import Callable, Optional, Sequence, Tuple, Dict, Any, Union
 def get_group_elements_and_output_fn(dataset: str, p: int, k: int):
     """Get the group elements and output function for arithmetic or permutation tasks."""
     if dataset == "mod_sum_dataset":
-        group_elements = set(range(p))
+        group_elements1, group_elements2 = set(range(p)), set(range(p))
         def fetch_output(a, b): return (a + b) % p
     elif dataset == "mod_subtract_dataset":
-        group_elements = set(range(p))
+        group_elements1, group_elements2 = set(range(p)), set(range(p))
         def fetch_output(a, b): return (a - b) % p
     elif dataset == "mod_division_dataset":
-        group_elements = set(range(p))
-        def fetch_output(a, b): return (a * pow(b, p-2, p)) % p
+        roup_elements1, group_elements2 = set(range(p)), set(range(1, p))
+        def fetch_output(a, b): return (a * jnp.power(b, p-2) % p) % p
     elif dataset == "permutation_group_dataset":
-        perms = set(map(tuple, permutations(range(k))))
-        group_elements = perms
+        perms = set(map(tuple, permutations(list(range(k)))))
+        group_elements1, group_elements2 = perms, perms
         def fetch_output(a, b): return tuple(a[b[i]] for i in range(len(b)))
     else:
         raise NotImplementedError(f"Dataset {dataset} not implemented.")
-    return fetch_output, group_elements, group_elements
+    return fetch_output, group_elements1, group_elements2
 
-def build_vocab(group_elements) -> Tuple[Dict[Any, int], Dict[int, Any], int]:
-    """Build vocab mappings. First two are operator/equal, then group elements."""
-    all_elements = list(group_elements)
-    idx2vocab = ['o', '='] + all_elements
-    vocab2idx = {v: i for i, v in enumerate(idx2vocab)}
-    return vocab2idx, idx2vocab, len(idx2vocab)
 
 def create_dataset_arrays(
     dataset: str, frac_train: float, split: str, p: int, k: int, split_seed: int = 0
 ) -> Tuple[jnp.ndarray, jnp.ndarray, int]:
     """Generate the (x, y) arrays for a given dataset split."""
     fetch_output, group_elements1, group_elements2 = get_group_elements_and_output_fn(dataset, p, k)
-    vocab2idx, idx2vocab, vocab_size = build_vocab(group_elements1.union(group_elements2))
+    all_elements = list(group_elements1.union(group_elements2))
+    idx2vocab = ['o', '='] + all_elements
+    vocab2idx = {vocab: idx for idx, vocab in enumerate(idx2vocab)}
+    vocab_size = len(idx2vocab)
 
     # Enumerate all input pairs
-    group1 = list(group_elements1)
-    group2 = list(group_elements2)
-    pairs = [(a, b) for a in group1 for b in group2]
-    all_idx = jax.random.permutation(jax.random.PRNGKey(split_seed), len(pairs))
+    group1 = jnp.array(list(group_elements1))
+    group2 = jnp.array(list(group_elements2))
+    all_idx = jax.random.permutation(jax.random.PRNGKey(split_seed), len(group1)*len(group2))
 
     # Split into train/test
-    split_point = int(len(pairs) * frac_train)
+    split_point = int(len(all_idx) * frac_train)
     if split == 'train':
-        idxs = all_idx[:split_point]
-    else:
-        idxs = all_idx[split_point:]
+        pairs = all_idx[:split_point]
+    elif split == 'test':
+        pairs = all_idx[split_point:]
 
-    # Prepare x and y arrays
-    X, Y = [], []
-    for idx in idxs:
-        a, b = pairs[idx]
-        c = fetch_output(a, b)
-        x = [vocab2idx[a], vocab2idx['o'], vocab2idx[b], vocab2idx['=']]
-        y = vocab2idx[c] - 2  # Shift so targets start at 0
-        X.append(x)
-        Y.append(y)
-    return jnp.array(X, dtype=jnp.int32), jnp.array(Y, dtype=jnp.int32), vocab_size
+    # Construct dataset and store in memory:
+    pairs_a = jax.vmap(lambda idx: group1[idx // len(group_elements2)])(pairs)
+    pairs_b = jax.vmap(lambda idx: group2[idx % len(group_elements2)])(pairs)
+    pairs_c = jax.vmap(fetch_output)(pairs_a, pairs_b)
+    pairs = jnp.stack([pairs_a, pairs_b, pairs_c], axis=-1)
+
+    def apply_mapping(x):
+        a_i, b_i, c_i = x
+        a_i, b_i, c_i = int(a_i), int(b_i), int(c_i)
+        mapped_indices = jnp.array([vocab2idx.get(a_i), vocab2idx['o'], vocab2idx.get(b_i), vocab2idx['=']]), jnp.array(
+            [vocab2idx.get(c_i) - 2, ])
+        return mapped_indices
+
+    inputs_list = []
+    targets_list = []
+
+    for el in pairs:
+        inp, tgt = apply_mapping(el)
+        inputs_list.append(inp)
+        targets_list.append(tgt)
+
+    # Efficiently stack once at the end
+    input_array = jnp.stack(inputs_list, axis=0)
+    target_array = jnp.stack(targets_list, axis=0)
+
+    return input_array, jnp.squeeze(target_array), vocab_size
 
 @dataclass
 class AbstractDataset:

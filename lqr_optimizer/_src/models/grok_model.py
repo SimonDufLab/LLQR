@@ -7,7 +7,7 @@ from lqr_optimizer._src.utils.utils import EnhancedSequential
 
 # --- LayerNorm (scale only, axis=-1) ---
 class LayerNorm(nn.Module):
-    epsilon: float = 1e-6
+    epsilon: float = 1e-5
     @nn.compact
     def __call__(self, x):
         return nn.LayerNorm(epsilon=self.epsilon, use_scale=True, use_bias=False)(x)
@@ -88,7 +88,7 @@ class InitLayer(nn.Module):
         assert L <= self.max_length, "sequence too long"
         emb = nn.Embed(self.vocab_size, self.hidden_dim)(x)
         pos_idx = jnp.arange(L)
-        pos_emb = self.param("pos_embedding", nn.initializers.normal(stddev=0.02), (self.max_length, self.hidden_dim))
+        pos_emb = self.param("pos_embedding", nn.initializers.normal(stddev=1.0), (self.max_length, self.hidden_dim))
         pos = pos_emb[pos_idx]
         x = emb * jnp.sqrt(self.hidden_dim) + pos[None, :, :]
         mask = causal_attn_mask(L, B)
@@ -111,7 +111,7 @@ class LastLayer(nn.Module):
 def create_grok_model(
     num_classes: int,
     vocab_size: int,
-    depth: int = 16,
+    depth: int = 2,
 ) -> Tuple[EnhancedSequential, None]:
     mlp_dim = 512
     max_length = 5

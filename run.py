@@ -91,7 +91,7 @@ def main(cfg: DictConfig):
 
   # 4) Create the main optimizer
   opt_chain = []
-  if cfg.weight_decay:
+  if cfg.weight_decay and "adamw" not in cfg.main_optimizer:
     opt_chain.append(optax.add_decayed_weights(weight_decay=cfg.weight_decay))
   if cfg.lr_scheduler and cfg.lr_scheduler.name != "constant":
     lr_sched_kwargs = {_key:_value for _key, _value in cfg.lr_scheduler.items() if _key!='name'}

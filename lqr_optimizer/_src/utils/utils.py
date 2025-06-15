@@ -205,8 +205,8 @@ def load_main_optimizer(cfg, lr_or_sched):
     model_optimizer = optax.adam(learning_rate=lr_or_sched)
   elif cfg.main_optimizer == "sgd":
     model_optimizer = optax.sgd(learning_rate=lr_or_sched)
-  elif cfg.main_optimizer == "adam_b2-98":
-    model_optimizer = optax.adam(learning_rate=lr_or_sched, b2=0.98)
+  elif cfg.main_optimizer == "adamw_b2-98":
+    model_optimizer = optax.adamw(learning_rate=lr_or_sched, b2=0.98, weight_decay=cfg.weight_decay)
   else:
     raise ValueError("Unknown main optimizer")
   return model_optimizer
@@ -288,10 +288,10 @@ def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_data
   Returns the generator along with the number of classes in the dataset.
   """
   grokking_datasets = {
-    'mod_sum': lambda: ModSumDataset(frac_train=0.9, p=97, k=5),
-    'mod_subtract': lambda: ModSubtractDataset(frac_train=0.9, p=97, k=5),
-    'mod_division': lambda: ModDivisonDataset(frac_train=0.9, p=97, k=5),
-    'permutation': lambda: PermutationGroup(frac_train=0.9, p=97, k=5),
+    'mod_sum': lambda: ModSumDataset(frac_train=0.5, p=97, k=5),
+    'mod_subtract': lambda: ModSubtractDataset(frac_train=0.5, p=97, k=5),
+    'mod_division': lambda: ModDivisonDataset(frac_train=0.5, p=97, k=5),
+    'permutation': lambda: PermutationGroup(frac_train=0.5, p=97, k=5),
   }
   if dataset in grokking_datasets:
     split = 'train' if train else 'test'
