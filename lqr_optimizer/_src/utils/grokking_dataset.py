@@ -18,7 +18,7 @@ def get_group_elements_and_output_fn(dataset: str, p: int, k: int):
         def fetch_output(a, b): return (a - b) % p
     elif dataset == "mod_division_dataset":
         group_elements1, group_elements2 = set(range(p)), set(range(1, p))
-        def fetch_output(a, b): return (a * jnp.power(b, p-2) % p) % p
+        def fetch_output(a, b): return (a * (jnp.power(b, p-2) % p)) % p
     elif dataset == "permutation_group_dataset":
         perms = set(map(tuple, permutations(list(range(k)))))
         group_elements1, group_elements2 = perms, perms
