@@ -154,7 +154,12 @@ class BasePreconditioner(abc.ABC):
           cost += (x.T @ q_backward[-i - 1](x) + u.T @ r_backward[-i - 1](u)) / 2 + u.T @ m_backward[-i - 1](x)
           x = a[i](x) + b[i](u)
 
-        cost += x.T @ jnp.squeeze(final_lin_cost) + (x.T @ final_q(x)) / 2
+        # cost += x.T @ jnp.squeeze(final_lin_cost) + (x.T @ final_q(x)) / 2 # squeeze is causing problems
+        x1 = jnp.ravel(x)  # () -> (1,), (n,1)/(1,n)/(n,) -> (n,)
+        c1 = jnp.ravel(final_lin_cost)
+        qx1 = jnp.ravel(final_q(x))  # assume final_q(x) ~ Qx
+
+        cost += jnp.dot(x1, c1) + 0.5 * jnp.dot(x1, qx1)
 
         return cost
 

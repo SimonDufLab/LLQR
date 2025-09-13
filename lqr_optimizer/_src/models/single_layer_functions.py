@@ -56,10 +56,43 @@ class RosenbrockIterator:
                where each row is [a, b], and None.
     """
     batch = jnp.array([[self.a, self.b]] * self.batch_size)
-    return batch, None
+    return batch, batch*0
 
 def get_rosenbrock_model_and_datagen(a=1.0, b=100.0):
   return EnhancedSequential([Rosenbrock2DBlock(),]), RosenbrockIterator(a, b)
+
+class SplitRosenbrock1stBlock(Module):
+  dtype: Any = jnp.float32
+  precision: Any = None
+
+  param_init: Callable[[PRNGKey, Shape, Dtype], Array] = lecun_uniform
+
+  @compact
+  def __call__(self, inputs: Array) -> Array:
+    inputs = jnp.asarray(inputs, self.dtype)
+    params = self.param("kernel", self.param_init(), (1, 1))
+    params = jnp.asarray(params, self.dtype)
+    inputs = inputs.flatten()
+    params = params.flatten()
+    return jnp.array([inputs[0]**2-2*inputs[0]*params[0], params[0]**2, inputs[1]])
+
+class SplitRosenbrock2ndBlock(Module):
+  dtype: Any = jnp.float32
+  precision: Any = None
+
+  param_init: Callable[[PRNGKey, Shape, Dtype], Array] = lecun_uniform
+
+  @compact
+  def __call__(self, inputs: Array) -> Array:
+    inputs = jnp.asarray(inputs, self.dtype)
+    params = self.param("kernel", self.param_init(), (1, 1))
+    params = jnp.asarray(params, self.dtype)
+    inputs = inputs.flatten()
+    params = params.flatten()
+    return jnp.dot(jnp.ones(3),inputs) - inputs[2] + inputs[2]*(params - inputs[1])**2
+
+def get_split_rosenbrock_model_and_datagen(a=1.0, b=100.0):
+  return EnhancedSequential([SplitRosenbrock1stBlock(),SplitRosenbrock2ndBlock()]), RosenbrockIterator(a, b)
 
 class AckleyBlock(Module):
   """Consider parameter (a,b,c) as input to apply Ackley function"""

@@ -10,6 +10,7 @@ import optax
 from flax.training import train_state
 from aim import Run
 from jax.tree_util import Partial
+from jax.flatten_util import ravel_pytree
 
 from lqr_optimizer._src.models.single_layer_functions import *
 from lqr_optimizer._src.preconditioner import BasePreconditioner
@@ -21,30 +22,32 @@ def loss_to_params(params, apply_fn, x, y):
   return loss_fn(apply_fn({'params': params}, x), y)
 
 model_dict = {"rosenbrock": get_rosenbrock_model_and_datagen,
+              "split_rosenbrock": get_split_rosenbrock_model_and_datagen,
               "ackley": get_ackley_model_and_datagen,
               "goldstein_price": get_goldsteinprice_model_and_datagen}
 
 def main():
   # Initialize aim for logging
-  problem_type = "rosenbrock"
+  problem_type = "split_rosenbrock"
 
   log_path = "./single-layer-test"
   run = Run(repo=log_path, experiment=problem_type)
   # Hyperparameters
   batch_size = 1
   learning_rate = 1e-3
-  momentum = 0.0
+  momentum = 0.9
   optimizer = "sgd"
   t = 5000  # total training iterations
-  update_preconditioner_every = 500  # k: update the preconditioner every k steps
-  precond_steps = 25  # how many gradient steps to take on the preconditioner
-  precond_lr = 1e-1  # learning rate for the preconditioner's ADAM
-  test_eval_freq = 500
+  update_preconditioner_every = 100  # k: update the preconditioner every k steps
+  precond_steps = 50  # how many gradient steps to take on the preconditioner
+  precond_lr = 1e-4  # learning rate for the preconditioner's ADAM
+  test_eval_freq = 5
   use_preconditioner = True
   precond_clip_norm = None
-  normalize_grad_for_lqr = True
+  normalize_grad_for_lqr = False
 
-  optimizer_dict = {"sgd": Partial(optax.sgd, momentum=momentum),
+  optimizer_dict = {"sgd": optax.sgd,
+                    "momentum": Partial(optax.sgd, momentum=momentum),
                     "adam": optax.adam, }
 
   # Create model
@@ -107,8 +110,10 @@ def main():
     model=model,
     network_params=params,
     optax_solver=optax_solver_for_precond,
+    trainstate_solver=state.tx,
     damping=0.0,
     divergence_args_index=None,
+    multibatch=multibatch_training,
     precond_clip_norm = precond_clip_norm,
     normalize_grad_for_lqr= normalize_grad_for_lqr,
     preconditioner_update_steps = precond_steps,
@@ -133,7 +138,7 @@ def main():
     if (step % update_preconditioner_every) == 0 and use_preconditioner:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
-      preconditioner.update_preconditioner(state.params, data_iter)
+      preconditioner.update_preconditioner(state.params, data_iter, state.opt_state)
 
     # Grab the next batch for normal training
     x_batch, y_batch = next(data_iter)
@@ -148,7 +153,7 @@ def main():
     state = state.apply_gradients(grads=precond_grads)
 
     # Logging or testing every so often
-    if step % 10 == 0:
+    if step % test_eval_freq == 0:
       # Simple logging
       train_loss = loss_to_params(state.params, model.apply, x_batch, y_batch)
       elapsed_time = time.time() - start_time  # Calculate elapsed time
@@ -156,6 +161,10 @@ def main():
       if step % 200 == 0:
         # Print info
         print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
+        print(f"Gradient norm {jnp.linalg.norm(ravel_pytree(precond_grads)[0]):.4f}")
+        print(f"Preconditioners:")
+        print(preconditioner.expose_blocks())
+        print()
 
   print("Training complete!")
   # End timer
