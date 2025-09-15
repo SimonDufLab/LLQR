@@ -52,6 +52,46 @@ def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, ot
 
   return a, b, a_transpose, states
 
+def __lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, other_model_variables=FrozenDict({})):
+  """ Function calculating the A and B matrices (jvp + vjp) of the linear transition layers of the LQR.
+  Also store the state variables for each layer application, to use as primal
+  """
+  a, b, a_transpose, b_transpose = [], [], [], []
+  states = [batch]
+  for i, layer_name in enumerate(layer_names):
+    # unravel the layers params so that the jacobians have the right dimension, same for state
+    layer_params, unravel_params_fn = ravel_pytree(params[layer_name])
+    layer_state, unravel_state = ravel_pytree(states[i])
+    layer_other_vars = {k: v.get(layer_name, {}) for k, v in other_model_variables.items()}
+
+    # Define a simpler state transition function (layer propagation) for jacobians retrieval
+    def simpler_apply(parameters, x):
+      # return trans_fn.apply({'params': unravel_params_fn(parameters)}, unravel_state(x))
+      return layers_apply({'params': unravel_params_fn(parameters)}|layer_other_vars, unravel_state(x), i)
+
+    # Recover next state
+    states.append(simpler_apply(layer_params, layer_state))
+
+    # Retrieve the vjp and jvp expressions of the jacobians (w/r to state and to controls)
+    def partial_apply_inputs(state):
+      return ravel_pytree(simpler_apply(layer_params, state))[0]
+
+    def partial_apply_params(params):
+      return ravel_pytree(simpler_apply(params, layer_state))[0]
+
+    # JVPs
+    _, b_fn = jax.linearize(partial_apply_params, layer_params)
+    _, a_fn = jax.linearize(partial_apply_inputs, jnp.float32(layer_state))
+    a.append(a_fn)
+    b.append(b_fn)
+    # VJPs
+    a_transpose_fn = vjp_f(partial_apply_inputs, x=layer_state)
+    b_transpose_fn = vjp_f(partial_apply_params, layer_params)
+    a_transpose.append(a_transpose_fn)
+    b_transpose.append(b_transpose_fn)
+
+  return a, b, a_transpose, b_transpose, states
+
 def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_arg=None):
   """Handle a divergence function, for steepest descent
   """

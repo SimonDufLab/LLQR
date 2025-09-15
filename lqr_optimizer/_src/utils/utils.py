@@ -34,6 +34,10 @@ def add_f(f, g):
   """
   return lambda x: f(x) + g(x)
 
+def subtract_f(f, g):
+  """ Return the function composition of g subtracted to f
+  """
+  return lambda x: f(x) - g(x)
 
 def normalize_gradient(gradient):
   # Compute the total L2 norm of the gradient using jnp.linalg.norm

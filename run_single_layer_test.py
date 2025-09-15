@@ -14,7 +14,7 @@ from jax.flatten_util import ravel_pytree
 
 from lqr_optimizer._src.models.single_layer_functions import *
 from lqr_optimizer._src.preconditioner import BasePreconditioner
-from lqr_optimizer._src.exact_methods import make_newton_step
+from lqr_optimizer._src.exact_methods import make_newton_step, make_lqr_step
 
 def loss_fn(y, target):
   return jnp.sum(y)
@@ -40,11 +40,12 @@ def main():
   optimizer = "sgd"
   t = 5000  # total training iterations
   update_preconditioner_every = 1  # k: update the preconditioner every k steps
-  precond_steps = 500 # how many gradient steps to take on the preconditioner
+  precond_steps = 250 # how many gradient steps to take on the preconditioner
   precond_lr = 1e-3  # learning rate for the preconditioner's ADAM
   test_eval_freq = 5
   damping = 0.0
   exact_newton = False
+  lqr_exact_method = False
   use_preconditioner = True
   precond_clip_norm = 1e-3
   normalize_grad_for_lqr = False
@@ -101,6 +102,7 @@ def main():
     "test_eval_freq": test_eval_freq,
     "damping": damping,
     "exact_newton": exact_newton,
+    "lqr_exact_method": lqr_exact_method,
     "use_preconditioner": use_preconditioner,
     "precond_solver": precond_solver,
     "block_structure": block_structure,
@@ -137,9 +139,15 @@ def main():
     return jax.grad(loss_to_params, argnums=0)(_params, model.apply, x, y)
 
   # For exact Newton
-  newton_step = make_newton_step(
-    loss_to_params, model.apply, damping=0.0, tol=1e-5,
-  )
+  if exact_newton:
+    if lqr_exact_method:
+      exact_step = make_lqr_step(
+        None, loss_fn, model, damping=damping,
+      )
+    else:
+      exact_step = make_newton_step(
+        loss_to_params, model.apply, damping=damping, tol=1e-5,
+      )
 
   # Start timer
   start_time = time.time()
@@ -157,7 +165,7 @@ def main():
     x_batch, y_batch = next(data_iter)
 
     if exact_newton:
-      precond_grads, _ = newton_step(state.params, x_batch, y_batch)
+      precond_grads = exact_step(state.params, x_batch, y_batch)
 
     else:
       # 1) Compute the raw gradient
