@@ -29,25 +29,25 @@ model_dict = {"rosenbrock": get_rosenbrock_model_and_datagen,
 
 def main():
   # Initialize aim for logging
-  problem_type = "split_rosenbrock"
+  problem_type = "rosenbrock"
 
-  log_path = "./single-layer-test"
+  log_path = "./single-layer-test-debug"
   run = Run(repo=log_path, experiment=problem_type)
   # Hyperparameters
   batch_size = 1
-  learning_rate = 1e-3
+  learning_rate = 5e-3
   momentum = 0.9
   optimizer = "sgd"
   t = 5000  # total training iterations
   update_preconditioner_every = 1  # k: update the preconditioner every k steps
-  precond_steps = 250 # how many gradient steps to take on the preconditioner
-  precond_lr = 1e-3  # learning rate for the preconditioner's ADAM
+  precond_steps = 500 # how many gradient steps to take on the preconditioner
+  precond_lr = 1e-2  # learning rate for the preconditioner's ADAM
   test_eval_freq = 5
   damping = 0.0
   exact_newton = False
   lqr_exact_method = False
   use_preconditioner = True
-  precond_clip_norm = 1e-3
+  precond_clip_norm = 1e-2
   normalize_grad_for_lqr = False
 
   if exact_newton: # Don't use preconditioner when exact solving

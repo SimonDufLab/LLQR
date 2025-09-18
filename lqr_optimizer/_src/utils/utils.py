@@ -20,6 +20,8 @@ from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable
 from types import FrameType
 from pathlib import Path
 
+from jax.tree_util import Partial
+
 from lqr_optimizer._src.utils.grokking_dataset import ModSumDataset, ModDivisonDataset, ModSubtractDataset, PermutationGroup, load_grok_ds
 
 def vjp_f(f, x):
@@ -51,15 +53,20 @@ def normalize_gradient(gradient):
 
   return normalized_gradient
 
+def clip_gradient(gradient, clip_norm):
+  example_norm = jnp.linalg.norm(gradient, ord=2)
+  clipped_grad = gradient * (clip_norm / jnp.maximum(example_norm, clip_norm))
+  return clipped_grad
 
 def clip_norm_single_example(_grad, clip_norm):
   """Apply clipping norm to a single example within a batch"""
   ravel_grad, unravel_fn = ravel_pytree(_grad)
-  example_norm = jnp.linalg.norm(ravel_grad, ord=2)
-  clipped_grad = ravel_grad * (clip_norm / jnp.maximum(example_norm, clip_norm))
+  clipped_grad = clip_gradient(ravel_grad, clip_norm)
   return unravel_fn(clipped_grad)
 
 vmapped_clip_norm = jax.vmap(clip_norm_single_example, in_axes=(0, None))
+def treemapped_clip_norm(gradient, clip_norm):
+  return jax.tree_map(Partial(clip_gradient, clip_norm=clip_norm), gradient)
 
 
 @jax.jit

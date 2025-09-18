@@ -127,7 +127,10 @@ def main(cfg: DictConfig):
     divergence_kwarg = {"order":cfg.divergence_order_param}
   else:
     divergence_kwarg = {}
-  divergence_f = Partial(divergence_choice[cfg.divergence], **divergence_kwarg)
+  if divergence_kwarg:
+    divergence_f = Partial(divergence_choice[cfg.divergence], **divergence_kwarg)
+  else:
+    divergence_f = divergence_choice[cfg.divergence]
   preconditioner = BasePreconditioner(
     divergence_function=divergence_f,
     loss_fn=cross_entropy_loss,
@@ -139,6 +142,7 @@ def main(cfg: DictConfig):
     trainstate_solver=state.tx,
     precond_clip_norm=cfg.precond_clip_norm,
     preconditioner_update_steps=cfg.precond_steps,
+    batch_solve_precond=cfg.batch_solve_precond,
     multibatch=cfg.multibatch_training,
     precond_on_update=cfg.precond_on_update,
     normalize_grad_for_lqr = cfg.normalize_grad_for_lqr,
@@ -232,13 +236,15 @@ def main(cfg: DictConfig):
       # Simple logging
       # train_loss = loss_eval(state, x_batch, y_batch)
       train_loss = loss
+      elapsed_time = time.time() - start_time + prev_elapsed_time  # Calculate elapsed time
       run.track(train_loss, name="train loss", step=step)
+      run.track(train_loss, name="train loss|t", step=elapsed_time*100)
       # Compute batch accuracy
       batch_accuracy = compute_batch_accuracy(state, x_batch, y_batch)
       run.track(batch_accuracy, name="train accuracy", step=step)
+      run.track(batch_accuracy, name="train accuracy|t", step=elapsed_time*100)
       if step % cfg.report_freq == 0:
         # Print info
-        elapsed_time = time.time() - start_time + prev_elapsed_time  # Calculate elapsed time
         print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
     if step % cfg.test_eval_freq == 0:
@@ -249,6 +255,8 @@ def main(cfg: DictConfig):
       elapsed_time = time.time() - start_time + prev_elapsed_time
       run.track(test_accuracy, name="test accuracy", step=step)
       run.track(test_loss, name="test loss", step=step)
+      run.track(test_accuracy, name="test accuracy|t", step=elapsed_time*100)
+      run.track(test_loss, name="test loss|t", step=elapsed_time*100)
       print("============================")
       print(f"Step {step} | Test Loss: {test_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
       print(f"Step {step} | Test Accuracy: {test_accuracy:.2f}%")

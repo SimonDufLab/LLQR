@@ -18,7 +18,7 @@ precond_lr: 0.001
 precond_solver: momentum
 precond_on_update: false
 precond_clip_norm: 5.0
-normalize_grad_for_lqr: true
+normalize_grad_for_lqr: false
 normalize_conv_params: false
 use_preconditioner: true
 
@@ -26,6 +26,7 @@ divergence: ngd
 divergence_order_param: 0.5
 block_structure: diagonal
 block_structure_init: identity
+batch_solve_precond: true
 multibatch_training: false
 damping: 0.0
 

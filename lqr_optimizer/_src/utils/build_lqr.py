@@ -104,15 +104,16 @@ def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_
 
   grad_fn = jax.grad(loss_fn)
   final_lin_cost = grad_fn(final_states)
+  ravel_final_states, unravel_fn = ravel_pytree(final_states)
 
   if div_f:  # Case where the adjoints are w/r to a divergence function
 
     def div_fn(outputs):
-      return div_f(div_arg, outputs)
+      return div_f(div_arg, unravel_fn(outputs))
       # return jnp.sum(vmap(div_f)(div_arg, logits))
     grad_div_fn = jax.grad(div_fn)
     final_p = grad_div_fn(final_states)
-    _, final_q = jax.linearize(grad_div_fn, jnp.ravel(jnp.atleast_1d(final_states)))
+    _, final_q = jax.linearize(grad_div_fn, jnp.atleast_1d(ravel_final_states))
 
     return final_q, final_p, final_lin_cost
     # return add_f(Q_T, diag_Ri(1)), p_T, a_T
