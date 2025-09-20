@@ -11,6 +11,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 import jax
 import jax.numpy as jnp
 from jax.tree_util import Partial
+from jax.flatten_util import ravel_pytree
 
 import hydra
 from aim import Run
@@ -66,6 +67,8 @@ def main(cfg: DictConfig):
   steps_per_epoch_rounded = train_ds_size // cfg.batch_size
   steps_per_epoch = train_ds_size / cfg.batch_size
   total_steps = ((train_ds_size * cfg.total_epochs) // cfg.batch_size) + 1
+  if not cfg.update_preconditioner_until:
+    cfg.update_preconditioner_until = total_steps + 1
 
   # 1b) Initialize aim for logging
   run = Run(repo=cfg.logging.aim_repo, experiment=experiment_name, run_hash=aim_hash, force_resume=True)
@@ -120,7 +123,14 @@ def main(cfg: DictConfig):
     )
 
   # 5) Create the BasePreconditioner
-  precond_optimizer = utl.load_precond_optimizer(cfg)
+  if cfg.precond_lr_scheduler and cfg.precond_lr_scheduler.name != "constant":
+    precond_lr_sched_kwargs = {_key:_value for _key, _value in cfg.precond_lr_scheduler.items() if _key!='name'}
+    precond_lr_fn = lr_schedule_choice[cfg.precond_lr_scheduler.name](base_lr=cfg.precond_lr, total_epochs=cfg.total_epochs ,steps_per_epoch=steps_per_epoch, **precond_lr_sched_kwargs)
+    precond_lr = 1.0
+  else:
+    precond_lr_fn = lambda _: 1.0
+    precond_lr = cfg.precond_lr
+  precond_optimizer = utl.load_precond_optimizer(cfg, precond_lr)
 
   # Initialize BasePreconditioner
   if cfg.divergence == "renyi":
@@ -210,11 +220,12 @@ def main(cfg: DictConfig):
   print(f"Continuing training from step {starting_step}")
   for step in range(starting_step, total_steps):
     # Possibly update the preconditioner every `update_preconditioner_every` steps
-    if (step % cfg.update_preconditioner_every) == 0 and cfg.use_preconditioner:
+    if (step % cfg.update_preconditioner_every) == 0 and cfg.use_preconditioner and step < cfg.update_preconditioner_until:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
       precond_update_start_time = time.time()
-      preconditioner.update_preconditioner(state.params, precond_dataloader, state.opt_state,
+      precond_lr = precond_lr_fn(step)
+      preconditioner.update_preconditioner(state.params, precond_dataloader, precond_lr, state.opt_state,
                                            other_model_variables={'batch_stats': state.batch_stats})
       precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
       # !!Remove below when timing against non-2nd order methods!! (Affect computation time)

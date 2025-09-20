@@ -9,7 +9,7 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
-from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm, get_per_layer_norm
+from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm, get_per_layer_norm, zero_if_bad
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints,
                              lqr_backward_matrices_and_adjoints)
@@ -135,12 +135,13 @@ class BasePreconditioner(abc.ABC):
         grads = jax.grad(lqr_cost, argnums=0)(
           # _preconditioner, input_size, gradients, kernel_shapes, operators)
           _preconditioner, input_size, gradients, operators)
-        grads = jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=0.0, neginf=0.0), grads)
+        # grads = jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=0.0, neginf=0.0), grads)
+        grads = jax.tree_map(zero_if_bad, grads)
         print(jax.tree_map(lambda g: g.shape, grads))
         return grads
 
       @Partial(jax.jit, donate_argnames=("preconditioner",))
-      def get_update(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state):
+      def get_update(preconditioner, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
         # Initialize the optimizer state for the preconditioner.
         opt_state = optax_solver.init(preconditioner)
         gradients, operators = get_operators_and_gradients(
@@ -154,6 +155,7 @@ class BasePreconditioner(abc.ABC):
           # precond_grad = lqr_grad_fn(precond, input_size, gradients, kernel_shapes, operators)
           precond_grad = lqr_grad_fn(precond, input_size, gradients, operators)
           updates, opt_state = optax_solver.update(precond_grad, opt_state)
+          updates = jax.tree_map(lambda g: g * precond_lr, updates)
           new_precond = optax.apply_updates(precond, updates)
           return (new_precond, opt_state)
 
@@ -236,7 +238,7 @@ class BasePreconditioner(abc.ABC):
         # return get_update
 
       if multibatch:
-        def get_update(preconditioner, params, other_model_variables, dataloader, trainstate_opt_state):
+        def get_update(preconditioner, params, precond_lr, other_model_variables, dataloader, trainstate_opt_state):
           # Initialize the optimizer state for the preconditioner.
           opt_state = optax_solver.init(preconditioner)
 
@@ -245,6 +247,7 @@ class BasePreconditioner(abc.ABC):
           def update_step(precond, opt_state, datapoint):
             precond_grad = get_precond_grad(precond, params, other_model_variables, datapoint, trainstate_opt_state)
             updates, opt_state = optax_solver.update(precond_grad, opt_state)
+            updates = jax.tree_map(lambda g: g * precond_lr, updates)
             new_precond = optax.apply_updates(precond, updates)
             return (new_precond, opt_state)
 
@@ -255,7 +258,7 @@ class BasePreconditioner(abc.ABC):
 
       else:
         @jax.jit
-        def get_update(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state):
+        def get_update(preconditioner, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
           # Initialize the optimizer state for the preconditioner.
           opt_state = optax_solver.init(preconditioner)
 
@@ -264,6 +267,7 @@ class BasePreconditioner(abc.ABC):
             precond, opt_state = state
             precond_grad = get_precond_grad(precond, params, other_model_variables, datapoint, trainstate_opt_state)
             updates, opt_state = optax_solver.update(precond_grad, opt_state)
+            updates = jax.tree_map(lambda g: g * precond_lr, updates)
             new_precond = optax.apply_updates(precond, updates)
             return (new_precond, opt_state)
 
@@ -275,15 +279,15 @@ class BasePreconditioner(abc.ABC):
 
       return get_update
 
-  def update_preconditioner(self, params, dataloader, opt_state, other_model_variables=FrozenDict({})):
+  def update_preconditioner(self, params, dataloader, precond_lr, opt_state, other_model_variables=FrozenDict({})):
     """params is the current weights of the NN"""
     if self._multibatch:
       self._block_structure.update_blocks(
-        self._update_preconditioner_fn(self._block_structure.blocks, params, other_model_variables, dataloader,
+        self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
                                        opt_state))
     else:
       self._block_structure.update_blocks(
-        self._update_preconditioner_fn(self._block_structure.blocks, params, other_model_variables, next(dataloader), opt_state))
+        self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, next(dataloader), opt_state))
 
     if self._block_structure_name in ('scalar', "diagonal"):
       # We clip to (almost) 0 those 2 structures to avoid gradient inversion

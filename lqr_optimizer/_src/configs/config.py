@@ -4,7 +4,7 @@ from lqr_optimizer._src.models.resnet import create_resnet18
 from lqr_optimizer._src.models.grok_model import create_grok_model
 from lqr_optimizer._src.utils import divergence
 
-from lqr_optimizer._src.utils.utils import cosine_annealing_schedule_per_epoch, step_warmup
+from lqr_optimizer._src.utils.utils import cosine_annealing_schedule_per_epoch, step_warmup, linear_schedule
 
 model_choice = {
   "mlp": create_mlp,
@@ -21,4 +21,5 @@ divergence_choice = {
 lr_schedule_choice = {
   "cosine_annealing": cosine_annealing_schedule_per_epoch,
   "step_warmup": step_warmup,
+  "linear": linear_schedule,
 }

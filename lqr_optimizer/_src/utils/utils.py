@@ -71,6 +71,15 @@ def treemapped_clip_norm(gradient, clip_norm):
 def treemapped_clip_element_wise(gradient, clip_value):
   return jax.tree_map(Partial(jnp.clip, min=-1*clip_value, max=clip_value), gradient)
 
+@jax.jit
+def zero_if_bad(x):
+  # True if *all* elements are finite
+  is_finite = jnp.all(jnp.isfinite(x))
+  # Make it a numeric mask (1.0 if finite, 0.0 if bad)
+  mask = is_finite.astype(x.dtype)
+  # Multiply whole array by mask
+  return x * mask
+
 
 @jax.jit
 def pytree_max_min(pytree):
@@ -226,18 +235,18 @@ def load_main_optimizer(cfg, lr_or_sched):
   return model_optimizer
 
 
-def load_precond_optimizer(cfg):
+def load_precond_optimizer(cfg, lr):
   optax_solver_for_precond = []
   if cfg.precond_clip_norm:
     optax_solver_for_precond.append(optax.clip_by_global_norm(cfg.precond_clip_norm))
   if cfg.precond_clip_element_wise:
     optax_solver_for_precond.append(optax.clip(cfg.precond_clip_element_wise))
   if cfg.precond_solver == "adam":
-    optax_solver_for_precond.append(optax.adam(cfg.precond_lr))
+    optax_solver_for_precond.append(optax.adam(lr))
   elif cfg.precond_solver == "momentum":
-    optax_solver_for_precond.append(optax.sgd(cfg.precond_lr, momentum=cfg.momentum))
+    optax_solver_for_precond.append(optax.sgd(lr, momentum=cfg.momentum))
   elif cfg.precond_solver == "sgd":
-    optax_solver_for_precond.append(optax.sgd(cfg.precond_lr))
+    optax_solver_for_precond.append(optax.sgd(lr))
   else:
     raise ValueError("Unknown precond optimizer")
   return optax.chain(*optax_solver_for_precond)
@@ -770,6 +779,19 @@ def step_warmup(
   """ A simple linear warmup at the beginning, implemented for the small grokking experiments"""
   warmup_steps = total_epochs * steps_per_epoch * warmup_ratio
   return lambda s: base_lr * jnp.minimum(s / warmup_steps, 1)
+
+def linear_schedule(
+        base_lr: float,
+        total_epochs: int,
+        steps_per_epoch: float,
+        decay_factor: float, # by how much we reduce the lr over transition steps
+        transition_epochs: int,
+        transition_begin: int,
+) -> optax.Schedule:
+  transition_steps = int(steps_per_epoch * transition_epochs)
+  transition_begin = int(steps_per_epoch * transition_begin)
+  end_value = decay_factor * base_lr
+  return optax.linear_schedule(init_value=base_lr, end_value=end_value, transition_steps=transition_steps, transition_begin=transition_begin)
 ##################################
 # "Trick" utils
 ##################################

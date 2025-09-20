@@ -3,6 +3,8 @@ defaults:
   - /default        # includes default.yaml from default/
   - /dataset: mnist  # this now correctly maps to dataset/mnist.yaml
   - /architecture: mlp
-  - /lr_scheduler: null
+  - /lr_scheduler: constant
+  - /precond_lr_scheduler: constant
 
-lr_scheduler: null  # TODO: introduces a mismatch when overriding with default experiment
+#lr_scheduler: null  # TODO: introduces a mismatch when overriding with default experiment
+#precond_lr_scheduler: null

@@ -1,0 +1,5 @@
+name: linear
+
+decay_factor: 0.01
+transition_begin: 0
+transition_epochs: 2
