@@ -140,7 +140,6 @@ def main(cfg: DictConfig):
     network_params=params,
     optax_solver=precond_optimizer,
     trainstate_solver=state.tx,
-    precond_clip_norm=cfg.precond_clip_norm,
     preconditioner_update_steps=cfg.precond_steps,
     batch_solve_precond=cfg.batch_solve_precond,
     multibatch=cfg.multibatch_training,

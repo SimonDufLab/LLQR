@@ -1,5 +1,6 @@
 """Preconditioner classes and their update rules."""
 import abc
+from functools import partial
 
 import optax
 import jax
@@ -8,7 +9,7 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
-from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, vmapped_clip_norm, treemapped_clip_norm, pytree_max_min, pytree_l2_norm, get_per_layer_norm
+from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm, get_per_layer_norm
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints,
                              lqr_backward_matrices_and_adjoints)
@@ -30,7 +31,6 @@ class BasePreconditioner(abc.ABC):
                network_params,
                optax_solver,
                trainstate_solver,
-               precond_clip_norm,
                preconditioner_update_steps,
                batch_solve_precond: bool = True,
                multibatch: bool = False,
@@ -43,7 +43,6 @@ class BasePreconditioner(abc.ABC):
     self._loss_fn = loss_fn
     self._optax_solver = optax_solver
     self._trainstate_solver = trainstate_solver
-    self._clip_norm = precond_clip_norm
     self._layer_names = list(network_params.keys())
     self._block_structure = BLOCK_STRUCTURE_DICT[block_structure](network_params, self._layer_names, block_structure_init)
     self._block_structure_name = block_structure
@@ -59,21 +58,16 @@ class BasePreconditioner(abc.ABC):
       self._normalize_grad_for_lqr_fn = normalize_gradient
     else:
       self._normalize_grad_for_lqr_fn = lambda _: _  # Nothing, identity fn
-    if precond_clip_norm:
-      if multibatch:
-        self._clip_norm_fn = vmapped_clip_norm
-      else:
-        self._clip_norm_fn = treemapped_clip_norm
-    else:
-      self._clip_norm_fn = lambda x, _: x # Nothing, identity fn
 
     self._update_preconditioner_fn = self._get_evaluate_lqr(self._optax_solver, self._preconditioner_update_steps,
                                                             batch_solve_precond=self._batch_solve_precond,
                                                             multibatch=self._multibatch,
                                                             precond_on_update=self._precond_on_update)
-
+    self._jit_apply_fn = jax.jit(
+      lambda blocks, update: self._block_structure.matrix_product(blocks, update)
+    )
   def apply(self, update):
-    return self._block_structure.matrix_product(self._block_structure.blocks, update)
+    return self._jit_apply_fn(self._block_structure.blocks, update)
 
   def get_stats(self):
     precond_max, precond_min = pytree_max_min(self._block_structure.blocks)
@@ -115,10 +109,12 @@ class BasePreconditioner(abc.ABC):
 
         return gradients, (a, b, q_backward, r_backward, m_backward, final_q, final_lin_cost)
 
+      # def lqr_cost(_preconditioner, input_size, gradients, kernel_shapes, operators):
       def lqr_cost(_preconditioner, input_size, gradients, operators):
         a, b, q_backward, r_backward, m_backward, final_q, final_lin_cost = operators
         cost = 0
         x = jnp.zeros(input_size)
+        # u_dict = self._block_structure.matrix_product_for_scan(_preconditioner, gradients, kernel_shapes)
         u_dict = self._block_structure.matrix_product(_preconditioner, gradients)
         for i, layer_name in enumerate(self._layer_names):
           u, _ = ravel_pytree(u_dict[layer_name])
@@ -128,30 +124,34 @@ class BasePreconditioner(abc.ABC):
         # cost += x.T @ jnp.squeeze(final_lin_cost) + (x.T @ final_q(x)) / 2 # squeeze is causing problems
         x1 = jnp.ravel(x)  # () -> (1,), (n,1)/(1,n)/(n,) -> (n,)
         c1 = jnp.ravel(final_lin_cost)
-        qx1 = jnp.ravel(final_q(x))  # assume final_q(x) ~ Qx
+        qx1 = jnp.ravel(final_q(x))  # final_q(x) = Qx
 
         cost += jnp.dot(x1, c1) + 0.5 * jnp.dot(x1, qx1)
 
         return cost
 
+      # def lqr_grad_fn(_preconditioner, input_size, gradients, kernel_shapes, operators):
       def lqr_grad_fn(_preconditioner, input_size, gradients, operators):
         grads = jax.grad(lqr_cost, argnums=0)(
+          # _preconditioner, input_size, gradients, kernel_shapes, operators)
           _preconditioner, input_size, gradients, operators)
-        grads = jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), grads)
+        grads = jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=0.0, neginf=0.0), grads)
         print(jax.tree_map(lambda g: g.shape, grads))
-        return self._clip_norm_fn(grads, self._clip_norm)
+        return grads
 
-      @jax.jit
+      @Partial(jax.jit, donate_argnames=("preconditioner",))
       def get_update(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state):
         # Initialize the optimizer state for the preconditioner.
         opt_state = optax_solver.init(preconditioner)
         gradients, operators = get_operators_and_gradients(
           params, other_model_variables, datapoint, trainstate_opt_state)
+        # gradients, kernel_shapes = self._block_structure.prepare_vectors(gradients)
         input_size = datapoint[0].size
 
         # Define a single update step to be run in the compiled loop.
         def update_step(i, state):
           precond, opt_state = state
+          # precond_grad = lqr_grad_fn(precond, input_size, gradients, kernel_shapes, operators)
           precond_grad = lqr_grad_fn(precond, input_size, gradients, operators)
           updates, opt_state = optax_solver.update(precond_grad, opt_state)
           new_precond = optax.apply_updates(precond, updates)
@@ -161,7 +161,8 @@ class BasePreconditioner(abc.ABC):
         init_state = (preconditioner, opt_state)
         final_precond, _ = jax.lax.fori_loop(0, steps, update_step, init_state)
         # Safeguard against any numerical issues
-        return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), final_precond)
+        # return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), final_precond)
+        return jax.tree_map(jnp.nan_to_num, final_precond)
 
       return get_update
     else:
@@ -220,7 +221,6 @@ class BasePreconditioner(abc.ABC):
         # print(datapoint[0].shape)
         grads = vmapped_evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint,
                                           trainstate_opt_state)
-        grads = self._clip_norm_fn(grads, self._clip_norm)
         return jax.tree_map(Partial(jnp.mean, axis=0), grads)
 
         # @timed_jit # switch back to jax.jit after debugging

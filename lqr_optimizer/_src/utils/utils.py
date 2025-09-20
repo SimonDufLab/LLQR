@@ -54,7 +54,7 @@ def normalize_gradient(gradient):
   return normalized_gradient
 
 def clip_gradient(gradient, clip_norm):
-  example_norm = jnp.linalg.norm(gradient, ord=2)
+  example_norm = jnp.linalg.norm(gradient)
   clipped_grad = gradient * (clip_norm / jnp.maximum(example_norm, clip_norm))
   return clipped_grad
 
@@ -67,6 +67,9 @@ def clip_norm_single_example(_grad, clip_norm):
 vmapped_clip_norm = jax.vmap(clip_norm_single_example, in_axes=(0, None))
 def treemapped_clip_norm(gradient, clip_norm):
   return jax.tree_map(Partial(clip_gradient, clip_norm=clip_norm), gradient)
+
+def treemapped_clip_element_wise(gradient, clip_value):
+  return jax.tree_map(Partial(jnp.clip, min=-1*clip_value, max=clip_value), gradient)
 
 
 @jax.jit
@@ -224,15 +227,20 @@ def load_main_optimizer(cfg, lr_or_sched):
 
 
 def load_precond_optimizer(cfg):
+  optax_solver_for_precond = []
+  if cfg.precond_clip_norm:
+    optax_solver_for_precond.append(optax.clip_by_global_norm(cfg.precond_clip_norm))
+  if cfg.precond_clip_element_wise:
+    optax_solver_for_precond.append(optax.clip(cfg.precond_clip_element_wise))
   if cfg.precond_solver == "adam":
-    optax_solver_for_precond = optax.adam(cfg.precond_lr)
+    optax_solver_for_precond.append(optax.adam(cfg.precond_lr))
   elif cfg.precond_solver == "momentum":
-    optax_solver_for_precond = optax.sgd(cfg.precond_lr, momentum=cfg.momentum)
+    optax_solver_for_precond.append(optax.sgd(cfg.precond_lr, momentum=cfg.momentum))
   elif cfg.precond_solver == "sgd":
-    optax_solver_for_precond = optax.sgd(cfg.precond_lr)
+    optax_solver_for_precond.append(optax.sgd(cfg.precond_lr))
   else:
     raise ValueError("Unknown precond optimizer")
-  return optax_solver_for_precond
+  return optax.chain(*optax_solver_for_precond)
 
 
 ##################################
