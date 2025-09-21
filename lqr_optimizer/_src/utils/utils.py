@@ -71,15 +71,6 @@ def treemapped_clip_norm(gradient, clip_norm):
 def treemapped_clip_element_wise(gradient, clip_value):
   return jax.tree_map(Partial(jnp.clip, min=-1*clip_value, max=clip_value), gradient)
 
-@jax.jit
-def zero_if_bad(x):
-  # True if *all* elements are finite
-  is_finite = jnp.all(jnp.isfinite(x))
-  # Make it a numeric mask (1.0 if finite, 0.0 if bad)
-  mask = is_finite.astype(x.dtype)
-  # Multiply whole array by mask
-  return x * mask
-
 
 @jax.jit
 def pytree_max_min(pytree):

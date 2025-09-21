@@ -9,7 +9,7 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
-from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm, get_per_layer_norm, zero_if_bad
+from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm, get_per_layer_norm
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints,
                              lqr_backward_matrices_and_adjoints)
@@ -135,8 +135,8 @@ class BasePreconditioner(abc.ABC):
         grads = jax.grad(lqr_cost, argnums=0)(
           # _preconditioner, input_size, gradients, kernel_shapes, operators)
           _preconditioner, input_size, gradients, operators)
-        # grads = jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=0.0, neginf=0.0), grads)
-        grads = jax.tree_map(zero_if_bad, grads)
+        grads = jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=1.0, neginf=-1.0), grads)
+        # grads = jax.tree_map(zero_if_bad, grads)
         print(jax.tree_map(lambda g: g.shape, grads))
         return grads
 
