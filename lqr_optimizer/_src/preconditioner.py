@@ -36,7 +36,8 @@ class BasePreconditioner(abc.ABC):
                multibatch: bool = False,
                precond_on_update: bool =False,
                normalize_grad_for_lqr = True,
-               damping:float = 0.0,
+               damping: float = 0.0,
+               allow_grad_inversion: bool = False,
                divergence_args_index = -1):
     self._divergence_function = divergence_function
     self._damping =damping
@@ -54,6 +55,7 @@ class BasePreconditioner(abc.ABC):
     self._batch_solve_precond = batch_solve_precond
     self._multibatch = multibatch
     self._precond_on_update = precond_on_update
+    self._allow_grad_inversion = allow_grad_inversion
     if normalize_grad_for_lqr:
       self._normalize_grad_for_lqr_fn = normalize_gradient
     else:
@@ -289,7 +291,7 @@ class BasePreconditioner(abc.ABC):
       self._block_structure.update_blocks(
         self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, next(dataloader), opt_state))
 
-    if self._block_structure_name in ('scalar', "diagonal"):
+    if not self._allow_grad_inversion and self._block_structure_name in ('scalar', "diagonal"):
       # We clip to (almost) 0 those 2 structures to avoid gradient inversion
       self._block_structure.clip_blocks(min_for_block=1e-8)
 

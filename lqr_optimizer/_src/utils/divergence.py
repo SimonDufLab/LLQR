@@ -9,4 +9,4 @@ def ngd_divergence_f(px, px_):
   return (-jnp.exp(px) * px_).sum()
 
 def renyi_divergence(px, px_, order=1/2):
-  return (1/order-1) * jnp.log((jnp.exp(px)**order / jnp.exp(px_)**(order-1)).sum())
+  return (1/order-1) * jnp.log((jnp.exp(px)**order / (jnp.exp(px_)**(order-1))+1e-8).sum())

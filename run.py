@@ -156,6 +156,7 @@ def main(cfg: DictConfig):
     precond_on_update=cfg.precond_on_update,
     normalize_grad_for_lqr = cfg.normalize_grad_for_lqr,
     damping=cfg.damping,
+    allow_grad_inversion=cfg.allow_grad_inversion,
     divergence_args_index=-1
   )
   if load_from_preexisting_model_state:

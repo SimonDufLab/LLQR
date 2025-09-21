@@ -22,6 +22,7 @@ precond_clip_norm: 5.0
 precond_clip_element_wise: null
 normalize_grad_for_lqr: false
 normalize_conv_params: false
+allow_grad_inversion: false
 use_preconditioner: true
 
 divergence: ngd

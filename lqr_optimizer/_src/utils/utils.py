@@ -260,7 +260,7 @@ def clip_by_group_norm(max_norm: float) -> optax.GradientTransformation:
 
   def update_fn(updates, state, params=None):
     def clip_leaf(g: jnp.ndarray) -> jnp.ndarray:
-      leaf_norm = jnp.linalg.norm(g)
+      leaf_norm = optax._src.linear_algebra.global_norm(g) # Safer than jnp.linalg.norm
       leaf_norm = jnp.maximum(max_norm, leaf_norm)
       scale = max_norm / leaf_norm
       return g * scale
