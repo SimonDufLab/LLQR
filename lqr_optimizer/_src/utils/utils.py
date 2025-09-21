@@ -229,7 +229,7 @@ def load_main_optimizer(cfg, lr_or_sched):
 def load_precond_optimizer(cfg, lr):
   optax_solver_for_precond = []
   if cfg.precond_clip_norm:
-    optax_solver_for_precond.append(optax.clip_by_global_norm(cfg.precond_clip_norm))
+    optax_solver_for_precond.append(clip_by_group_norm(cfg.precond_clip_norm))
   if cfg.precond_clip_element_wise:
     optax_solver_for_precond.append(optax.clip(cfg.precond_clip_element_wise))
   if cfg.precond_solver == "adam":
@@ -242,6 +242,34 @@ def load_precond_optimizer(cfg, lr):
     raise ValueError("Unknown precond optimizer")
   return optax.chain(*optax_solver_for_precond)
 
+
+def clip_by_group_norm(max_norm: float) -> optax.GradientTransformation:
+  """
+  Clip each gradient leaf independently by its L2 norm.
+
+  Args:
+      max_norm: Maximum allowed norm for each parameter leaf.
+
+  Returns:
+      An optax.GradientTransformation that can be used in optax.chain.
+  """
+
+  def init_fn(params):
+    # No state needed for clipping
+    return ()
+
+  def update_fn(updates, state, params=None):
+    def clip_leaf(g: jnp.ndarray) -> jnp.ndarray:
+      leaf_norm = jnp.linalg.norm(g)
+      leaf_norm = jnp.maximum(max_norm, leaf_norm)
+      scale = max_norm / leaf_norm
+      return g * scale
+
+    # Treemap over all leaves
+    clipped_updates = jax.tree_map(clip_leaf, updates)
+    return clipped_updates, state
+
+  return optax.GradientTransformation(init_fn, update_fn)
 
 ##################################
 # Training utils
