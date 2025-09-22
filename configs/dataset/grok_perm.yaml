@@ -1,3 +1,4 @@
 name: permutation
 
 augment_dataset: false
+lt_config: null

@@ -328,11 +328,29 @@ def apply_cutout(image, size=16, p=0.5):
   return tf.cond(tf.random.uniform([]) < p, cutout_fn, lambda: image)
 
 
-def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_dataset=False):
+def prepare_dataloader(
+    batch_size=128,
+    train=True,
+    dataset='mnist',
+    augment_dataset=False,
+    lt_config=None,  # e.g., {"imbalance_ratio": 100, "distribution": "exp", "seed": 0}
+):
   """
-  Creates a generator that yields (x, y) from the specified dataset (MNIST, CIFAR-10, or CIFAR-100).
-  Applies specified data augmentation to CIFAR datasets if augment_dataset=True.
-  Returns the generator along with the number of classes in the dataset.
+  Creates a generator that yields (x, y) from the specified dataset:
+    - MNIST, truncated_mnist, CIFAR-10, CIFAR-100
+    - If lt_config is provided and dataset is CIFAR-10/100 (train=True),
+      builds a long-tailed (LT) training split (CIFAR-10-LT / CIFAR-100-LT).
+
+  lt_config (dict or None):
+    - "imbalance_ratio": float, optional. E.g., 100 means max:min = 100:1.
+      (If omitted, defaults to 100.)
+    - OR "imb_factor": float in (0,1], optional. (imb_factor = 1/imbalance_ratio)
+    - "distribution": str, optional. Only "exp" is implemented (default).
+    - "seed": int, optional. Controls per-class shuffles before taking.
+  Returns:
+    (generator, info)
+      info["num_classes"], info["ds_size"],
+      and if LT is used: info["class_counts"] (list length = num_classes).
   """
   grokking_datasets = {
     'mod_sum': lambda: ModSumDataset(frac_train=0.5, p=97, k=5),
@@ -345,78 +363,123 @@ def prepare_dataloader(batch_size=128, train=True, dataset='mnist', augment_data
     ds = grokking_datasets[dataset]()
     iterator, info = load_grok_ds(ds, split=split, batch_size=batch_size, with_info=True)
 
-    # Note: grokking data is already int32 and normalized
     def generator():
       for x_batch, y_batch in iterator:
         yield x_batch, y_batch
-
     return generator(), info
 
+  # ---------- Standard image datasets ----------
+  info = {}
+  if dataset in ('mnist', 'truncated_mnist'):
+    ds_name = 'mnist'
+    mean = 0.1307
+    std = 0.3081
+    info["num_classes"] = 10
+  elif dataset == 'cifar-10':
+    ds_name = 'cifar10'
+    mean = jnp.array([0.4914, 0.4822, 0.4465])
+    std = jnp.array([0.2470, 0.2435, 0.2616])
+    info["num_classes"] = 10
+  elif dataset == 'cifar-100':
+    ds_name = 'cifar100'
+    mean = jnp.array([0.5071, 0.4867, 0.4408])
+    std = jnp.array([0.2675, 0.2565, 0.2761])
+    info["num_classes"] = 100
   else:
-    info = {}
-    if dataset == 'mnist' or dataset == 'truncated_mnist':
-      ds_name = 'mnist'
-      mean = 0.1307
-      std = 0.3081
-      info["num_classes"] = 10
-    elif dataset == 'cifar-10':
-      ds_name = 'cifar10'
-      mean = jnp.array([0.4914, 0.4822, 0.4465])
-      std = jnp.array([0.2470, 0.2435, 0.2616])
-      info["num_classes"] = 10
-    elif dataset == 'cifar-100':
-      ds_name = 'cifar100'
-      mean = jnp.array([0.5071, 0.4867, 0.4408])
-      std = jnp.array([0.2675, 0.2565, 0.2761])
-      info["num_classes"] = 100
-    else:
-      raise ValueError("Unsupported dataset. Choose either 'mnist', 'truncated_mnist', 'cifar-10', or 'cifar-100'")
+    raise ValueError("Unsupported dataset. Use 'mnist', 'truncated_mnist', 'cifar-10', or 'cifar-100'.")
 
-    ds, _info = tfds.load(ds_name, split='train' if train else 'test', as_supervised=True, with_info=True)
+  # Load base split
+  ds, _info = tfds.load(ds_name, split='train' if train else 'test', as_supervised=True, with_info=True)
 
-    if dataset == 'truncated_mnist' and train:
-      # Shuffle and take a subset of 10,000 examples
-      ds = ds.shuffle(buffer_size=_info.splits['train'].num_examples, seed=0)
-      ds = ds.take(10_000)
+  # Optionally truncate MNIST train
+  if dataset == 'truncated_mnist' and train:
+    ds = ds.shuffle(buffer_size=_info.splits['train'].num_examples, seed=0)
+    ds = ds.take(10_000)
 
-    info["ds_size"] = int(ds.cardinality())
+  # ---------- Build LT split for CIFAR train if requested ----------
+  def _make_lt_counts(num_classes, per_class_max, lt_cfg):
+    # Accept either imb_factor (0<imb<=1) or imbalance_ratio (>=1)
+    if lt_cfg is None:
+      return [per_class_max] * num_classes
+    imb_factor = lt_cfg.get("imb_factor", None)
+    imb_ratio = lt_cfg.get("imbalance_ratio", None)
+    if imb_factor is None:
+      imb_factor = 1.0 / float(imb_ratio if imb_ratio is not None else 100.0)
+    dist = lt_cfg.get("distribution", "exp")
+    # Exponential long-tail (class 0 = head, class K-1 = tail)
+    if dist != "exp":
+      raise ValueError(f"Only 'exp' distribution is supported, got '{dist}'.")
+    if num_classes == 1:
+      return [per_class_max]
+    counts = []
+    for i in range(num_classes):
+      # decay exponent spans [0,1]
+      frac = i / (num_classes - 1)
+      ci = int(round(per_class_max * (imb_factor ** frac)))
+      counts.append(max(1, ci))
+    return counts
+
+  if train and lt_config is not None and dataset in ('cifar-10', 'cifar-100'):
+    num_classes = info["num_classes"]
+    # CIFAR train sizes: 5000/class for CIFAR-10, 500/class for CIFAR-100
+    total_train = int(_info.splits['train'].num_examples)
+    per_class_max = total_train // num_classes
+    class_counts = _make_lt_counts(num_classes, per_class_max, lt_config)
+    info["class_counts"] = class_counts
+    info["ds_size"] = int(sum(class_counts))
+    lt_seed = int(lt_config.get("seed", 0))
+
+    # Build per-class subsets: filter -> shuffle (per class) -> take desired count
+    # Note: this keeps labels intact and reshuffling happens later as well.
+    per_class_ds = []
+    for c in range(num_classes):
+      ds_c = ds.filter(lambda x, y, c=c: tf.equal(y, c))
+      # shuffle within class so you don't always take the same prefix
+      ds_c = ds_c.shuffle(buffer_size=10_000, seed=lt_seed + c, reshuffle_each_iteration=False)
+      ds_c = ds_c.take(class_counts[c])
+      per_class_ds.append(ds_c)
+
+    # Concatenate all per-class datasets and shuffle globally
+    ds = per_class_ds[0]
+    for dsc in per_class_ds[1:]:
+      ds = ds.concatenate(dsc)
+
+    # Cache & shuffle the final LT dataset
+    ds = ds.cache()
+    ds = ds.shuffle(info["ds_size"], seed=lt_seed, reshuffle_each_iteration=True)
+  else:
+    # Balanced/default path
+    size = int(ds.cardinality()) if tf.data.experimental.cardinality(ds) != tf.data.experimental.UNKNOWN_CARDINALITY else int(_info.splits['train' if train else 'test'].num_examples)
+    info["ds_size"] = size
     ds = ds.cache()
     ds = ds.shuffle(info["ds_size"], seed=0, reshuffle_each_iteration=True)
-    ds = ds.batch(batch_size)
 
-    if augment_dataset and train and dataset in ['cifar-10', 'cifar-100']:
-      ReflectionPadding2D = tf.keras.layers.Lambda(lambda x: tf.pad(x, [[0, 0], [4, 4], [4, 4], [0, 0]], 'REFLECT'))
-      # augmentation_pipeline = tf.keras.Sequential([
-      #   ReflectionPadding2D,
-      #   tf.keras.layers.RandomCrop(height=32, width=32),
-      #   tf.keras.layers.RandomFlip('horizontal')
-      # ])
-      # ds = ds.map(lambda x, y: (augmentation_pipeline(x), y), num_parallel_calls=tf.data.AUTOTUNE)
-      def augment_with_cutout(x, y):
-        x = ReflectionPadding2D(x)
-        x = tf.image.random_crop(x, size=[tf.shape(x)[0], 32, 32, 3])
-        x = tf.image.random_flip_left_right(x)
-        x = tf.map_fn(lambda img: apply_cutout(img, size=16, p=0.5), x)
-        return x, y
+  # Batch and (optional) augment
+  ds = ds.batch(batch_size)
 
-      ds = ds.map(augment_with_cutout, num_parallel_calls=tf.data.AUTOTUNE)
+  if augment_dataset and train and dataset in ('cifar-10', 'cifar-100'):
+    ReflectionPadding2D = tf.keras.layers.Lambda(lambda x: tf.pad(x, [[0, 0], [4, 4], [4, 4], [0, 0]], 'REFLECT'))
+    def augment_with_cutout(x, y):
+      x = ReflectionPadding2D(x)
+      x = tf.image.random_crop(x, size=[tf.shape(x)[0], 32, 32, 3])
+      x = tf.image.random_flip_left_right(x)
+      x = tf.map_fn(lambda img: apply_cutout(img, size=16, p=0.5), x)
+      return x, y
+    ds = ds.map(augment_with_cutout, num_parallel_calls=tf.data.AUTOTUNE)
 
-    ds = ds.repeat().prefetch(tf.data.AUTOTUNE)
+  ds = ds.repeat().prefetch(tf.data.AUTOTUNE)
 
-    def generator():
-      for x_batch, y_batch in ds:
-        x_batch = x_batch.numpy()
-        y_batch = y_batch.numpy()
+  # ---------- Generator ----------
+  def generator():
+    for x_batch, y_batch in ds:
+      x_batch = x_batch.numpy().astype(jnp.float32) / 255.0
+      if dataset == 'mnist' or dataset == 'truncated_mnist':
+        x_batch = (x_batch - mean) / std
+      else:
+        x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]
+      yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch.numpy(), dtype=jnp.int32)
 
-        x_batch = x_batch.astype(jnp.float32) / 255.0
-        if dataset == 'mnist':
-          x_batch = (x_batch - mean) / std
-        else:
-          x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]
-
-        yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch, dtype=jnp.int32)
-
-    return generator(), info
+  return generator(), info
 
 
 def compute_batch_accuracy(state, x_batch, y_batch):

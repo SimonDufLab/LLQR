@@ -1,0 +1,4 @@
+name: cifar-100
+
+augment_dataset: true
+lt_config: {"imbalance_ratio": 100, "distribution": "exp", "seed": 42}

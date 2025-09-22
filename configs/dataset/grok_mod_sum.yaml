@@ -1,3 +1,4 @@
 name: mod_sum
 
 augment_dataset: false
+lt_config: null
