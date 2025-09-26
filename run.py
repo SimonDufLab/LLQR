@@ -93,9 +93,13 @@ def main(cfg: DictConfig):
   print(jax.tree_util.tree_map(jnp.shape, init_batch_stats))
 
   # 4) Create the main optimizer
+  if cfg.wd_mask:
+    mask = utl.mask_from_flat_keys(params, cfg.wd_mask)
+  else:
+    mask = None
   opt_chain = []
   if cfg.weight_decay and "adamw" not in cfg.main_optimizer:
-    opt_chain.append(optax.add_decayed_weights(weight_decay=cfg.weight_decay))
+    opt_chain.append(optax.add_decayed_weights(weight_decay=cfg.weight_decay, mask=mask))
   if cfg.lr_scheduler and cfg.lr_scheduler.name != "constant":
     lr_sched_kwargs = {_key:_value for _key, _value in cfg.lr_scheduler.items() if _key!='name'}
     lr_or_sched = lr_schedule_choice[cfg.lr_scheduler.name](base_lr=cfg.learning_rate, total_epochs=cfg.total_epochs ,steps_per_epoch=steps_per_epoch, **lr_sched_kwargs)

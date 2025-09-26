@@ -16,9 +16,11 @@ from flax.linen import Sequential
 from flax.core.frozen_dict import FrozenDict
 from flax.training import train_state
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
+from flax.traverse_util import flatten_dict, unflatten_dict
 from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable
 from types import FrameType
 from pathlib import Path
+from collections.abc import Sequence
 
 from jax.tree_util import Partial
 
@@ -644,6 +646,41 @@ class TrainState(train_state.TrainState):
       **kwargs,
     )
 
+
+def mask_from_flat_keys(pytree, substrings, delimiter="/"):
+  """
+  Build a boolean mask pytree with the same structure as `pytree`.
+  A leaf is False iff any substring in `substrings` appears in its flattened key path.
+  """
+
+  # --- Input validation for `substrings` ---
+  if isinstance(substrings, (str, bytes)):
+    raise TypeError(
+      "substrings must be a sequence of strings (e.g., ['bias', 'LayerNorm']), "
+      "not a single string."
+    )
+  if not isinstance(substrings, Sequence):
+    raise TypeError(
+      f"substrings must be a sequence of strings; got {type(substrings).__name__}."
+    )
+  if not all(isinstance(s, str) for s in substrings):
+    bad = [type(s).__name__ for s in substrings if not isinstance(s, str)]
+    raise TypeError(
+      f"all items in `substrings` must be str; got non-str types: {set(bad)}."
+    )
+
+  subs = tuple(substrings)
+
+  flat_dict = flatten_dict(pytree)
+  new_flat_dict = {}
+  for k, v in flat_dict.items():
+    new_flat_dict[k] = not any(n in s for s in k for n in subs)
+  return unflatten_dict(new_flat_dict)
+
+
+#################################
+# Checkpointing utils
+#################################
 # Preemption handling on cluster
 class RunState(TypedDict):  # Taken from https://docs.mila.quebec/examples/good_practices/checkpointing/index.html
   """Typed dictionary containing the state of the training run which is saved at each epoch.
@@ -850,6 +887,25 @@ def cosine_annealing_schedule_per_epoch(
     return eta_min + (base_lr - eta_min) * cosine_decay
 
   return schedule
+
+
+def warmup_cosine_annealing_schedule(
+    base_lr: float,
+    total_epochs: int,
+    steps_per_epoch: float,
+    init_lr: float,
+    warmup_epochs: int,
+    t_max: int,
+    eta_min: float = 0.0,):
+  if t_max <= 0:
+    raise ValueError(f"T_max must be positive, got {t_max}")
+  if steps_per_epoch <= 0:
+    raise ValueError(f"steps_per_epoch must be positive, got {steps_per_epoch}")
+  warmup_steps = int(warmup_epochs * steps_per_epoch)
+  step_max = int(steps_per_epoch * t_max)
+
+  return optax.schedules.warmup_cosine_decay_schedule(init_value=init_lr, peak_value=base_lr,
+                                                      warmup_steps=warmup_steps, decay_steps=step_max, end_value=eta_min)
 
 
 def step_warmup(
