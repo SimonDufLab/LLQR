@@ -16,9 +16,15 @@ def get_group_elements_and_output_fn(dataset: str, p: int, k: int):
     elif dataset == "mod_subtract_dataset":
         group_elements1, group_elements2 = set(range(p)), set(range(p))
         def fetch_output(a, b): return (a - b) % p
+    elif dataset == "mod_mul_dataset":
+        group_elements1, group_elements2 = set(range(p)), set(range(p))
+        def fetch_output(a, b): return (a * b) % p
     elif dataset == "mod_division_dataset":
         group_elements1, group_elements2 = set(range(p)), set(range(1, p))
-        def fetch_output(a, b): return (a * (jnp.power(b, p-2) % p)) % p
+        def fetch_output(a, b): return (a * mod_pow(b, p-2, p)) % p
+    elif dataset == "mod_exp_dataset":
+        group_elements1, group_elements2 = set(range(p)), set(range(1, p))
+        def fetch_output(a, b): return mod_pow(a, b, p)
     elif dataset == "permutation_group_dataset":
         perms = set(map(tuple, permutations(list(range(k)))))
         group_elements1, group_elements2 = perms, perms
@@ -102,8 +108,12 @@ class ModSumDataset(AbstractDataset):
     def __init__(self, frac_train, p, k): super().__init__("mod_sum_dataset", frac_train, p, k)
 class ModSubtractDataset(AbstractDataset):
     def __init__(self, frac_train, p, k): super().__init__("mod_subtract_dataset", frac_train, p, k)
-class ModDivisonDataset(AbstractDataset):
+class ModMulDataset(AbstractDataset):
+  def __init__(self, frac_train, p, k): super().__init__("mod_mul_dataset", frac_train, p, k)
+class ModDivisionDataset(AbstractDataset):
     def __init__(self, frac_train, p, k): super().__init__("mod_division_dataset", frac_train, p, k)
+class ModExpDataset(AbstractDataset):
+  def __init__(self, frac_train, p, k): super().__init__("mod_exp_dataset", frac_train, p, k)
 class PermutationGroup(AbstractDataset):
     def __init__(self, frac_train, p, k): super().__init__("permutation_group_dataset", frac_train, p, k)
 
@@ -133,24 +143,51 @@ def load_grok_ds(
     with_info: bool = False,
     **kwargs
 ) -> Union[Tuple[BatchingIterator, Dict], BatchingIterator]:
-    """
-    Returns a generator (and optionally info dict) mimicking tfds.load:
-      ds, info = tfds.load(..., as_supervised=True, with_info=True)
-    """
-    X, Y = dataset.build_dataset(split=split)
-    ds_size = X.shape[0]
+  """
+  Returns a generator (and optionally info dict) mimicking tfds.load:
+    ds, info = tfds.load(..., as_supervised=True, with_info=True)
+  """
+  X, Y = dataset.build_dataset(split=split)
+  ds_size = X.shape[0]
 
-    iterator = BatchingIterator(X, Y, batch_size)
-    info = {
-        "vocab_size": dataset.vocab_size,
-        "num_classes": len(jnp.unique(Y)),
-        "ds_size": ds_size,
-        "train_cardinality": getattr(dataset, "train_cardinality", None),
-        "test_cardinality": getattr(dataset, "test_cardinality", None),
-    }
+  iterator = BatchingIterator(X, Y, batch_size)
+  info = {
+      "vocab_size": dataset.vocab_size,
+      "num_classes": len(jnp.unique(Y)),
+      "ds_size": ds_size,
+      "train_cardinality": getattr(dataset, "train_cardinality", None),
+      "test_cardinality": getattr(dataset, "test_cardinality", None),
+  }
 
-    # To match tfds, you can request info as a second return
-    if with_info:
-        return iterator, info
-    else:
-        return iterator
+  # To match tfds, you can request info as a second return
+  if with_info:
+      return iterator, info
+  else:
+      return iterator
+
+# ==============================================
+# utils
+# ==============================================
+def mod_pow(base, exp, mod):
+  """Compute (base**exp) % mod with binary exponentiation (JIT-friendly)."""
+  # Use a wide unsigned type to avoid overflow in the intermediate product.
+  # Assumes mod < 2**63; adjust if you truly need bigger integers.
+  dtype = jnp.uint64
+  b = jnp.asarray(base, dtype=dtype) % mod
+  e = jnp.asarray(exp, dtype=dtype)
+  m = jnp.asarray(mod, dtype=dtype)
+  acc = jnp.ones_like(b, dtype=dtype)
+
+  def cond(carry):
+    acc, b, e = carry
+    return e > 0
+
+  def body(carry):
+    acc, b, e = carry
+    acc = jnp.where((e & 1) == 1, (acc * b) % m, acc)
+    b = (b * b) % m
+    e = e >> 1
+    return acc, b, e
+
+  acc, _, _ = jax.lax.while_loop(cond, body, (acc, b, e))
+  return (acc % m).astype(jnp.uint32)

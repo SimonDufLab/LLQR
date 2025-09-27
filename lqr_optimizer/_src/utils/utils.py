@@ -24,7 +24,7 @@ from collections.abc import Sequence
 
 from jax.tree_util import Partial
 
-from lqr_optimizer._src.utils.grokking_dataset import ModSumDataset, ModDivisonDataset, ModSubtractDataset, PermutationGroup, load_grok_ds
+from lqr_optimizer._src.utils.grokking_dataset import ModSumDataset, ModDivisionDataset, ModSubtractDataset, ModMulDataset, ModExpDataset, PermutationGroup, load_grok_ds
 
 def vjp_f(f, x):
   """ Return the vjp in a form that can be applied directly over a vector
@@ -356,8 +356,10 @@ def prepare_dataloader(
   """
   grokking_datasets = {
     'mod_sum': lambda: ModSumDataset(frac_train=0.5, p=97, k=5),
-    'mod_subtract': lambda: ModSubtractDataset(frac_train=0.5, p=97, k=5),
-    'mod_division': lambda: ModDivisonDataset(frac_train=0.5, p=97, k=5),
+    'mod_subtract': lambda: ModSubtractDataset(frac_train=0.8, p=97, k=5),
+    'mod_mul': lambda: ModMulDataset(frac_train=0.5, p=97, k=5),
+    'mod_division': lambda: ModDivisionDataset(frac_train=0.8, p=97, k=5),
+    'mod_exp': lambda: ModExpDataset(frac_train=0.7, p=97, k=5),
     'permutation': lambda: PermutationGroup(frac_train=0.5, p=97, k=5),
   }
   if dataset in grokking_datasets:
