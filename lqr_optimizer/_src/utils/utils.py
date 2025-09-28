@@ -355,12 +355,12 @@ def prepare_dataloader(
       and if LT is used: info["class_counts"] (list length = num_classes).
   """
   grokking_datasets = {
-    'mod_sum': lambda: ModSumDataset(frac_train=0.5, p=97, k=5),
-    'mod_subtract': lambda: ModSubtractDataset(frac_train=0.8, p=97, k=5),
-    'mod_mul': lambda: ModMulDataset(frac_train=0.5, p=97, k=5),
-    'mod_division': lambda: ModDivisionDataset(frac_train=0.8, p=97, k=5),
-    'mod_exp': lambda: ModExpDataset(frac_train=0.7, p=97, k=5),
-    'permutation': lambda: PermutationGroup(frac_train=0.5, p=97, k=5),
+    'mod_sum': lambda: ModSumDataset(frac_train=0.6, p=97, k=5),
+    'mod_subtract': lambda: ModSubtractDataset(frac_train=0.6, p=97, k=5),
+    'mod_mul': lambda: ModMulDataset(frac_train=0.6, p=97, k=5),
+    'mod_division': lambda: ModDivisionDataset(frac_train=0.6, p=97, k=5),
+    'mod_exp': lambda: ModExpDataset(frac_train=0.6, p=97, k=5),
+    'permutation': lambda: PermutationGroup(frac_train=0.6, p=97, k=5),
   }
   if dataset in grokking_datasets:
     split = 'train' if train else 'test'

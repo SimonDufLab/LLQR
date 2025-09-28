@@ -17,4 +17,4 @@ checkpoint_freq: 1000
 init_key: 42
 rng_seed: 123 # For dropout, etc.
 
-precond_batch_size: 64
+precond_batch_size: 128
