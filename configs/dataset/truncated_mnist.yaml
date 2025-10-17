@@ -1,0 +1,4 @@
+name: truncated_mnist  # A special case creating a subset of 10 000 images of mnist for the training set.
+
+augment_dataset: false
+lt_config: null

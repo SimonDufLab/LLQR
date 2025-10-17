@@ -3,6 +3,7 @@ from typing import Tuple, Optional
 import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
+from jax.tree_util import Partial
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 
@@ -23,6 +24,10 @@ class BlockStructures(abc.ABC):
 
   def update_blocks(self, new_blocks):
     self.blocks.update(new_blocks)
+
+  def clip_blocks(self, min_for_block=None, max_for_block=None):
+    block_clip_fn = Partial(jnp.clip, min=min_for_block, max=max_for_block)
+    self.blocks = jax.tree_map(block_clip_fn, self.blocks)
 
   @abc.abstractmethod
   def identity_block_init(self, shape:Optional[Tuple[int, ...]]) -> jnp.ndarray:
@@ -233,7 +238,8 @@ class KroneckerBlock(BlockStructures):
           # Apply the Kronecker product approximation
           # product_matrix = factor_B @ vector_matrix.T @ factor_A.T
           # layer_product[component] = product_matrix.T.reshape(vm_shape)
-          product_matrix = factor_A @ vector_matrix @ factor_B.T
+          # product_matrix = factor_A @ vector_matrix @ factor_B.T
+          product_matrix = jnp.einsum('mk,kn,rn->mr', factor_A, vector_matrix, factor_B)
           layer_product[component] = product_matrix.reshape(vm_shape)
         elif 'bias' in component or 'scale' in component:
           diag = layer_blocks[component]
@@ -245,3 +251,63 @@ class KroneckerBlock(BlockStructures):
       product_dict[layer_name] = unflatten_dict(layer_product)
     return product_dict
 
+  @staticmethod
+  def prepare_vectors(vectors):
+    kernel_shapes = {}
+    prepared_vectors = {}
+    for layer_name, layer_vectors in vectors.items():
+      prepared_layer_vectors = {}
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if 'kernel' in component:
+          # Reshape the gradient vector according to the component type
+          vector_matrix = vec_component
+          vm_shape = vector_matrix.shape
+          if len(vm_shape) == 4:
+            k_h, k_w, cin, cout = vm_shape
+            vector_matrix = vector_matrix.reshape((k_h * k_w * cin, cout))
+          prepared_layer_vectors[component] = vector_matrix
+          kernel_shapes[layer_name] = {component: vm_shape}
+        elif 'bias' in component or 'scale' in component:
+          prepared_layer_vectors[component] = vec_component
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+      prepared_vectors[layer_name] = prepared_layer_vectors
+    return prepared_vectors, kernel_shapes
+
+  @staticmethod
+  def matrix_product_for_scan(blocks, prepared_vectors, kernel_shapes):
+    """
+    For each layer, perform the appropriate matrix–vector product for each parameter component.
+
+    - For kernel (dense or conv):
+        Compute vec(A @ X @ B^T), where X is the pre-reshaped gradient.
+        Then reshape back to the original kernel shape from kernel_shapes.
+    - For bias/scale:
+        Compute elementwise multiplication with the diagonal block.
+    """
+    product_dict = {}
+    for layer_name, layer_vectors in prepared_vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+
+      for component, vec_component in layer_vectors.items():
+        if "kernel" in component:
+              factor_A, factor_B = layer_blocks[component]
+              vector_matrix = vec_component  # already 2D from prepare_vectors
+
+              # Apply Kronecker product approximation
+              product_matrix = jnp.einsum(
+                  "mk,kn,rn->mr", factor_A, vector_matrix, factor_B
+              )
+
+              # Reshape back to the original 4D kernel shape
+              vm_shape = kernel_shapes[layer_name][component]
+              layer_product[component] = product_matrix.reshape(vm_shape)
+
+          # else: # Always called after prepare_vectors, so check is done
+        elif 'bias' in component or 'scale' in component:
+              diag = layer_blocks[component]
+              layer_product[component] = diag * vec_component
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return product_dict

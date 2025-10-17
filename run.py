@@ -3,19 +3,22 @@ import os
 import time
 from datetime import timedelta
 import signal
+import optax
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 # os.environ["XLA_FLAGS"] = "--xla_dump_hlo_as_text --xla_force_host_platform_device_count=1"  # Logging XLA compilation, for debugging
 
 import jax
 import jax.numpy as jnp
+from jax.tree_util import Partial
+from jax.flatten_util import ravel_pytree
 
 import hydra
 from aim import Run
 from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 
-from lqr_optimizer._src.configs.config import model_choice, divergence_choice
+from lqr_optimizer._src.configs.config import model_choice, divergence_choice, lr_schedule_choice
 from lqr_optimizer._src.preconditioner import BasePreconditioner
 from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, loss_eval, compute_accuracy, compute_batch_accuracy
 import lqr_optimizer._src.utils.utils as utl
@@ -56,19 +59,28 @@ def main(cfg: DictConfig):
   else:
     aim_hash = None
 
-  # Initialize aim for logging
-  run = Run(experiment=experiment_name, run_hash=aim_hash, force_resume=True)
+  # 1a) Create the data generators
+  dataloader, ds_info = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config)
+  num_classes, train_ds_size = ds_info['num_classes'], ds_info['ds_size']
+  precond_dataloader, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config)
+  test_dataloader, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name)
+  steps_per_epoch_rounded = train_ds_size // cfg.batch_size
+  steps_per_epoch = train_ds_size / cfg.batch_size
+  total_steps = ((train_ds_size * cfg.total_epochs) // cfg.batch_size) + 1
+  if not cfg.update_preconditioner_until:
+    cfg.update_preconditioner_until = total_steps + 1
+
+  # 1b) Initialize aim for logging
+  run = Run(repo=cfg.logging.aim_repo, experiment=experiment_name, run_hash=aim_hash, force_resume=True)
   run["config"] = OmegaConf.to_container(cfg)
   if cfg.preempt_handling:
     run_state["aim_hash"] = run.hash
 
-  # 1) Create the data generator
-  dataloader, num_classes, train_ds_size = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset)
-  test_dataloader, _, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name)
-  steps_per_epoch = train_ds_size // cfg.batch_size
-
   # 2) Define model
-  model, inf_model = model_choice[cfg.architecture.name](num_classes=num_classes)
+  model_kwargs = {}
+  if "grok" in cfg.architecture.name:
+    model_kwargs["vocab_size"] = ds_info["vocab_size"]
+  model, inf_model = model_choice[cfg.architecture.name](num_classes=num_classes, **model_kwargs)
   if inf_model is None:
     inf_model = model
 
@@ -81,7 +93,19 @@ def main(cfg: DictConfig):
   print(jax.tree_util.tree_map(jnp.shape, init_batch_stats))
 
   # 4) Create the main optimizer
-  model_optimizer = utl.load_main_optimizer(cfg)
+  if cfg.wd_mask:
+    mask = utl.mask_from_flat_keys(params, cfg.wd_mask)
+  else:
+    mask = None
+  opt_chain = []
+  if cfg.weight_decay and "adamw" not in cfg.main_optimizer:
+    opt_chain.append(optax.add_decayed_weights(weight_decay=cfg.weight_decay, mask=mask))
+  if cfg.lr_scheduler and cfg.lr_scheduler.name != "constant":
+    lr_sched_kwargs = {_key:_value for _key, _value in cfg.lr_scheduler.items() if _key!='name'}
+    lr_or_sched = lr_schedule_choice[cfg.lr_scheduler.name](base_lr=cfg.learning_rate, total_epochs=cfg.total_epochs ,steps_per_epoch=steps_per_epoch, **lr_sched_kwargs)
+  else: lr_or_sched = cfg.learning_rate
+  opt_chain.append(utl.load_main_optimizer(cfg, lr_or_sched))
+  model_optimizer = optax.chain(*opt_chain)
 
   if load_from_preexisting_model_state:
     state, precond_blocks = utl.restore_trainstate_and_precond(run_state["model_dir"])
@@ -103,10 +127,24 @@ def main(cfg: DictConfig):
     )
 
   # 5) Create the BasePreconditioner
-  precond_optimizer = utl.load_precond_optimizer(cfg)
+  if cfg.precond_lr_scheduler and cfg.precond_lr_scheduler.name != "constant":
+    precond_lr_sched_kwargs = {_key:_value for _key, _value in cfg.precond_lr_scheduler.items() if _key!='name'}
+    precond_lr_fn = lr_schedule_choice[cfg.precond_lr_scheduler.name](base_lr=cfg.precond_lr, total_epochs=cfg.total_epochs ,steps_per_epoch=steps_per_epoch, **precond_lr_sched_kwargs)
+    precond_lr = 1.0
+  else:
+    precond_lr_fn = lambda _: 1.0
+    precond_lr = cfg.precond_lr
+  precond_optimizer = utl.load_precond_optimizer(cfg, precond_lr)
 
   # Initialize BasePreconditioner
-  divergence_f = divergence_choice[cfg.divergence]
+  if cfg.divergence == "renyi":
+    divergence_kwarg = {"order":cfg.divergence_order_param}
+  else:
+    divergence_kwarg = {}
+  if divergence_kwarg:
+    divergence_f = Partial(divergence_choice[cfg.divergence], **divergence_kwarg)
+  else:
+    divergence_f = divergence_choice[cfg.divergence]
   preconditioner = BasePreconditioner(
     divergence_function=divergence_f,
     loss_fn=cross_entropy_loss,
@@ -115,10 +153,14 @@ def main(cfg: DictConfig):
     model=inf_model,
     network_params=params,
     optax_solver=precond_optimizer,
-    precond_clip_norm=cfg.precond_clip_norm,
+    trainstate_solver=state.tx,
     preconditioner_update_steps=cfg.precond_steps,
+    batch_solve_precond=cfg.batch_solve_precond,
     multibatch=cfg.multibatch_training,
+    precond_on_update=cfg.precond_on_update,
+    normalize_grad_for_lqr = cfg.normalize_grad_for_lqr,
     damping=cfg.damping,
+    allow_grad_inversion=cfg.allow_grad_inversion,
     divergence_args_index=-1
   )
   if load_from_preexisting_model_state:
@@ -150,31 +192,23 @@ def main(cfg: DictConfig):
 
   # @jax.jit
   def train_step(state, x, y):
-    # @jax.jit
-    # def loss_fn(params):
-    #   # Pass both params and batch_stats, and mark batch_stats as mutable.
-    #   (log_probs, new_model_state) = state.apply_fn(
-    #     {'params': params, 'batch_stats': state.batch_stats},
-    #     x,
-    #     mutable=['batch_stats']
-    #   )
-    #   loss = cross_entropy_loss(log_probs, y)
-    #   return loss, new_model_state
-
-    # Compute the loss and gradients. Note: we use has_aux=True to get new_model_state.
-    # (loss, new_model_state), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     (loss, new_model_state), grads = compute_updates(state.params, state.batch_stats, x, y)
 
-    # 2) Apply the preconditioner on the gradient
-    precond_grads = preconditioner.apply(grads)
+    if cfg.precond_on_update:
+      new_state = state.apply_gradients_and_precond(grads=grads, precond_apply=preconditioner.apply,
+                                                    normalize_conv_params=cfg.normalize_conv_params,
+                                                    batch_stats=new_model_state['batch_stats'])
+    else:
+      # Apply the preconditioner on the gradient
+      precond_grads = preconditioner.apply(grads)
+      new_state = state.apply_gradients(grads=precond_grads, normalize_conv_params=cfg.normalize_conv_params,
+                                        batch_stats=new_model_state['batch_stats'])
 
-    new_state = state.apply_gradients(grads=precond_grads, batch_stats=new_model_state['batch_stats'])
     return new_state, loss
 
   # Start timer
   start_time = time.time()
   # We'll keep a local dataloader iterator
-  data_iter = dataloader  # generator
 
   dropout_key = jax.random.PRNGKey(cfg.rng_seed)
   if load_from_preexisting_model_state:
@@ -189,37 +223,42 @@ def main(cfg: DictConfig):
     prev_elapsed_time = 0
 
   print(f"Continuing training from step {starting_step}")
-  for step in range(starting_step, cfg.total_steps):
+  for step in range(starting_step, total_steps):
     # Possibly update the preconditioner every `update_preconditioner_every` steps
-    if (step % cfg.update_preconditioner_every) == 0 and cfg.use_preconditioner:
+    if (step % cfg.update_preconditioner_every) == 0 and cfg.use_preconditioner and step < cfg.update_preconditioner_until:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
       precond_update_start_time = time.time()
-      preconditioner.update_preconditioner(state.params, data_iter,
+      precond_lr = precond_lr_fn(step)
+      preconditioner.update_preconditioner(state.params, precond_dataloader, precond_lr, state.opt_state,
                                            other_model_variables={'batch_stats': state.batch_stats})
-      precond_max, precond_min, precond_norm = preconditioner.get_stats()
+      precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
       # !!Remove below when timing against non-2nd order methods!! (Affect computation time)
       run.track(precond_max, name="Maximum across preconditioner", step=step)
       run.track(precond_min, name="Minimum across preconditioner", step=step)
       run.track(precond_norm, name="Preconditioner l2 norm", step=step)
+      for layer, l_norm in per_layer_norm.items():
+        run.track(l_norm, name=f"{layer} l2 norm", step=step)
       print(f"Preconditioner was updated in {time.time()-precond_update_start_time:.2f} seconds")
 
     # Grab the next batch for normal training
-    x_batch, y_batch = next(data_iter)
+    x_batch, y_batch = next(dataloader)
 
     state, loss = train_step(state, x_batch, y_batch)
 
     # Logging or testing every so often
-    if step % 10 == 0:
+    if step % cfg.logging_freq == 0:
       # Simple logging
       # train_loss = loss_eval(state, x_batch, y_batch)
       train_loss = loss
-      elapsed_time = time.time() - start_time + prev_elapsed_time # Calculate elapsed time
+      elapsed_time = time.time() - start_time + prev_elapsed_time  # Calculate elapsed time
       run.track(train_loss, name="train loss", step=step)
+      run.track(train_loss, name="train loss|t", step=elapsed_time*100)
       # Compute batch accuracy
       batch_accuracy = compute_batch_accuracy(state, x_batch, y_batch)
       run.track(batch_accuracy, name="train accuracy", step=step)
-      if step % 200 == 0:
+      run.track(batch_accuracy, name="train accuracy|t", step=elapsed_time*100)
+      if step % cfg.report_freq == 0:
         # Print info
         print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
@@ -231,6 +270,8 @@ def main(cfg: DictConfig):
       elapsed_time = time.time() - start_time + prev_elapsed_time
       run.track(test_accuracy, name="test accuracy", step=step)
       run.track(test_loss, name="test loss", step=step)
+      run.track(test_accuracy, name="test accuracy|t", step=elapsed_time*100)
+      run.track(test_loss, name="test loss|t", step=elapsed_time*100)
       print("============================")
       print(f"Step {step} | Test Loss: {test_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
       print(f"Step {step} | Test Accuracy: {test_accuracy:.2f}%")
@@ -239,7 +280,7 @@ def main(cfg: DictConfig):
     if (step > 0) and cfg.preempt_handling and (step % cfg.checkpoint_freq == 0):
       chckpt_init_time = time.time()
       elapsed_time = time.time() - start_time + prev_elapsed_time
-      utl.checkpoint_exp(run_state, state, preconditioner.expose_blocks(), curr_epoch=step // steps_per_epoch,
+      utl.checkpoint_exp(run_state, state, preconditioner.expose_blocks(), curr_epoch=step // steps_per_epoch_rounded,
                          curr_step=step, dropout_key=dropout_key, best_acc=best_acc,
                          training_time=elapsed_time)
       print(

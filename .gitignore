@@ -145,6 +145,7 @@ static
 
 # Logger file from aim
 .aim/
+./*/.aim/
 
 # Logger file from hydra
 outputs/

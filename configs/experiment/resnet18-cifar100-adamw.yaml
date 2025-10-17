@@ -1,0 +1,20 @@
+# @package _global_
+defaults:
+  - /default        # includes default.yaml from default/
+  - /architecture: resnet18
+  - /dataset: cifar100
+  - /lr_scheduler: warmup_cosine_decay
+  - /precond_lr_scheduler: constant
+
+batch_size: 128
+learning_rate: 3e-3
+main_optimizer: adam
+weight_decay: 1e-2
+wd_mask: ['Norm', 'bias']
+total_epochs: 200
+test_eval_freq: 2000
+checkpoint_freq: 1000
+init_key: 42
+rng_seed: 123 # For dropout, etc.
+
+precond_batch_size: 128

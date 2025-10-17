@@ -1,8 +1,7 @@
 defaults:
   - _self_
-  - default
-  - architecture: mlp
-  - dataset: mnist
+  - experiment: _default
 
 logging:
   aim: true
+  aim_repo: null

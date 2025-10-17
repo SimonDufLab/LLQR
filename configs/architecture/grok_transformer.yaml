@@ -1,0 +1,4 @@
+name: grok-transformer
+
+activation: gelu # TODO: later implementation
+size: null # TODO: later implementation

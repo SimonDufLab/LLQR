@@ -1,4 +1,4 @@
-name: mnist
+name: mod_division
 
 augment_dataset: false
 lt_config: null

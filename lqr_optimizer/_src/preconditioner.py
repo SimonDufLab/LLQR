@@ -1,5 +1,6 @@
 """Preconditioner classes and their update rules."""
 import abc
+from functools import partial
 
 import optax
 import jax
@@ -8,7 +9,7 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
-from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, vmapped_clip_norm, pytree_max_min, pytree_l2_norm
+from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm, get_per_layer_norm
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints,
                              lqr_backward_matrices_and_adjoints)
@@ -29,90 +30,61 @@ class BasePreconditioner(abc.ABC):
                model,
                network_params,
                optax_solver,
-               precond_clip_norm,
+               trainstate_solver,
                preconditioner_update_steps,
+               batch_solve_precond: bool = True,
                multibatch: bool = False,
+               precond_on_update: bool =False,
                normalize_grad_for_lqr = True,
-               damping:float = 0.0,
+               damping: float = 0.0,
+               allow_grad_inversion: bool = False,
                divergence_args_index = -1):
     self._divergence_function = divergence_function
     self._damping =damping
     self._loss_fn = loss_fn
     self._optax_solver = optax_solver
-    self._clip_norm = precond_clip_norm
+    self._trainstate_solver = trainstate_solver
     self._layer_names = list(network_params.keys())
     self._block_structure = BLOCK_STRUCTURE_DICT[block_structure](network_params, self._layer_names, block_structure_init)
+    self._block_structure_name = block_structure
     # self._block_structure.make_blocks(network_params, model.layer_names)
     self._layer_apply = model.apply_block_from_params
     self._model_apply = model.apply
     self._divergence_args_index = divergence_args_index
     self._preconditioner_update_steps = preconditioner_update_steps
+    self._batch_solve_precond = batch_solve_precond
     self._multibatch = multibatch
+    self._precond_on_update = precond_on_update
+    self._allow_grad_inversion = allow_grad_inversion
     if normalize_grad_for_lqr:
       self._normalize_grad_for_lqr_fn = normalize_gradient
     else:
       self._normalize_grad_for_lqr_fn = lambda _: _  # Nothing, identity fn
-    if precond_clip_norm:
-      self._clip_norm_fn = vmapped_clip_norm
-    else:
-      self._clip_norm_fn = lambda x, _: x # Nothing, identity fn
 
-    self._update_preconditioner_fn = self._get_evaluate_lqr(self._optax_solver, self._preconditioner_update_steps, multibatch=self._multibatch)
-
+    self._update_preconditioner_fn = self._get_evaluate_lqr(self._optax_solver, self._preconditioner_update_steps,
+                                                            batch_solve_precond=self._batch_solve_precond,
+                                                            multibatch=self._multibatch,
+                                                            precond_on_update=self._precond_on_update)
+    self._jit_apply_fn = jax.jit(
+      lambda blocks, update: self._block_structure.matrix_product(blocks, update)
+    )
   def apply(self, update):
-    return self._block_structure.matrix_product(self._block_structure.blocks, update)
+    return self._jit_apply_fn(self._block_structure.blocks, update)
 
   def get_stats(self):
     precond_max, precond_min = pytree_max_min(self._block_structure.blocks)
     precond_norm = pytree_l2_norm(self._block_structure.blocks)
-    return precond_max, precond_min, precond_norm
+    per_layer_norm = get_per_layer_norm(self._block_structure.blocks)
+    return precond_max, precond_min, precond_norm, per_layer_norm
 
-  def _get_evaluate_lqr(self, optax_solver=None, steps=1, multibatch=False):
+  def _get_evaluate_lqr(self, optax_solver=None, steps=1, batch_solve_precond=True, multibatch=False, precond_on_update=False):
     def compute_loss(_params, _other_model_variables, x, y):
       if type(_other_model_variables) is FrozenDict:
         _other_model_variables = dict(_other_model_variables)
       return self._loss_fn(self._model_apply({'params': _params}|_other_model_variables, x), y)
 
-    if multibatch:
-      @jax.jit
-      def evaluate_lqr(preconditioner, params, other_model_variables, datapoint):
-        inputs, targets = datapoint
-        a, b, a_transpose, states =lqr_forward_matrices_and_states(inputs, params, self._layer_apply, self._layer_names,
-                                                                   other_model_variables)
-        if self._divergence_args_index is not None:
-          div_arg = states[self._divergence_args_index]
-        else:
-          div_arg = None
-        final_q, final_p, final_lin_cost = lqr_final_costs_and_adjoints(self._loss_fn, states[-1], targets,
-                                                                        div_f=self._divergence_function,
-                                                                        div_arg=div_arg)
-        final_lin_cost = jnp.atleast_1d(final_lin_cost)
-        q_backward, r_backward, m_backward, m_transpose_backward = lqr_backward_matrices_and_adjoints(params, states,
-                                                                                                      final_p,
-                                                                                                      a_transpose,
-                                                                                                      self._layer_apply,
-                                                                                                      self._layer_names,
-                                                                                                      self._damping,
-                                                                                                      other_model_variables)
-        gradients = jax.grad(compute_loss, argnums=0)(params, other_model_variables, inputs, targets)
-        gradients = self._normalize_grad_for_lqr_fn(gradients)
-        gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
-        cost = 0
-        x = jnp.zeros(states[0].size)
-        u_dict = self._block_structure.matrix_product(preconditioner, gradients)
-        for i, layer_name in enumerate(self._layer_names):
-          u, _ = ravel_pytree(u_dict[layer_name])
-          cost += (x.T @ q_backward[-i - 1](x) + u.T @ r_backward[-i - 1](u)) / 2 + u.T @ m_backward[-i - 1](x)
-          x = a[i](x) + b[i](u)
-
-        cost += x.T@final_lin_cost + (x.T@final_q(x))/2
-
-        return cost
-      return evaluate_lqr
-
-    else:
-      # @jax.jit
-      def evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint):
+    if batch_solve_precond:
+      def get_operators_and_gradients(params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
         a, b, a_transpose, states = lqr_forward_matrices_and_states(inputs, params, self._layer_apply,
                                                                     self._layer_names, other_model_variables)
@@ -132,6 +104,95 @@ class BasePreconditioner(abc.ABC):
                                                                                                       self._damping,
                                                                                                       other_model_variables)
         gradients = jax.grad(compute_loss, argnums=0)(params, other_model_variables, inputs, targets)
+        if precond_on_update:
+          gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state, params)
+        gradients = self._normalize_grad_for_lqr_fn(gradients)
+        gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
+
+        return gradients, (a, b, q_backward, r_backward, m_backward, final_q, final_lin_cost)
+
+      # def lqr_cost(_preconditioner, input_size, gradients, kernel_shapes, operators):
+      def lqr_cost(_preconditioner, input_size, gradients, operators):
+        a, b, q_backward, r_backward, m_backward, final_q, final_lin_cost = operators
+        cost = 0
+        x = jnp.zeros(input_size)
+        # u_dict = self._block_structure.matrix_product_for_scan(_preconditioner, gradients, kernel_shapes)
+        u_dict = self._block_structure.matrix_product(_preconditioner, gradients)
+        for i, layer_name in enumerate(self._layer_names):
+          u, _ = ravel_pytree(u_dict[layer_name])
+          cost += (x.T @ q_backward[-i - 1](x) + u.T @ r_backward[-i - 1](u)) / 2 + u.T @ m_backward[-i - 1](x)
+          x = a[i](x) + b[i](u)
+
+        # cost += x.T @ jnp.squeeze(final_lin_cost) + (x.T @ final_q(x)) / 2 # squeeze is causing problems
+        x1 = jnp.ravel(x)  # () -> (1,), (n,1)/(1,n)/(n,) -> (n,)
+        c1 = jnp.ravel(final_lin_cost)
+        qx1 = jnp.ravel(final_q(x))  # final_q(x) = Qx
+
+        cost += jnp.dot(x1, c1) + 0.5 * jnp.dot(x1, qx1)
+
+        return cost
+
+      # def lqr_grad_fn(_preconditioner, input_size, gradients, kernel_shapes, operators):
+      def lqr_grad_fn(_preconditioner, input_size, gradients, operators):
+        grads = jax.grad(lqr_cost, argnums=0)(
+          # _preconditioner, input_size, gradients, kernel_shapes, operators)
+          _preconditioner, input_size, gradients, operators)
+        grads = jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=1.0, neginf=-1.0), grads)
+        # grads = jax.tree_map(zero_if_bad, grads)
+        print(jax.tree_map(lambda g: g.shape, grads))
+        return grads
+
+      @Partial(jax.jit, donate_argnames=("preconditioner",))
+      def get_update(preconditioner, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
+        # Initialize the optimizer state for the preconditioner.
+        opt_state = optax_solver.init(preconditioner)
+        gradients, operators = get_operators_and_gradients(
+          params, other_model_variables, datapoint, trainstate_opt_state)
+        # gradients, kernel_shapes = self._block_structure.prepare_vectors(gradients)
+        input_size = datapoint[0].size
+
+        # Define a single update step to be run in the compiled loop.
+        def update_step(i, state):
+          precond, opt_state = state
+          # precond_grad = lqr_grad_fn(precond, input_size, gradients, kernel_shapes, operators)
+          precond_grad = lqr_grad_fn(precond, input_size, gradients, operators)
+          updates, opt_state = optax_solver.update(precond_grad, opt_state)
+          updates = jax.tree_map(lambda g: g * precond_lr, updates)
+          new_precond = optax.apply_updates(precond, updates)
+          return (new_precond, opt_state)
+
+        # Use a compiled loop to perform “steps” iterations.
+        init_state = (preconditioner, opt_state)
+        final_precond, _ = jax.lax.fori_loop(0, steps, update_step, init_state)
+        # Safeguard against any numerical issues
+        # return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), final_precond)
+        return jax.tree_map(jnp.nan_to_num, final_precond)
+
+      return get_update
+    else:
+      @jax.jit
+      def evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state):
+        inputs, targets = datapoint
+        a, b, a_transpose, states = lqr_forward_matrices_and_states(inputs, params, self._layer_apply,
+                                                                    self._layer_names, other_model_variables)
+        if self._divergence_args_index is not None:
+          div_arg = states[self._divergence_args_index]
+        else:
+          div_arg = None
+        final_q, final_p, final_lin_cost = lqr_final_costs_and_adjoints(self._loss_fn, states[-1], targets,
+                                                                        div_f=self._divergence_function,
+                                                                        div_arg=div_arg)
+        final_lin_cost = jnp.atleast_1d(final_lin_cost)
+        q_backward, r_backward, m_backward, m_transpose_backward = lqr_backward_matrices_and_adjoints(params, states,
+                                                                                                      final_p,
+                                                                                                      a_transpose,
+                                                                                                      self._layer_apply,
+                                                                                                      self._layer_names,
+                                                                                                      self._damping,
+                                                                                                      other_model_variables)
+        gradients = jax.grad(compute_loss, argnums=0)(params, other_model_variables, inputs, targets)
+        if precond_on_update:
+          gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state, params)
         gradients = self._normalize_grad_for_lqr_fn(gradients)
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
 
@@ -144,79 +205,98 @@ class BasePreconditioner(abc.ABC):
             cost += (x.T @ q_backward[-i - 1](x) + u.T @ r_backward[-i - 1](u)) / 2 + u.T @ m_backward[-i - 1](x)
             x = a[i](x) + b[i](u)
 
-          cost += x.T @ final_lin_cost + (x.T @ final_q(x)) / 2
+          # cost += x.T @ jnp.squeeze(final_lin_cost) + (x.T @ final_q(x)) / 2 # squeeze is causing problems
+          x1 = jnp.ravel(x)  # () -> (1,), (n,1)/(1,n)/(n,) -> (n,)
+          c1 = jnp.ravel(final_lin_cost)
+          qx1 = jnp.ravel(final_q(x))  # assume final_q(x) ~ Qx
+
+          cost += jnp.dot(x1, c1) + 0.5 * jnp.dot(x1, qx1)
 
           return cost
-
-        # opt_state = optax_solver.init(preconditioner)
-        # for _ in range(steps):
-        #   precond_grad = jax.grad(lqr_cost, argnums=0)(preconditioner)
-        #   _update, opt_state = optax_solver.update(precond_grad, opt_state)
-        #   preconditioner = optax.apply_updates(preconditioner, _update)
-        # return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), preconditioner)
 
         local_precond_grad = jax.grad(lqr_cost, argnums=0)(preconditioner)
         return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), local_precond_grad)
 
-      vmapped_evaluate_lqr_grad = jax.vmap(evaluate_lqr_grad, in_axes=(None, None, None, (0, 0)))
-      def get_precond_grad(preconditioner, params, other_model_variables, datapoint):
-        grads = vmapped_evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint)
-        grads = self._clip_norm_fn(grads, self._clip_norm)
+      vmapped_evaluate_lqr_grad = jax.vmap(evaluate_lqr_grad, in_axes=(None, None, None, (0, 0), None))
+
+      def get_precond_grad(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state):
+        # print(datapoint[0].shape)
+        datapoint = tuple(jnp.expand_dims(x, axis=1) for x in datapoint)
+        # print(datapoint[0].shape)
+        grads = vmapped_evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint,
+                                          trainstate_opt_state)
         return jax.tree_map(Partial(jnp.mean, axis=0), grads)
 
-      # @timed_jit # switch back to jax.jit after debugging
-      # # jax.jit
-      # def get_update(preconditioner, params, other_model_variables, datapoint):
-      #   opt_state = optax_solver.init(preconditioner)
-      #   for _ in range(steps):
-      #     precond_grad = get_precond_grad(preconditioner, params, other_model_variables, datapoint)
-      #     _update, opt_state = optax_solver.update(precond_grad, opt_state)
-      #     preconditioner = optax.apply_updates(preconditioner, _update)
-      #   return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), preconditioner)
-      #
-      # return get_update
+        # @timed_jit # switch back to jax.jit after debugging
+        # # jax.jit
+        # def get_update(preconditioner, params, other_model_variables, datapoint):
+        #   opt_state = optax_solver.init(preconditioner)
+        #   for _ in range(steps):
+        #     precond_grad = get_precond_grad(preconditioner, params, other_model_variables, datapoint)
+        #     _update, opt_state = optax_solver.update(precond_grad, opt_state)
+        #     preconditioner = optax.apply_updates(preconditioner, _update)
+        #   return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), preconditioner)
+        #
+        # return get_update
 
-      @jax.jit
-      def get_update(preconditioner, params, other_model_variables, datapoint):
-        # Initialize the optimizer state for the preconditioner.
-        opt_state = optax_solver.init(preconditioner)
+      if multibatch:
+        def get_update(preconditioner, params, precond_lr, other_model_variables, dataloader, trainstate_opt_state):
+          # Initialize the optimizer state for the preconditioner.
+          opt_state = optax_solver.init(preconditioner)
 
-        # Define a single update step to be run in the compiled loop.
-        def update_step(i, state):
-          precond, opt_state = state
-          precond_grad = get_precond_grad(precond, params, other_model_variables, datapoint)
-          updates, opt_state = optax_solver.update(precond_grad, opt_state)
-          new_precond = optax.apply_updates(precond, updates)
-          return (new_precond, opt_state)
+          # Define a single update step to be run in the compiled loop.
+          @jax.jit
+          def update_step(precond, opt_state, datapoint):
+            precond_grad = get_precond_grad(precond, params, other_model_variables, datapoint, trainstate_opt_state)
+            updates, opt_state = optax_solver.update(precond_grad, opt_state)
+            updates = jax.tree_map(lambda g: g * precond_lr, updates)
+            new_precond = optax.apply_updates(precond, updates)
+            return (new_precond, opt_state)
 
-        # Use a compiled loop to perform “steps” iterations.
-        init_state = (preconditioner, opt_state)
-        final_precond, _ = jax.lax.fori_loop(0, steps, update_step, init_state)
-        # Safeguard against any numerical issues
-        return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), final_precond)
+          for _ in range(steps):
+            precond, opt_state = update_step(preconditioner, opt_state, next(dataloader))
+          # Safeguard against any numerical issues
+          return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), precond)
+
+      else:
+        @jax.jit
+        def get_update(preconditioner, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
+          # Initialize the optimizer state for the preconditioner.
+          opt_state = optax_solver.init(preconditioner)
+
+          # Define a single update step to be run in the compiled loop.
+          def update_step(i, state):
+            precond, opt_state = state
+            precond_grad = get_precond_grad(precond, params, other_model_variables, datapoint, trainstate_opt_state)
+            updates, opt_state = optax_solver.update(precond_grad, opt_state)
+            updates = jax.tree_map(lambda g: g * precond_lr, updates)
+            new_precond = optax.apply_updates(precond, updates)
+            return (new_precond, opt_state)
+
+          # Use a compiled loop to perform “steps” iterations.
+          init_state = (preconditioner, opt_state)
+          final_precond, _ = jax.lax.fori_loop(0, steps, update_step, init_state)
+          # Safeguard against any numerical issues
+          return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), final_precond)
 
       return get_update
 
-  def update_preconditioner(self, params, dataloader, other_model_variables=FrozenDict({})):
+  def update_preconditioner(self, params, dataloader, precond_lr, opt_state, other_model_variables=FrozenDict({})):
     """params is the current weights of the NN"""
     if self._multibatch:
-      lqr_loss_fn = lambda x, y : jnp.mean(jax.vmap(self._get_evaluate_lqr(params, multibatch=True, other_model_variables=other_model_variables), in_axes=(None, (0,0)))(x, y))
-      # lqr_loss_fn = lambda x: jnp.mean(jax.vmap(self._get_evaluate_lqr, in_axes=(None, (0,0)))(params, next(dataloader))(x))
-      # reinitialize the optimizer state every time:
-      opt_state = self._optax_solver.init(self._block_structure.blocks)
-      # datapoint = next(dataloader)
-      for _ in range(self._preconditioner_update_steps):
-        _cost, precond_grad = jax.value_and_grad(lqr_loss_fn, argnums=0)(self._block_structure.blocks, next(dataloader))
-        # precond_grad = jax.grad(lqr_loss_fn, argnums=0)(self._block_structure.blocks)
-        updates, opt_state = self._optax_solver.update(precond_grad, opt_state)
-        self._block_structure.update_blocks(optax.apply_updates(self._block_structure.blocks, updates))
-        # print(_cost)
+      self._block_structure.update_blocks(
+        self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
+                                       opt_state))
     else:
       self._block_structure.update_blocks(
-        self._update_preconditioner_fn(self._block_structure.blocks, params, other_model_variables, next(dataloader)))
+        self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, next(dataloader), opt_state))
+
+    if not self._allow_grad_inversion and self._block_structure_name in ('scalar', "diagonal"):
+      # We clip to (almost) 0 those 2 structures to avoid gradient inversion
+      self._block_structure.clip_blocks(min_for_block=1e-8)
 
     # print(self._block_structure.blocks["layers_2"])
-    print(self._block_structure.blocks)
+    # print(self._block_structure.blocks)
 
   def expose_blocks(self):
     return self._block_structure.blocks

@@ -1,3 +1,4 @@
 name: cifar-100
 
 augment_dataset: true
+lt_config: null
