@@ -153,3 +153,9 @@ outputs/
 # Cluster slurm files and venv
 slurm*
 py310jax_tf/*
+
+# Custom folder for local csv
+aim_csv/
+
+# Any generated figures
+*.pdf
