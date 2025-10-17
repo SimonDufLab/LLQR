@@ -26,6 +26,7 @@ import lqr_optimizer._src.utils.utils as utl
 
 @hydra.main(config_path="configs", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
+  assert 0.0 <= cfg.ema_decay <= 1.0, f"cfg.ema_decay ({cfg.ema_decay}) must be in [0, 1]"
   # Print the loaded config
   print(OmegaConf.to_yaml(cfg))
   experiment_name = cfg.dataset.name + "_" + cfg.architecture.name
@@ -230,7 +231,7 @@ def main(cfg: DictConfig):
       # We do multiple steps (precond_steps) of "preconditioner training"
       precond_update_start_time = time.time()
       precond_lr = precond_lr_fn(step)
-      preconditioner.update_preconditioner(state.params, precond_dataloader, precond_lr, state.opt_state,
+      preconditioner.update_preconditioner(state.params, precond_dataloader, precond_lr, state.opt_state, cfg.ema_decay,
                                            other_model_variables={'batch_stats': state.batch_stats})
       precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
       # !!Remove below when timing against non-2nd order methods!! (Affect computation time)

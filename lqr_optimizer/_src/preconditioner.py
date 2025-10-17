@@ -142,7 +142,8 @@ class BasePreconditioner(abc.ABC):
         print(jax.tree_map(lambda g: g.shape, grads))
         return grads
 
-      @Partial(jax.jit, donate_argnames=("preconditioner",))
+      #@Partial(jax.jit, donate_argnames=("preconditioner",)) # Can't donate anymore because of ema update...
+      @jax.jit
       def get_update(preconditioner, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
         # Initialize the optimizer state for the preconditioner.
         opt_state = optax_solver.init(preconditioner)
@@ -281,15 +282,16 @@ class BasePreconditioner(abc.ABC):
 
       return get_update
 
-  def update_preconditioner(self, params, dataloader, precond_lr, opt_state, other_model_variables=FrozenDict({})):
+  def update_preconditioner(self, params, dataloader, precond_lr, opt_state, ema_decay=0, other_model_variables=FrozenDict({})):
     """params is the current weights of the NN"""
     if self._multibatch:
       self._block_structure.update_blocks(
         self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
-                                       opt_state))
+                                       opt_state), ema_decay)
     else:
       self._block_structure.update_blocks(
-        self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, next(dataloader), opt_state))
+        self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
+                                       next(dataloader), opt_state), ema_decay)
 
     if not self._allow_grad_inversion and self._block_structure_name in ('scalar', "diagonal"):
       # We clip to (almost) 0 those 2 structures to avoid gradient inversion

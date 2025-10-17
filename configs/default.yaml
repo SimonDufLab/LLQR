@@ -33,6 +33,7 @@ block_structure_init: identity
 batch_solve_precond: true
 multibatch_training: false
 damping: 0.0
+ema_decay: 0.0 # EMA decay value for updating the preconditioner
 
 # Cluster options
 preempt_handling: false
