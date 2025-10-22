@@ -137,6 +137,13 @@ def main(cfg: DictConfig):
     precond_lr = cfg.precond_lr
   precond_optimizer = utl.load_precond_optimizer(cfg, precond_lr)
 
+  # Additional option: schedule on ema_decay
+  if cfg.ema_scheduler and cfg.ema_scheduler.name != "constant":
+    ema_sched_kwargs = {_key:_value for _key, _value in cfg.ema_scheduler.items() if _key!='name'}
+    ema_fn = lr_schedule_choice[cfg.ema_scheduler.name](base_lr=cfg.ema_decay, total_epochs=cfg.total_epochs ,steps_per_epoch=steps_per_epoch, **ema_sched_kwargs)
+  else:
+    ema_fn = lambda _: cfg.ema_decay
+
   # Initialize BasePreconditioner
   if cfg.divergence == "renyi":
     divergence_kwarg = {"order":cfg.divergence_order_param}
@@ -231,7 +238,8 @@ def main(cfg: DictConfig):
       # We do multiple steps (precond_steps) of "preconditioner training"
       precond_update_start_time = time.time()
       precond_lr = precond_lr_fn(step)
-      preconditioner.update_preconditioner(state.params, precond_dataloader, precond_lr, state.opt_state, cfg.ema_decay,
+      _ema_decay = ema_fn(step)
+      preconditioner.update_preconditioner(state.params, precond_dataloader, precond_lr, state.opt_state, _ema_decay,
                                            other_model_variables={'batch_stats': state.batch_stats})
       precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
       # !!Remove below when timing against non-2nd order methods!! (Affect computation time)
