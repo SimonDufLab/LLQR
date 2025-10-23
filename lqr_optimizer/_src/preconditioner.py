@@ -134,13 +134,13 @@ class BasePreconditioner(abc.ABC):
 
       # def lqr_grad_fn(_preconditioner, input_size, gradients, kernel_shapes, operators):
       def lqr_grad_fn(_preconditioner, input_size, gradients, operators):
-        grads = jax.grad(lqr_cost, argnums=0)(
+        v, grads = jax.value_and_grad(lqr_cost, argnums=0)(
           # _preconditioner, input_size, gradients, kernel_shapes, operators)
           _preconditioner, input_size, gradients, operators)
         grads = jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=1.0, neginf=-1.0), grads)
         # grads = jax.tree_map(zero_if_bad, grads)
-        print(jax.tree_map(lambda g: g.shape, grads))
-        return grads
+        # print(jax.tree_map(lambda g: g.shape, grads))
+        return v, grads
 
       #@Partial(jax.jit, donate_argnames=("preconditioner",)) # Can't donate anymore because of ema update...
       @jax.jit
@@ -156,8 +156,9 @@ class BasePreconditioner(abc.ABC):
         def update_step(i, state):
           precond, opt_state = state
           # precond_grad = lqr_grad_fn(precond, input_size, gradients, kernel_shapes, operators)
-          precond_grad = lqr_grad_fn(precond, input_size, gradients, operators)
-          updates, opt_state = optax_solver.update(precond_grad, opt_state)
+          _, precond_grad = lqr_grad_fn(precond, input_size, gradients, operators)
+          extra_args = {'value_and_grad_fn': Partial(lqr_grad_fn, input_size=input_size, gradients=gradients, operators=operators)}
+          updates, opt_state = optax_solver.update(precond_grad, opt_state, precond, **extra_args)
           updates = jax.tree_map(lambda g: g * precond_lr, updates)
           new_precond = optax.apply_updates(precond, updates)
           return (new_precond, opt_state)

@@ -25,6 +25,7 @@ from collections.abc import Sequence
 from jax.tree_util import Partial
 
 from lqr_optimizer._src.utils.grokking_dataset import ModSumDataset, ModDivisionDataset, ModSubtractDataset, ModMulDataset, ModExpDataset, PermutationGroup, load_grok_ds
+from lqr_optimizer._src.utils.precond_optimizers import nonlinear_cg
 
 def vjp_f(f, x):
   """ Return the vjp in a form that can be applied directly over a vector
@@ -240,6 +241,21 @@ def load_precond_optimizer(cfg, lr):
     optax_solver_for_precond.append(optax.sgd(lr, momentum=cfg.momentum))
   elif cfg.precond_solver == "sgd":
     optax_solver_for_precond.append(optax.sgd(lr))
+  elif cfg.precond_solver == "cg_zoom_hz":
+    opt = nonlinear_cg(
+      linesearch="optax_zoom",
+      method="hz",
+      optax_ls_kwargs=dict(max_linesearch_steps=20),
+    )
+    optax_solver_for_precond.append(opt)
+  elif cfg.precond_solver == "cg_back_pr+":
+    opt = nonlinear_cg(
+      linesearch="optax_backtracking",
+      method="pr+",
+      # enforce_descent=False,
+      optax_ls_kwargs=dict(max_backtracking_steps=20),
+    )
+    optax_solver_for_precond.append(opt)
   else:
     raise ValueError("Unknown precond optimizer")
   return optax.chain(*optax_solver_for_precond)
