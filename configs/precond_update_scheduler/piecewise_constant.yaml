@@ -1,0 +1,3 @@
+name: piecewise_constant
+
+boundaries: {15: 10, }

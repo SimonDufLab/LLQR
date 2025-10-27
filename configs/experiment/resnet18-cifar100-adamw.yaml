@@ -6,6 +6,7 @@ defaults:
   - /lr_scheduler: warmup_cosine_decay
   - /precond_lr_scheduler: constant
   - /ema_scheduler: constant
+  - /precond_update_scheduler: constant
 
 batch_size: 128
 learning_rate: 3e-3

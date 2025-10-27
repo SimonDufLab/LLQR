@@ -931,10 +931,13 @@ def step_warmup(
         total_epochs: int,
         steps_per_epoch: float,
         warmup_ratio: float=1e-5,
+        init_value: float=0.0,
 ) -> optax.Schedule:
   """ A simple linear warmup at the beginning, implemented for the small grokking experiments"""
   warmup_steps = total_epochs * steps_per_epoch * warmup_ratio
-  return lambda s: base_lr * jnp.minimum(s / warmup_steps, 1)
+  diff = base_lr - init_value
+  return lambda s: init_value + diff * jnp.minimum(s / warmup_steps, 1)
+
 
 def linear_schedule(
         base_lr: float,
@@ -948,6 +951,17 @@ def linear_schedule(
   transition_begin = int(steps_per_epoch * transition_begin)
   end_value = decay_factor * base_lr
   return optax.linear_schedule(init_value=base_lr, end_value=end_value, transition_steps=transition_steps, transition_begin=transition_begin)
+
+
+def piecewise_constant_schedule(
+        base_lr: float,
+        total_epochs: int,
+        steps_per_epoch: float,
+        boundaries: dict # of the form {epoch: scale}
+) -> optax.Schedule:
+  optax_boundaries = {steps_per_epoch*key:value for key,value in boundaries.items()}
+  return optax.piecewise_constant_schedule(init_value=base_lr, boundaries_and_scales=optax_boundaries)
+
 ##################################
 # "Trick" utils
 ##################################

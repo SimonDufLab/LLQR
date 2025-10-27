@@ -144,6 +144,13 @@ def main(cfg: DictConfig):
   else:
     ema_fn = lambda _: cfg.ema_decay
 
+  # Optional: schedule on how often the preconditioner is updated:
+  if cfg.precond_update_scheduler and cfg.precond_update_scheduler.name != "constant":
+    precond_update_sched_kwargs = {_key:_value for _key, _value in cfg.precond_update_scheduler.items() if _key!='name'}
+    precond_up_sched = lr_schedule_choice[cfg.precond_update_scheduler.name](base_lr=cfg.update_preconditioner_every, total_epochs=cfg.total_epochs ,steps_per_epoch=steps_per_epoch, **precond_update_sched_kwargs)
+  else:
+    precond_up_sched = lambda _: cfg.update_preconditioner_every
+
   # Initialize BasePreconditioner
   if cfg.divergence == "renyi":
     divergence_kwarg = {"order":cfg.divergence_order_param}
@@ -233,7 +240,8 @@ def main(cfg: DictConfig):
   print(f"Continuing training from step {starting_step}")
   for step in range(starting_step, total_steps):
     # Possibly update the preconditioner every `update_preconditioner_every` steps
-    if (step % cfg.update_preconditioner_every) == 0 and cfg.use_preconditioner and step < cfg.update_preconditioner_until:
+    _update_precond_every = precond_up_sched(step)
+    if (step % _update_precond_every) == 0 and cfg.use_preconditioner and step < cfg.update_preconditioner_until:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
       precond_update_start_time = time.time()
