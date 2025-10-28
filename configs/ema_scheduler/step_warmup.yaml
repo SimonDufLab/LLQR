@@ -1,3 +1,4 @@
 name: step_warmup
 
 warmup_ratio: 1 # i.e. linear increase over the whole training span
+init_value: 0

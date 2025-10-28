@@ -162,7 +162,7 @@ def main(cfg: DictConfig):
     divergence_f = divergence_choice[cfg.divergence]
   preconditioner = BasePreconditioner(
     divergence_function=divergence_f,
-    loss_fn=cross_entropy_loss,
+    loss_fn=Partial(cross_entropy_loss, label_smoothing=cfg.label_smoothing),
     block_structure=cfg.block_structure,
     block_structure_init=cfg.block_structure_init,
     model=inf_model,
@@ -194,7 +194,7 @@ def main(cfg: DictConfig):
       x,
       mutable=['batch_stats']
     )
-    loss = cross_entropy_loss(log_probs, y)
+    loss = cross_entropy_loss(log_probs, y, label_smoothing=cfg.label_smoothing)
     return loss, new_model_state
 
   @jax.jit

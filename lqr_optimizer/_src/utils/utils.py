@@ -293,15 +293,26 @@ def clip_by_group_norm(max_norm: float) -> optax.GradientTransformation:
 # Training utils
 ##################################
 # Simple cross-entropy loss for classification
-def cross_entropy_loss(log_probs, y): #TODO only with respect to output
+def cross_entropy_loss(log_probs, y, label_smoothing=0.0):
   """
-  log_probs: network outputs, the per-class log probabilities
-  y: integer class labels
-  """
+  Cross-entropy loss with optional label smoothing.
 
-  # Cross-entropy using negative log-likelihood
-  nll = -jnp.mean(jnp.sum(jax.nn.one_hot(y, log_probs.shape[-1]) * log_probs, axis=-1))
-  return nll
+  Args:
+      log_probs: [batch, num_classes], log probabilities (e.g., from nn.log_softmax)
+      y: [batch,] integer class labels
+      label_smoothing: float in [0, 1]. 0 = no smoothing (standard CE)
+  """
+  num_classes = log_probs.shape[-1]
+  one_hot = jax.nn.one_hot(y, num_classes)
+
+  if label_smoothing > 0.0:
+    smooth = label_smoothing / num_classes
+    one_hot = (1.0 - label_smoothing) * one_hot + smooth
+
+  # Negative log-likelihood
+  nll = -jnp.sum(one_hot * log_probs, axis=-1)
+  return jnp.mean(nll)
+
 
 def loss_eval(state, x, y):
   """
@@ -344,6 +355,41 @@ def apply_cutout(image, size=16, p=0.5):
     return image * mask
 
   return tf.cond(tf.random.uniform([]) < p, cutout_fn, lambda: image)
+
+
+### ImageNet-specific dataloader helper fn ####
+@tf.function
+def resize_imgnet_dataset(images, labels, is_training=False):
+    if is_training:
+        # Generate a random number to decide the resizing dimensions
+        random_num = tf.random.uniform(shape=[], minval=0, maxval=1)
+
+        if random_num < 0.5:
+            # Resize images to 480x480 with 50% probability when training
+            images = tf.image.resize(images, [480, 480])
+        else:
+            # Resize images to 256x256 with 50% probability when training
+            images = tf.image.resize(images, [256, 256])
+    else:
+        # Resize images to 256x256 when not training
+        images = tf.image.resize(images, [256, 256])
+    return images, labels
+
+
+@tf.function
+def augment_train_imagenet_dataset_res50(image, label):
+    # Randomly crop the image
+    image = tf.image.random_crop(image, [224, 224, 3])  # Assuming image has 3 color channels
+    # Randomly flip the image horizontally
+    image = tf.image.random_flip_left_right(image)
+
+    return image, tf.one_hot(label, 1000)
+
+
+@tf.function
+def process_test_imagenet_dataset(image, label):
+    image = tf.image.central_crop(image, 224/256)  # assuming input image size is 256x256
+    return image, tf.one_hot(label, 1000)
 
 
 def prepare_dataloader(
@@ -405,6 +451,62 @@ def prepare_dataloader(
     mean = jnp.array([0.5071, 0.4867, 0.4408])
     std = jnp.array([0.2675, 0.2565, 0.2761])
     info["num_classes"] = 100
+  elif dataset == 'imagenet':
+    # ImageNet-1k normalization
+    mean = jnp.array([0.485, 0.456, 0.406])
+    std = jnp.array([0.229, 0.224, 0.225])
+    info["num_classes"] = 1000
+
+    # Build from TFDS builder to select 'train' vs 'validation' correctly.
+    builder = tfds.builder("imagenet2012")
+    # Assumes data present locally already; this is idempotent if already prepared.
+    builder.download_and_prepare()
+    split = "train" if train else "validation"
+
+    # Load dataset (supervised: (image, label))
+    ds = builder.as_dataset(
+      split=split,
+      as_supervised=True,
+      shuffle_files=True,
+      read_config=tfds.ReadConfig(try_autocache=False, skip_prefetch=True),
+    )
+
+    # Dataset size
+    info["ds_size"] = int(builder.info.splits[split].num_examples)
+
+    # Cache & shuffle like the other branches
+    ds = ds.cache()
+    ds = ds.shuffle(info["ds_size"], seed=0, reshuffle_each_iteration=True)
+
+    # Pre-processing & augmentation
+    # We apply resize+crop BEFORE batching (per-example ops).
+    def _resize_train(x, y):
+      return resize_imgnet_dataset(x, y, is_training=True)
+
+    def _resize_eval(x, y):
+      return resize_imgnet_dataset(x, y, is_training=False)
+
+    if train and augment_dataset:
+      ds = ds.map(_resize_train, num_parallel_calls=tf.data.AUTOTUNE)
+      ds = ds.map(augment_train_imagenet_dataset_res50, num_parallel_calls=tf.data.AUTOTUNE)
+    else:
+      ds = ds.map(_resize_eval, num_parallel_calls=tf.data.AUTOTUNE)
+      ds = ds.map(process_test_imagenet_dataset, num_parallel_calls=tf.data.AUTOTUNE)
+
+    # Batch → prefetch → repeat
+    ds = ds.batch(batch_size)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    ds = ds.repeat()
+
+    # ---------- Generator ----------
+    def generator():
+      for x_batch, y_batch in ds:
+        x_batch = x_batch.numpy().astype(jnp.float32) / 255.0
+        x_batch = (x_batch - mean[None, None, None, :]) / std[None, None, None, :]
+        yield jnp.array(x_batch, dtype=jnp.float32), jnp.array(y_batch.numpy(), dtype=jnp.int32)
+
+    return generator(), info
+    # ==============================================================================================
   else:
     raise ValueError("Unsupported dataset. Use 'mnist', 'truncated_mnist', 'cifar-10', or 'cifar-100'.")
 
@@ -477,15 +579,16 @@ def prepare_dataloader(
   # Batch and (optional) augment
   ds = ds.batch(batch_size)
 
-  if augment_dataset and train and dataset in ('cifar-10', 'cifar-100'):
-    ReflectionPadding2D = tf.keras.layers.Lambda(lambda x: tf.pad(x, [[0, 0], [4, 4], [4, 4], [0, 0]], 'REFLECT'))
-    def augment_with_cutout(x, y):
-      x = ReflectionPadding2D(x)
-      x = tf.image.random_crop(x, size=[tf.shape(x)[0], 32, 32, 3])
-      x = tf.image.random_flip_left_right(x)
-      x = tf.map_fn(lambda img: apply_cutout(img, size=16, p=0.5), x)
-      return x, y
-    ds = ds.map(augment_with_cutout, num_parallel_calls=tf.data.AUTOTUNE)
+  if augment_dataset and train:
+    if dataset in ('cifar-10', 'cifar-100'):
+      ReflectionPadding2D = tf.keras.layers.Lambda(lambda x: tf.pad(x, [[0, 0], [4, 4], [4, 4], [0, 0]], 'REFLECT'))
+      def augment_with_cutout(x, y):
+        x = ReflectionPadding2D(x)
+        x = tf.image.random_crop(x, size=[tf.shape(x)[0], 32, 32, 3])
+        x = tf.image.random_flip_left_right(x)
+        x = tf.map_fn(lambda img: apply_cutout(img, size=16, p=0.5), x)
+        return x, y
+      ds = ds.map(augment_with_cutout, num_parallel_calls=tf.data.AUTOTUNE)
 
   ds = ds.repeat().prefetch(tf.data.AUTOTUNE)
 
@@ -961,6 +1064,30 @@ def piecewise_constant_schedule(
 ) -> optax.Schedule:
   optax_boundaries = {steps_per_epoch*key:value for key,value in boundaries.items()}
   return optax.piecewise_constant_schedule(init_value=base_lr, boundaries_and_scales=optax_boundaries)
+
+def warmup_piecewise_decay_schedule(
+        base_lr: float,
+        total_epochs: int,
+        steps_per_epoch: float,
+        epoch_decay_bounds: List, # of epochs, when scaling_factor (decay) is applied
+        scaling_factor: float,
+        warmup_ratio: float = 0.05
+) -> optax.Schedule:
+  """Linear warmup followed by piecewise decay
+  """
+  training_steps = int(total_epochs * steps_per_epoch)
+  warmup_steps = int(warmup_ratio * training_steps)  # warmup is done for 5% of training_steps
+  _step_decay_bounds = [steps_per_epoch * lr_decay_step for lr_decay_step in epoch_decay_bounds]
+  bound_dict = {i - warmup_steps: scaling_factor for i in _step_decay_bounds}
+  schedules = [
+    optax.linear_schedule(
+      init_value=1e-6,
+      end_value=base_lr,
+      transition_steps=warmup_steps),
+    optax.piecewise_constant_schedule(
+      init_value=base_lr,
+      boundaries_and_scales=bound_dict)]
+  return optax.join_schedules(schedules, [warmup_steps])
 
 ##################################
 # "Trick" utils

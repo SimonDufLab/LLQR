@@ -16,23 +16,23 @@ from lqr_optimizer._src.utils.utils import EnhancedSequential
 #     (if needed) projects identity before adding and applying relu.
 # ============================================================================
 
-# class StemBlock(nn.Module): # Original version, better suited to ImageNet
-#   """Initial stem: 7×7 conv, batch norm, ReLU and MaxPool."""
-#   inference: bool = False
-#
-#   @nn.compact
-#   def __call__(self, x):
-#     # One conv here (with bn and relu grouped) counts as one block.
-#     x = nn.Conv(features=64, kernel_size=(7, 7), strides=(2, 2),
-#                 padding='SAME', use_bias=False)(x)
-#     x = nn.BatchNorm(use_running_average=self.inference)(x)
-#     x = nn.relu(x)
-#     x = nn.max_pool(x, window_shape=(3,3),
-#                        strides=(2,2), padding='SAME')
-#     return x
+class BigStemBlock(nn.Module): # Original version, better suited to ImageNet
+  """Initial stem: 7×7 conv, batch norm, ReLU and MaxPool."""
+  inference: bool = False
+
+  @nn.compact
+  def __call__(self, x):
+    # One conv here (with bn and relu grouped) counts as one block.
+    x = nn.Conv(features=64, kernel_size=(7, 7), strides=(2, 2),
+                padding='SAME', use_bias=False)(x)
+    x = nn.BatchNorm(use_running_average=self.inference)(x)
+    x = nn.relu(x)
+    x = nn.max_pool(x, window_shape=(3,3),
+                       strides=(2,2), padding='SAME')
+    return x
 
 
-class StemBlock(nn.Module):  # Version  for  Cifar-10/100, better suited to smaller img resolution
+class SmallStemBlock(nn.Module):  # Version  for  Cifar-10/100, better suited to smaller img resolution
   inference: bool = False
 
   @nn.compact
@@ -169,7 +169,7 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
   def inference_mode(inference: bool):
     layers = []
     # Stem and max-pooling
-    layers.append(StemBlock(inference=inference))
+    layers.append(SmallStemBlock(inference=inference))
     # layers.append(MaxPool())
 
     # Group 1: two basic blocks with 64 filters (no downsampling)
@@ -198,6 +198,121 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
 
     # Global average pooling and final classification layer.
     # layers.append(GlobalAvgPool())
+    layers.append(GPoolDenseLogSoftmax(num_classes))
+
+    return EnhancedSequential(layers)
+
+  return inference_mode(False), inference_mode(True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bottleneck (ResNet-50/101) split into 3 modules, each with a single conv.
+# Part1: 1×1 reduce + BN + ReLU → returns (out, identity)
+# Part2: 3×3 (+stride if downsampling) + BN + ReLU → returns (out, identity)
+# Part3: 1×1 expand + BN, optional proj on identity (1×1, stride), add + ReLU
+# We implement ResNet-50 v1.5: the stride (2) is placed on the 3×3 conv.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BottleneckPart1(nn.Module):
+  """1×1 reduce, keep identity aside."""
+  planes: int            # bottleneck width before expansion
+  stride: int = 1        # kept for API symmetry; not used here
+  inference: bool = False
+  expansion: int = 4
+
+  @nn.compact
+  def __call__(self, x):
+    identity = x
+    out = nn.Conv(features=self.planes, kernel_size=(1, 1), strides=(1, 1),
+                  padding='SAME', use_bias=False)(x)
+    out = nn.BatchNorm(use_running_average=self.inference)(out)
+    out = nn.relu(out)
+    return (out, identity)
+
+
+class BottleneckPart2(nn.Module):
+  """3×3 conv (with stride for downsampling in v1.5), keep identity aside."""
+  planes: int
+  stride: int = 1
+  inference: bool = False
+  expansion: int = 4
+
+  @nn.compact
+  def __call__(self, inputs):
+    x, identity = inputs
+    out = nn.Conv(features=self.planes, kernel_size=(3, 3),
+                  strides=(self.stride, self.stride),
+                  padding='SAME', use_bias=False)(x)
+    out = nn.BatchNorm(use_running_average=self.inference)(out)
+    out = nn.relu(out)
+    return (out, identity)
+
+
+class BottleneckPart3(nn.Module):
+  """1×1 expand, project identity if needed, add + ReLU."""
+  planes: int
+  stride: int = 1
+  inference: bool = False
+  expansion: int = 4
+
+  @nn.compact
+  def __call__(self, inputs):
+    x, identity = inputs
+    out_channels = self.planes * self.expansion
+
+    out = nn.Conv(features=out_channels, kernel_size=(1, 1),
+                  strides=(1, 1), padding='SAME', use_bias=False)(x)
+    out = nn.BatchNorm(use_running_average=self.inference)(out)
+
+    # Project identity if spatial dims or channel dims differ.
+    if identity.shape != out.shape:
+      identity = nn.Conv(features=out_channels, kernel_size=(1, 1),
+                         strides=(self.stride, self.stride),
+                         padding='SAME', use_bias=False)(identity)
+      identity = nn.BatchNorm(use_running_average=self.inference)(identity)
+
+    out = out + identity
+    out = nn.relu(out)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ResNet-50 creation (ImageNet): stem → [3,4,6,3] bottleneck blocks →
+# GlobalAvgPool → Dense(num_classes) → log_softmax
+# We keep your GPoolDenseLogSoftmax for symmetry with CIFAR code.
+# If you prefer raw logits for loss, you can swap GPoolDenseLogSoftmax
+# for GlobalAvgPool() + nn.Dense(num_classes) in your pipeline.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
+  """Build ResNet-50 (v1.5) using the tuple-carry split bottleneck logic."""
+  EXPANSION = 4
+  STAGE_PLANES = [64, 128, 256, 512]   # bottleneck widths before expansion
+  STAGE_BLOCKS = [3, 4, 6, 3]          # number of bottleneck blocks per stage
+
+  def inference_mode(inference: bool):
+    layers = []
+
+    # ImageNet stem (7×7/2 + BN + ReLU + 3×3 max-pool/2)
+    layers.append(BigStemBlock(inference=inference))
+
+    # Build stages conv2_x .. conv5_x
+    for stage_idx, (planes, num_blocks) in enumerate(zip(STAGE_PLANES, STAGE_BLOCKS)):
+      # Downsample on the first block of stages 2/3/4 (i.e., not on the very first stage)
+      # Using v1.5: put stride on the 3×3 (BottleneckPart2).
+      stride = 1 if stage_idx == 0 else 2
+
+      # First block in the stage (may downsample)
+      layers.append(BottleneckPart1(planes=planes, stride=1, inference=inference, expansion=EXPANSION))
+      layers.append(BottleneckPart2(planes=planes, stride=stride, inference=inference, expansion=EXPANSION))
+      layers.append(BottleneckPart3(planes=planes, stride=stride, inference=inference, expansion=EXPANSION))
+
+      # Remaining blocks in the stage (no downsampling)
+      for _ in range(num_blocks - 1):
+        layers.append(BottleneckPart1(planes=planes, stride=1, inference=inference, expansion=EXPANSION))
+        layers.append(BottleneckPart2(planes=planes, stride=1, inference=inference, expansion=EXPANSION))
+        layers.append(BottleneckPart3(planes=planes, stride=1, inference=inference, expansion=EXPANSION))
+
+    # Head: Global Average Pool → Dense(num_classes) → log_softmax
     layers.append(GPoolDenseLogSoftmax(num_classes))
 
     return EnhancedSequential(layers)
