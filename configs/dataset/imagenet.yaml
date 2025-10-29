@@ -2,3 +2,4 @@ name: imagenet
 
 augment_dataset: true
 lt_config: null
+dataset_dir: null

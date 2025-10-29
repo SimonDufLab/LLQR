@@ -2,3 +2,4 @@ name: truncated_mnist  # A special case creating a subset of 10 000 images of mn
 
 augment_dataset: false
 lt_config: null
+dataset_dir: null

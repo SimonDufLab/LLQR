@@ -398,6 +398,7 @@ def prepare_dataloader(
     dataset='mnist',
     augment_dataset=False,
     lt_config=None,  # e.g., {"imbalance_ratio": 100, "distribution": "exp", "seed": 0}
+    dataset_dir: str = None,
 ):
   """
   Creates a generator that yields (x, y) from the specified dataset:
@@ -460,7 +461,7 @@ def prepare_dataloader(
     # Build from TFDS builder to select 'train' vs 'validation' correctly.
     builder = tfds.builder("imagenet2012")
     # Assumes data present locally already; this is idempotent if already prepared.
-    builder.download_and_prepare()
+    builder.download_and_prepare(download_dir=dataset_dir)
     split = "train" if train else "validation"
 
     # Load dataset (supervised: (image, label))
