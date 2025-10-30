@@ -283,16 +283,32 @@ class BasePreconditioner(abc.ABC):
 
       return get_update
 
-  def update_preconditioner(self, params, dataloader, precond_lr, opt_state, ema_decay=0, other_model_variables=FrozenDict({})):
+  def update_preconditioner(self, params, dataloader, precond_lr, opt_state, precond_batch_size, ema_decay=0, other_model_variables=FrozenDict({})):
     """params is the current weights of the NN"""
     if self._multibatch:
       self._block_structure.update_blocks(
         self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
                                        opt_state), ema_decay)
     else:
+      # Accumulate batches until we reach (or exceed) the requested preconditioner batch size
+      batches = []
+      acc_size = 0
+      while acc_size < precond_batch_size:
+        b = next(dataloader)  # can be (x, y) or any pytree of arrays
+        # Infer batch size from the first leaf
+        b_size = jax.tree_util.tree_leaves(b)[0].shape[0]
+        batches.append(b)
+        acc_size += int(b_size)
+
+      # Concatenate along the batch dimension
+      acc_batches = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *batches)
+
+      # Clip so that acc_batches has exactly `precond_batch_size` elements on axis 0
+      acc_batches = jax.tree_util.tree_map(lambda x: x[:precond_batch_size], acc_batches)
+
       self._block_structure.update_blocks(
         self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
-                                       next(dataloader), opt_state), ema_decay)
+                                       acc_batches, opt_state), ema_decay)
 
     if not self._allow_grad_inversion and self._block_structure_name in ('scalar', "diagonal"):
       # We clip to (almost) 0 those 2 structures to avoid gradient inversion
