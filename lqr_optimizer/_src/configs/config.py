@@ -5,7 +5,8 @@ from lqr_optimizer._src.models.grok_model import create_grok_model
 from lqr_optimizer._src.utils import divergence
 
 from lqr_optimizer._src.utils.utils import (cosine_annealing_schedule_per_epoch, step_warmup, linear_schedule,
-                                            warmup_cosine_annealing_schedule, piecewise_constant_schedule)
+                                            warmup_cosine_annealing_schedule, piecewise_constant_schedule,
+                                            warmup_piecewise_decay_schedule)
 
 model_choice = {
   "mlp": create_mlp,
@@ -26,4 +27,5 @@ lr_schedule_choice = {
   "step_warmup": step_warmup,
   "linear": linear_schedule,
   "piecewise_constant": piecewise_constant_schedule,
+  "warmup_piecewise_decay": warmup_piecewise_decay_schedule,
 }
