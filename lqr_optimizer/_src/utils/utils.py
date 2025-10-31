@@ -463,6 +463,7 @@ def prepare_dataloader(
     # Assumes data present locally already; this is idempotent if already prepared.
     builder.download_and_prepare(download_dir=dataset_dir)
     split = "train" if train else "validation"
+    split = tfds.split_for_jax_process(split, drop_remainder=True)
 
     # Load dataset (supervised: (image, label))
     ds = builder.as_dataset(
@@ -476,8 +477,9 @@ def prepare_dataloader(
     info["ds_size"] = int(builder.info.splits[split].num_examples)
 
     # Cache & shuffle like the other branches
-    ds = ds.cache()
-    ds = ds.shuffle(info["ds_size"], seed=0, reshuffle_each_iteration=True)
+    # ds = ds.cache() Oh, no, not caching imagenet...
+    if train:
+      ds = ds.shuffle(4096, seed=0, reshuffle_each_iteration=True)
 
     # Pre-processing & augmentation
     # We apply resize+crop BEFORE batching (per-example ops).
