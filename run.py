@@ -4,7 +4,9 @@ import time
 from datetime import timedelta
 import signal
 import optax
+import tensorflow as tf
 
+tf.config.experimental.set_visible_devices([], "GPU")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 # os.environ["XLA_FLAGS"] = "--xla_dump_hlo_as_text --xla_force_host_platform_device_count=1"  # Logging XLA compilation, for debugging
 
