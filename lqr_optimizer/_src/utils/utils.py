@@ -383,13 +383,13 @@ def augment_train_imagenet_dataset_res50(image, label):
     # Randomly flip the image horizontally
     image = tf.image.random_flip_left_right(image)
 
-    return image, tf.one_hot(label, 1000)
+    return image, label
 
 
 @tf.function
 def process_test_imagenet_dataset(image, label):
     image = tf.image.central_crop(image, 224/256)  # assuming input image size is 256x256
-    return image, tf.one_hot(label, 1000)
+    return image, label
 
 
 def prepare_dataloader(
