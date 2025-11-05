@@ -325,6 +325,30 @@ class BasePreconditioner(abc.ABC):
     # print(self._block_structure.blocks["layers_2"])
     # print(self._block_structure.blocks)
 
+  def compile_precond_updater(self, params, dataloader, precond_lr, opt_state, precond_batch_size, other_model_variables=FrozenDict({})):
+    """For when we want to trigger jax compilation of _update_preconditioner_fn without applying the update"""
+    if self._multibatch:
+        blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
+                                       opt_state)
+    else:
+      # Accumulate batches until we reach (or exceed) the requested preconditioner batch size
+      batches = []
+      acc_size = 0
+      while acc_size < precond_batch_size:
+        b = next(dataloader)  # can be (x, y) or any pytree of arrays
+        # Infer batch size from the first leaf
+        b_size = jax.tree_util.tree_leaves(b)[0].shape[0]
+        batches.append(b)
+        acc_size += int(b_size)
+
+      # Concatenate along the batch dimension
+      acc_batches = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *batches)
+
+      # Clip so that acc_batches has exactly `precond_batch_size` elements on axis 0
+      acc_batches = jax.tree_util.tree_map(lambda x: x[:precond_batch_size], acc_batches)
+      blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
+                                     acc_batches, opt_state)
+
   def expose_blocks(self):
     return self._block_structure.blocks
 

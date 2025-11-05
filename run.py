@@ -233,7 +233,6 @@ def main(cfg: DictConfig):
     starting_step = run_state["training_step"]
     best_acc = run_state["best_accuracy"]
     prev_elapsed_time = run_state["training_time"]
-    load_from_preexisting_model_state = False
   else:
     starting_step = 0
     best_acc = 0
@@ -241,8 +240,23 @@ def main(cfg: DictConfig):
 
   print(f"Continuing training from step {starting_step}")
   for step in range(starting_step, total_steps):
+    # First, checkpoint if required
+    if (step > 0) and cfg.preempt_handling and (step % cfg.checkpoint_freq == 0) and not load_from_preexisting_model_state:
+      chckpt_init_time = time.time()
+      elapsed_time = time.time() - start_time + prev_elapsed_time
+      utl.checkpoint_exp(run_state, state, preconditioner.expose_blocks(), curr_epoch=step // steps_per_epoch_rounded,
+                         curr_step=step, dropout_key=dropout_key, best_acc=best_acc,
+                         training_time=elapsed_time)
+      print(
+        f"Checkpointing performed in: {timedelta(seconds=time.time() - chckpt_init_time)}")
     # Possibly update the preconditioner every `update_preconditioner_every` steps
     _update_precond_every = precond_up_sched(step)
+    if load_from_preexisting_model_state:
+      # trigger compilation
+      precond_lr = precond_lr_fn(step)
+      preconditioner.compile_precond_updater(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size,
+                                           other_model_variables={'batch_stats': state.batch_stats})
+      load_from_preexisting_model_state = False
     if (step % _update_precond_every) == 0 and cfg.use_preconditioner and step < cfg.update_preconditioner_until:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
@@ -296,14 +310,6 @@ def main(cfg: DictConfig):
       print(f"Step {step} | Test Accuracy: {test_accuracy:.2f}%")
       print(f"Test accuracy across entire dataset computed in {time.time() - test_time_start:.2f} seconds")
       print("============================")
-    if (step > 0) and cfg.preempt_handling and (step % cfg.checkpoint_freq == 0):
-      chckpt_init_time = time.time()
-      elapsed_time = time.time() - start_time + prev_elapsed_time
-      utl.checkpoint_exp(run_state, state, preconditioner.expose_blocks(), curr_epoch=step // steps_per_epoch_rounded,
-                         curr_step=step, dropout_key=dropout_key, best_acc=best_acc,
-                         training_time=elapsed_time)
-      print(
-        f"Checkpointing performed in: {timedelta(seconds=time.time() - chckpt_init_time)}")
 
 
   print("Training complete!")
