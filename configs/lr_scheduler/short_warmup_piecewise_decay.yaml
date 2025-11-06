@@ -1,0 +1,5 @@
+name: warmup_piecewise_decay
+
+epoch_decay_bounds: [30,  40, 45]
+scaling_factor: 0.1
+warmup_ratio: 0.05

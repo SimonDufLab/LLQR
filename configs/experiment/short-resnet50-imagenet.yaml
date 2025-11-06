@@ -1,0 +1,24 @@
+# @package _global_
+defaults:
+  - /default        # includes default.yaml from default/
+  - /architecture: resnet50
+  - /dataset: imagenet
+  - /lr_scheduler: warmup_piecewise_decay
+  - /precond_lr_scheduler: constant
+  - /ema_scheduler: constant
+  - /precond_update_scheduler: constant
+
+batch_size: 256
+learning_rate: 0.1
+momentum: 0.9
+main_optimizer: polyak
+weight_decay: 1e-4
+total_epochs: 50
+label_smoothing: 0.1
+test_eval_freq: 5000
+checkpoint_freq: 2500
+init_key: 42
+rng_seed: 123 # For dropout, etc.
+
+precond_batch_size: 128
+update_preconditioner_every: 1500
