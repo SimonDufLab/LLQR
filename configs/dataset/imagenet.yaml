@@ -1,4 +1,4 @@
-name: cifar-10
+name: imagenet
 
 augment_dataset: true
 lt_config: null

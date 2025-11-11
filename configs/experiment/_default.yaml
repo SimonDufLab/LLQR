@@ -5,6 +5,8 @@ defaults:
   - /architecture: mlp
   - /lr_scheduler: constant
   - /precond_lr_scheduler: constant
+  - /ema_scheduler: constant
+  - /precond_update_scheduler: constant
 
 #lr_scheduler: null  # TODO: introduces a mismatch when overriding with default experiment
 #precond_lr_scheduler: null

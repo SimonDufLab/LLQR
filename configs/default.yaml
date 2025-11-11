@@ -5,6 +5,7 @@ main_optimizer: sgd
 weight_decay: null
 wd_mask: null # list of parameters type to exclude from wd
 total_epochs: 250 # used to be total_steps: 97656
+label_smoothing: 0.0 # smoothing applied over cross-entropy labels
 test_eval_freq: 2000
 checkpoint_freq: 1000 # Snapshot of model and training for preemption handling
 logging_freq: 10 # Base logging freq for training losses etc. with aim
@@ -33,6 +34,7 @@ block_structure_init: identity
 batch_solve_precond: true
 multibatch_training: false
 damping: 0.0
+ema_decay: 0.0 # EMA decay value for updating the preconditioner
 
 # Cluster options
 preempt_handling: false

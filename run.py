@@ -4,7 +4,9 @@ import time
 from datetime import timedelta
 import signal
 import optax
+import tensorflow as tf
 
+tf.config.experimental.set_visible_devices([], "GPU")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 # os.environ["XLA_FLAGS"] = "--xla_dump_hlo_as_text --xla_force_host_platform_device_count=1"  # Logging XLA compilation, for debugging
 
@@ -26,6 +28,7 @@ import lqr_optimizer._src.utils.utils as utl
 
 @hydra.main(config_path="configs", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
+  assert 0.0 <= cfg.ema_decay <= 1.0, f"cfg.ema_decay ({cfg.ema_decay}) must be in [0, 1]"
   # Print the loaded config
   print(OmegaConf.to_yaml(cfg))
   experiment_name = cfg.dataset.name + "_" + cfg.architecture.name
@@ -60,10 +63,10 @@ def main(cfg: DictConfig):
     aim_hash = None
 
   # 1a) Create the data generators
-  dataloader, ds_info = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config)
+  dataloader, ds_info = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
   num_classes, train_ds_size = ds_info['num_classes'], ds_info['ds_size']
-  precond_dataloader, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config)
-  test_dataloader, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name)
+  # precond_dataloader, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
+  test_dataloader, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name, dataset_dir=cfg.dataset.dataset_dir)
   steps_per_epoch_rounded = train_ds_size // cfg.batch_size
   steps_per_epoch = train_ds_size / cfg.batch_size
   total_steps = ((train_ds_size * cfg.total_epochs) // cfg.batch_size) + 1
@@ -136,6 +139,20 @@ def main(cfg: DictConfig):
     precond_lr = cfg.precond_lr
   precond_optimizer = utl.load_precond_optimizer(cfg, precond_lr)
 
+  # Additional option: schedule on ema_decay
+  if cfg.ema_scheduler and cfg.ema_scheduler.name != "constant":
+    ema_sched_kwargs = {_key:_value for _key, _value in cfg.ema_scheduler.items() if _key!='name'}
+    ema_fn = lr_schedule_choice[cfg.ema_scheduler.name](base_lr=cfg.ema_decay, total_epochs=cfg.total_epochs ,steps_per_epoch=steps_per_epoch, **ema_sched_kwargs)
+  else:
+    ema_fn = lambda _: cfg.ema_decay
+
+  # Optional: schedule on how often the preconditioner is updated:
+  if cfg.precond_update_scheduler and cfg.precond_update_scheduler.name != "constant":
+    precond_update_sched_kwargs = {_key:_value for _key, _value in cfg.precond_update_scheduler.items() if _key!='name'}
+    precond_up_sched = lr_schedule_choice[cfg.precond_update_scheduler.name](base_lr=cfg.update_preconditioner_every, total_epochs=cfg.total_epochs ,steps_per_epoch=steps_per_epoch, **precond_update_sched_kwargs)
+  else:
+    precond_up_sched = lambda _: cfg.update_preconditioner_every
+
   # Initialize BasePreconditioner
   if cfg.divergence == "renyi":
     divergence_kwarg = {"order":cfg.divergence_order_param}
@@ -147,7 +164,7 @@ def main(cfg: DictConfig):
     divergence_f = divergence_choice[cfg.divergence]
   preconditioner = BasePreconditioner(
     divergence_function=divergence_f,
-    loss_fn=cross_entropy_loss,
+    loss_fn=Partial(cross_entropy_loss, label_smoothing=cfg.label_smoothing),
     block_structure=cfg.block_structure,
     block_structure_init=cfg.block_structure_init,
     model=inf_model,
@@ -179,7 +196,7 @@ def main(cfg: DictConfig):
       x,
       mutable=['batch_stats']
     )
-    loss = cross_entropy_loss(log_probs, y)
+    loss = cross_entropy_loss(log_probs, y, label_smoothing=cfg.label_smoothing)
     return loss, new_model_state
 
   @jax.jit
@@ -216,7 +233,6 @@ def main(cfg: DictConfig):
     starting_step = run_state["training_step"]
     best_acc = run_state["best_accuracy"]
     prev_elapsed_time = run_state["training_time"]
-    load_from_preexisting_model_state = False
   else:
     starting_step = 0
     best_acc = 0
@@ -224,13 +240,30 @@ def main(cfg: DictConfig):
 
   print(f"Continuing training from step {starting_step}")
   for step in range(starting_step, total_steps):
+    # First, checkpoint if required
+    if (step > 0) and cfg.preempt_handling and (step % cfg.checkpoint_freq == 0) and not load_from_preexisting_model_state:
+      chckpt_init_time = time.time()
+      elapsed_time = time.time() - start_time + prev_elapsed_time
+      utl.checkpoint_exp(run_state, state, preconditioner.expose_blocks(), curr_epoch=step // steps_per_epoch_rounded,
+                         curr_step=step, dropout_key=dropout_key, best_acc=best_acc,
+                         training_time=elapsed_time)
+      print(
+        f"Checkpointing performed in: {timedelta(seconds=time.time() - chckpt_init_time)}")
     # Possibly update the preconditioner every `update_preconditioner_every` steps
-    if (step % cfg.update_preconditioner_every) == 0 and cfg.use_preconditioner and step < cfg.update_preconditioner_until:
+    _update_precond_every = precond_up_sched(step)
+    if load_from_preexisting_model_state:
+      # trigger compilation
+      precond_lr = precond_lr_fn(step)
+      preconditioner.compile_precond_updater(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size,
+                                           other_model_variables={'batch_stats': state.batch_stats})
+      load_from_preexisting_model_state = False
+    if (step % _update_precond_every) == 0 and cfg.use_preconditioner and step < cfg.update_preconditioner_until:
       # The preconditioner update can be run on a mini-batch from the dataloader
       # We do multiple steps (precond_steps) of "preconditioner training"
       precond_update_start_time = time.time()
       precond_lr = precond_lr_fn(step)
-      preconditioner.update_preconditioner(state.params, precond_dataloader, precond_lr, state.opt_state,
+      _ema_decay = ema_fn(step)
+      preconditioner.update_preconditioner(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size, _ema_decay,
                                            other_model_variables={'batch_stats': state.batch_stats})
       precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
       # !!Remove below when timing against non-2nd order methods!! (Affect computation time)
@@ -277,14 +310,6 @@ def main(cfg: DictConfig):
       print(f"Step {step} | Test Accuracy: {test_accuracy:.2f}%")
       print(f"Test accuracy across entire dataset computed in {time.time() - test_time_start:.2f} seconds")
       print("============================")
-    if (step > 0) and cfg.preempt_handling and (step % cfg.checkpoint_freq == 0):
-      chckpt_init_time = time.time()
-      elapsed_time = time.time() - start_time + prev_elapsed_time
-      utl.checkpoint_exp(run_state, state, preconditioner.expose_blocks(), curr_epoch=step // steps_per_epoch_rounded,
-                         curr_step=step, dropout_key=dropout_key, best_acc=best_acc,
-                         training_time=elapsed_time)
-      print(
-        f"Checkpointing performed in: {timedelta(seconds=time.time() - chckpt_init_time)}")
 
 
   print("Training complete!")

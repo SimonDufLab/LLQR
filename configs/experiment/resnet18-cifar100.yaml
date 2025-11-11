@@ -5,6 +5,8 @@ defaults:
   - /dataset: cifar100
   - /lr_scheduler: cosine_annealing
   - /precond_lr_scheduler: constant
+  - /ema_scheduler: constant
+  - /precond_update_scheduler: constant
 
 batch_size: 128
 learning_rate: 0.05

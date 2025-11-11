@@ -6,6 +6,9 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+def ema_update(old, new, decay):
+  return old * decay + new * (1 - decay)
+
 
 class BlockStructures(abc.ABC):
 
@@ -22,8 +25,9 @@ class BlockStructures(abc.ABC):
       self._init_blocks = self.identity_block_init
     self.blocks = self._make_blocks(network_params, layer_names)
 
-  def update_blocks(self, new_blocks):
-    self.blocks.update(new_blocks)
+  def update_blocks(self, new_blocks, ema_decay=0):
+    _new_blocks = jax.tree_map(Partial(ema_update, decay=ema_decay), self.blocks, new_blocks)
+    self.blocks.update(_new_blocks)
 
   def clip_blocks(self, min_for_block=None, max_for_block=None):
     block_clip_fn = Partial(jnp.clip, min=min_for_block, max=max_for_block)

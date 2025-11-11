@@ -1,14 +1,17 @@
 """Simple dictionary file to match string identifiers to the desired output"""
 from lqr_optimizer._src.models.mlp import create_mlp
-from lqr_optimizer._src.models.resnet import create_resnet18
+from lqr_optimizer._src.models.resnet import create_resnet18, create_resnet50
 from lqr_optimizer._src.models.grok_model import create_grok_model
 from lqr_optimizer._src.utils import divergence
 
-from lqr_optimizer._src.utils.utils import cosine_annealing_schedule_per_epoch, step_warmup, linear_schedule, warmup_cosine_annealing_schedule
+from lqr_optimizer._src.utils.utils import (cosine_annealing_schedule_per_epoch, step_warmup, linear_schedule,
+                                            warmup_cosine_annealing_schedule, piecewise_constant_schedule,
+                                            warmup_piecewise_decay_schedule)
 
 model_choice = {
   "mlp": create_mlp,
   "resnet-18": create_resnet18,
+  "resnet-50": create_resnet50,
   "grok-transformer": create_grok_model,
 }
 
@@ -23,4 +26,6 @@ lr_schedule_choice = {
   "warmup_cosine_decay": warmup_cosine_annealing_schedule,
   "step_warmup": step_warmup,
   "linear": linear_schedule,
+  "piecewise_constant": piecewise_constant_schedule,
+  "warmup_piecewise_decay": warmup_piecewise_decay_schedule,
 }

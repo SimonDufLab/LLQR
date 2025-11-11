@@ -5,6 +5,8 @@ defaults:
   - /dataset: grok_mod_sum
   - /lr_scheduler: step_warmup
   - /precond_lr_scheduler: constant
+  - /ema_scheduler: constant
+  - /precond_update_scheduler: constant
 
 batch_size: 512
 learning_rate: 1e-3
