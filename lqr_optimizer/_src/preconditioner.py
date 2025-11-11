@@ -9,7 +9,7 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
-from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm, get_per_layer_norm
+from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm, get_per_layer_norm, _deep_copy_pytree
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints,
                              lqr_backward_matrices_and_adjoints)
@@ -142,33 +142,41 @@ class BasePreconditioner(abc.ABC):
         # print(jax.tree_map(lambda g: g.shape, grads))
         return v, grads
 
-      #@Partial(jax.jit, donate_argnames=("preconditioner",)) # Can't donate anymore because of ema update...
-      @jax.jit
-      def get_update(preconditioner, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
-        # Initialize the optimizer state for the preconditioner.
-        opt_state = optax_solver.init(preconditioner)
+      @Partial(jax.jit, donate_argnames=("preconditioner",))
+      def _get_update(preconditioner, opt_state, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
         gradients, operators = get_operators_and_gradients(
           params, other_model_variables, datapoint, trainstate_opt_state)
         # gradients, kernel_shapes = self._block_structure.prepare_vectors(gradients)
         input_size = datapoint[0].size
 
         # Define a single update step to be run in the compiled loop.
-        def update_step(i, state):
-          precond, opt_state = state
+        def update_step(carry, _):
+          precond, opt_state = carry
           # precond_grad = lqr_grad_fn(precond, input_size, gradients, kernel_shapes, operators)
           _, precond_grad = lqr_grad_fn(precond, input_size, gradients, operators)
           extra_args = {'value_and_grad_fn': Partial(lqr_grad_fn, input_size=input_size, gradients=gradients, operators=operators)}
           updates, opt_state = optax_solver.update(precond_grad, opt_state, precond, **extra_args)
           updates = jax.tree_map(lambda g: g * precond_lr, updates)
           new_precond = optax.apply_updates(precond, updates)
-          return (new_precond, opt_state)
+          return (new_precond, opt_state), None
 
-        # Use a compiled loop to perform “steps” iterations.
-        init_state = (preconditioner, opt_state)
-        final_precond, _ = jax.lax.fori_loop(0, steps, update_step, init_state)
-        # Safeguard against any numerical issues
-        # return jax.tree_map(Partial(jnp.nan_to_num, nan=1.0, posinf=1.0, neginf=1.0), final_precond)
+        # # Use a compiled loop to perform “steps” iterations.
+        # init_state = (preconditioner, opt_state)
+        # final_precond, _ = jax.lax.fori_loop(0, steps, update_step, init_state)
+
+        (final_precond, _), _ = jax.lax.scan(update_step,
+                                             (preconditioner, opt_state),
+                                             xs=None, length=steps, unroll=1)
         return jax.tree_map(jnp.nan_to_num, final_precond)
+
+
+      def get_update(preconditioner, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
+        # Snapshot of preconditioner to donate arg during jitted fn, but need original for EMA later
+        precond_snapshot = _deep_copy_pytree(preconditioner)
+        # Initialize the optimizer state for the preconditioner.
+        opt_state = optax_solver.init(precond_snapshot)
+
+        return _get_update(precond_snapshot, opt_state, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state)
 
       return get_update
     else:
@@ -316,6 +324,30 @@ class BasePreconditioner(abc.ABC):
 
     # print(self._block_structure.blocks["layers_2"])
     # print(self._block_structure.blocks)
+
+  def compile_precond_updater(self, params, dataloader, precond_lr, opt_state, precond_batch_size, other_model_variables=FrozenDict({})):
+    """For when we want to trigger jax compilation of _update_preconditioner_fn without applying the update"""
+    if self._multibatch:
+        blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
+                                       opt_state)
+    else:
+      # Accumulate batches until we reach (or exceed) the requested preconditioner batch size
+      batches = []
+      acc_size = 0
+      while acc_size < precond_batch_size:
+        b = next(dataloader)  # can be (x, y) or any pytree of arrays
+        # Infer batch size from the first leaf
+        b_size = jax.tree_util.tree_leaves(b)[0].shape[0]
+        batches.append(b)
+        acc_size += int(b_size)
+
+      # Concatenate along the batch dimension
+      acc_batches = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *batches)
+
+      # Clip so that acc_batches has exactly `precond_batch_size` elements on axis 0
+      acc_batches = jax.tree_util.tree_map(lambda x: x[:precond_batch_size], acc_batches)
+      blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
+                                     acc_batches, opt_state)
 
   def expose_blocks(self):
     return self._block_structure.blocks

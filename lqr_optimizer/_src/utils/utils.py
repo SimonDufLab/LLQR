@@ -1092,6 +1092,7 @@ def warmup_piecewise_decay_schedule(
       boundaries_and_scales=bound_dict)]
   return optax.join_schedules(schedules, [warmup_steps])
 
+
 ##################################
 # "Trick" utils
 ##################################
@@ -1114,3 +1115,14 @@ def normalize_conv_params_l2(params):
         return p * scale
 
     return jax.tree_util.tree_map(maybe_normalize_leaf, params)
+
+
+##################################
+# Varia
+##################################
+def _deep_copy_pytree(tree):
+  # Ensures every array leaf gets a fresh device buffer (no aliasing).
+  def _copy_leaf(x):
+    # jnp.array(x, copy=True) is the most explicit; .copy() also works on arrays.
+    return jnp.array(x, copy=True) if isinstance(x, jnp.ndarray) else x
+  return jax.tree_map(_copy_leaf, tree)
