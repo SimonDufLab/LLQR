@@ -23,6 +23,7 @@ from pathlib import Path
 from lqr_optimizer._src.configs.config import model_choice, divergence_choice, lr_schedule_choice
 from lqr_optimizer._src.preconditioner import BasePreconditioner
 from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, loss_eval, compute_accuracy, compute_batch_accuracy
+from lqr_optimizer._src.utils.dataloaders.hf_loaders import prepare_hf_dataset
 import lqr_optimizer._src.utils.utils as utl
 
 
@@ -63,15 +64,23 @@ def main(cfg: DictConfig):
     aim_hash = None
 
   # 1a) Create the data generators
+  if not cfg.eval_batch_size:
+    cfg.eval_batch_size = cfg.batch_size
   if cfg.dataset.loader == "tfds":
     dataloader, ds_info = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
-    num_classes, train_ds_size = ds_info['num_classes'], ds_info['ds_size']
     # precond_dataloader, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
-    test_dataloader, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name, dataset_dir=cfg.dataset.dataset_dir)
-  elif cfg.dataset.loader == "torch":
-    pass
+    test_dataloader, _ = prepare_dataloader(batch_size=cfg.eval_batch_size, train=False, dataset=cfg.dataset.name, dataset_dir=cfg.dataset.dataset_dir)
+  elif cfg.dataset.loader == "hf":
+    dataloader, test_dataloader, ds_info = prepare_hf_dataset(cfg.dataset.name)(
+      save_path = Path(cfg.dataset.dataset_dir),
+      tokenizers_path = Path(cfg.dataset.tokenizer_dir),
+      batch_size = cfg.batch_size,
+      bptt = cfg.dataset.target_len,
+      eval_batch_size = cfg.eval_batch_size,
+      )
   else:
     raise ValueError(f"Loader missing or not supported for {cfg.dataset.name}")
+  num_classes, train_ds_size = ds_info['num_classes'], ds_info['ds_size']
   steps_per_epoch_rounded = train_ds_size // cfg.batch_size
   steps_per_epoch = train_ds_size / cfg.batch_size
   total_steps = ((train_ds_size * cfg.total_epochs) // cfg.batch_size) + 1

@@ -1,4 +1,5 @@
 name: imagenet
+loader: tfds
 
 augment_dataset: true
 lt_config: null

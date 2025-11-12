@@ -1,0 +1,8 @@
+name: wikitext-103
+loader: hf
+
+#augment_dataset: true
+#lt_config: null
+dataset_dir: "./data/WikiText103"
+tokenizer_dir: "./data/WikiText103/tokenizer"
+target_len: 1024
