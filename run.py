@@ -81,9 +81,9 @@ def main(cfg: DictConfig):
   else:
     raise ValueError(f"Loader missing or not supported for {cfg.dataset.name}")
   num_classes, train_ds_size = ds_info['num_classes'], ds_info['ds_size']
-  steps_per_epoch_rounded = train_ds_size // cfg.batch_size
-  steps_per_epoch = train_ds_size / cfg.batch_size
-  total_steps = ((train_ds_size * cfg.total_epochs) // cfg.batch_size) + 1
+  steps_per_epoch_rounded = train_ds_size // (cfg.batch_size * cfg.grad_acc_steps)
+  steps_per_epoch = train_ds_size / (cfg.batch_size * cfg.grad_acc_steps)
+  total_steps = ((train_ds_size * cfg.total_epochs) // (cfg.batch_size * cfg.grad_acc_steps)) + 1
   if not cfg.update_preconditioner_until:
     cfg.update_preconditioner_until = total_steps + 1
 
@@ -203,39 +203,51 @@ def main(cfg: DictConfig):
   # ---------------------------------------------------------------------------------
 
   # @jax.jit
-  def loss_fn(params, apply_fn, _batch_stats, x, y):
+  def loss_fn(params, apply_fn, _batch_stats, x, y, _dropout_key):
     # Pass both params and batch_stats, and mark batch_stats as mutable.
     (log_probs, new_model_state) = apply_fn(
       {'params': params, 'batch_stats': _batch_stats},
       x,
+      rngs={'dropout': _dropout_key},
       mutable=['batch_stats']
     )
     loss = cross_entropy_loss(log_probs, y, label_smoothing=cfg.label_smoothing)
     return loss, new_model_state
 
   @jax.jit
-  def compute_updates(params, _batch_stats, x, y):
+  def compute_updates(params, _batch_stats, x, y, _dropout_key):
     """Compute standard gradient of the cross entropy loss."""
-    return jax.value_and_grad(loss_fn, argnums=0, has_aux=True)(params, model.apply, _batch_stats, x, y)
+    return jax.value_and_grad(loss_fn, argnums=0, has_aux=True)(params, model.apply, _batch_stats, x, y, _dropout_key)
 
   signal.signal(signal.SIGTERM, utl.signal_handler)  # Before getting pre-empted and requeued.
   signal.signal(signal.SIGUSR1, utl.signal_handler)  # Before reaching the end of the time limit.
 
   # @jax.jit
-  def train_step(state, x, y):
-    (loss, new_model_state), grads = compute_updates(state.params, state.batch_stats, x, y)
+  def train_step(state, train_dataloader, _dropout_key):
+    x, y = next(train_dataloader)
+    _dropout_key, consumed_key = jax.random.split(_dropout_key)
+    (running_loss, new_model_state), running_grads = compute_updates(state.params, state.batch_stats, x, y, _dropout_key)
+    for i in range(cfg.grad_acc_steps - 1):
+      x, y = next(train_dataloader)
+      _dropout_key, consumed_key = jax.random.split(_dropout_key)
+      (loss, new_model_state), grads = compute_updates(state.params, state.batch_stats, x, y, _dropout_key)
+      running_grads = jax.tree_map(jnp.add, running_grads, grads)
+      running_loss += loss
+    running_loss /= cfg.grad_acc_steps
+    running_grads = jax.tree_util.tree_map(lambda v : v/cfg.grad_acc_steps, running_grads)
+    #TODO might want to revisit new_model_state handling with grad accumulation, no impact with current configs however
 
     if cfg.precond_on_update:
-      new_state = state.apply_gradients_and_precond(grads=grads, precond_apply=preconditioner.apply,
+      new_state = state.apply_gradients_and_precond(grads=running_grads, precond_apply=preconditioner.apply,
                                                     normalize_conv_params=cfg.normalize_conv_params,
                                                     batch_stats=new_model_state['batch_stats'])
     else:
       # Apply the preconditioner on the gradient
-      precond_grads = preconditioner.apply(grads)
+      precond_grads = preconditioner.apply(running_grads)
       new_state = state.apply_gradients(grads=precond_grads, normalize_conv_params=cfg.normalize_conv_params,
                                         batch_stats=new_model_state['batch_stats'])
 
-    return new_state, loss
+    return new_state, running_loss, x, y
 
   # Start timer
   start_time = time.time()
@@ -289,9 +301,10 @@ def main(cfg: DictConfig):
       print(f"Preconditioner was updated in {time.time()-precond_update_start_time:.2f} seconds")
 
     # Grab the next batch for normal training
-    x_batch, y_batch = next(dataloader)
-
-    state, loss = train_step(state, x_batch, y_batch)
+    # x_batch, y_batch = next(dataloader)
+    #
+    dropout_key, consumed_key = jax.random.split(dropout_key)
+    state, loss, x_batch, y_batch = train_step(state, dataloader, consumed_key)
 
     # Logging or testing every so often
     if step % cfg.logging_freq == 0:

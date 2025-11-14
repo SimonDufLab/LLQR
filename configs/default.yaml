@@ -1,4 +1,5 @@
 batch_size: 128
+grad_acc_steps: 1 # If we need to accumulated batches
 eval_batch_size: null
 learning_rate: 0.1
 momentum: 0.9

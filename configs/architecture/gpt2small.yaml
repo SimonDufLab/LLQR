@@ -1,0 +1,4 @@
+name: gpt2-small
+
+activation: gelu # TODO: later implementation
+size: null # TODO: later implementation
