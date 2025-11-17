@@ -22,7 +22,7 @@ from pathlib import Path
 
 from lqr_optimizer._src.configs.config import model_choice, divergence_choice, lr_schedule_choice
 from lqr_optimizer._src.preconditioner import BasePreconditioner
-from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, loss_eval, compute_accuracy, compute_batch_accuracy
+from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, compute_accuracy_and_loss, compute_batch_accuracy
 from lqr_optimizer._src.utils.dataloaders.hf_loaders import prepare_hf_dataset
 import lqr_optimizer._src.utils.utils as utl
 
@@ -231,7 +231,7 @@ def main(cfg: DictConfig):
       x, y = next(train_dataloader)
       _dropout_key, consumed_key = jax.random.split(_dropout_key)
       (loss, new_model_state), grads = compute_updates(state.params, state.batch_stats, x, y, _dropout_key)
-      running_grads = jax.tree_map(jnp.add, running_grads, grads)
+      running_grads = jax.tree_util.tree_map(jnp.add, running_grads, grads)
       running_loss += loss
     running_loss /= cfg.grad_acc_steps
     running_grads = jax.tree_util.tree_map(lambda v : v/cfg.grad_acc_steps, running_grads)
@@ -315,7 +315,7 @@ def main(cfg: DictConfig):
       run.track(train_loss, name="train loss", step=step)
       run.track(train_loss, name="train loss|t", step=elapsed_time*100)
       # Compute batch accuracy
-      batch_accuracy = compute_batch_accuracy(state, x_batch, y_batch)
+      batch_accuracy, _ = compute_batch_accuracy(state, x_batch, y_batch)
       run.track(batch_accuracy, name="train accuracy", step=step)
       run.track(batch_accuracy, name="train accuracy|t", step=elapsed_time*100)
       if step % cfg.report_freq == 0:
@@ -324,9 +324,7 @@ def main(cfg: DictConfig):
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
     if step % cfg.test_eval_freq == 0:
       test_time_start = time.time()
-      test_accuracy = compute_accuracy(state, test_dataloader)
-      x_test, y_test = next(test_dataloader)
-      test_loss = loss_eval(state, x_test, y_test)
+      test_accuracy, test_loss = compute_accuracy_and_loss(state, test_dataloader)
       elapsed_time = time.time() - start_time + prev_elapsed_time
       run.track(test_accuracy, name="test accuracy", step=step)
       run.track(test_loss, name="test loss", step=step)

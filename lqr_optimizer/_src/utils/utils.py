@@ -620,6 +620,7 @@ def compute_batch_accuracy(state, x_batch, y_batch):
 
   Returns:
       Accuracy for the batch as a percentage (float).
+      And Loss
   """
   # Forward pass to compute logits
   variables = {'params': state.params, 'batch_stats': state.batch_stats}
@@ -633,9 +634,9 @@ def compute_batch_accuracy(state, x_batch, y_batch):
 
   # Compute accuracy
   accuracy = (correct_predictions / y_batch.shape[0]) * 100
-  return accuracy
+  return accuracy, cross_entropy_loss(log_probs, y_batch)
 
-def compute_accuracy(state, dataloader):
+def compute_accuracy_and_loss(state, dataloader):
   """
   Computes accuracy for the given model parameters and dataloader.
 
@@ -646,21 +647,25 @@ def compute_accuracy(state, dataloader):
 
   Returns:
       Accuracy as a percentage (float).
+      Averaged loss
   """
   correct_predictions = 0
+  running_loss = 0
   total_samples = 0
 
   for x_batch, y_batch in dataloader:
     # Compute model predictions
     batch_size = y_batch.shape[0]
-    correct_predictions += compute_batch_accuracy(state, x_batch, y_batch) * batch_size
+    acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
+    correct_predictions += acc * batch_size
+    running_loss += loss * batch_size
     total_samples += batch_size
     if total_samples >= 10000:
       break
 
   # Compute accuracy as a percentage
   accuracy = (correct_predictions / total_samples)
-  return accuracy
+  return accuracy, running_loss / total_samples
 
 
  # Prepare the train state for the model parameters

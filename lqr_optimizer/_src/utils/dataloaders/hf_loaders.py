@@ -25,69 +25,87 @@ def prepare_hf_dataset(name: str):
 ## JAX prefetching iterator (no Torch required)
 #################################################
 class LoaderAsJaxIterator:
-    """
-    Wrap any Python iterator that yields NumPy arrays (or nested structures)
-    and device_put them with a background prefetching thread.
-    """
-    def __init__(
-        self,
-        source_iter: Iterable,
-        prefetch: int = 4,
-        postprocess: Optional[Callable[[Any], Any]] = None,
-    ):
-        self.source_iter = source_iter
-        self.prefetch = max(0, int(prefetch))
-        self.postprocess = postprocess
-        self._q: "queue.Queue[Any]" = queue.Queue(maxsize=self.prefetch if self.prefetch > 0 else 1)
-        self._stop = object()
-        self._exc: Optional[BaseException] = None
-        self._thread: Optional[threading.Thread] = None
-        self._started = False
+  """
+  Wrap an epoch *factory* (callable returning an iterator of batches)
+  and device_put them with a background prefetching thread.
 
-    def _to_device(self, obj):
-        if isinstance(obj, np.ndarray):
-            return jax.device_put(obj)
-        if isinstance(obj, (list, tuple)):
-            return type(obj)(self._to_device(x) for x in obj)
-        if isinstance(obj, dict):
-            return {k: self._to_device(v) for k, v in obj.items()}
-        return obj
+  If repeat=True, it recreates a fresh epoch iterator when one finishes
+  (so training can call next(...) forever).
+  """
 
-    def _producer(self):
-        try:
-            for batch in self.source_iter:
-                batch = self._to_device(batch)
-                if self.postprocess is not None:
-                    batch = self.postprocess(batch)
-                self._q.put(batch)
-            self._q.put(self._stop)
-        except BaseException as e:
-            self._exc = e
-            try:
-                self._q.put(self._stop)
-            except Exception:
-                pass
+  def __init__(
+          self,
+          source: Iterable | Callable[[], Iterable],
+          prefetch: int = 4,
+          postprocess: Optional[Callable[[Any], Any]] = None,
+          repeat: bool = False,
+  ):
+    self.source = source  # can be an iterable OR a 0-arg factory
+    self.prefetch = max(0, int(prefetch))
+    self.postprocess = postprocess
+    self.repeat = repeat
 
-    def _ensure_started(self):  # <— add
-      if not self._started:
-        self._exc = None
-        self._thread = threading.Thread(target=self._producer, daemon=True)
-        self._thread.start()
-        self._started = True
+    self._q: "queue.Queue[Any]" = queue.Queue(maxsize=self.prefetch if self.prefetch > 0 else 1)
+    self._stop = object()
+    self._exc: Optional[BaseException] = None
+    self._thread: Optional[threading.Thread] = None
+    self._started = False
 
-    def __iter__(self):
-      self._ensure_started()
-      return self
+  def _to_device(self, obj):
+    if isinstance(obj, np.ndarray):
+      return jax.device_put(obj)
+    if isinstance(obj, (list, tuple)):
+      return type(obj)(self._to_device(x) for x in obj)
+    if isinstance(obj, dict):
+      return {k: self._to_device(v) for k, v in obj.items()}
+    return obj
 
-    def __next__(self):
-      # Start lazily if user calls next(dataloader) without iter()
-      self._ensure_started()
-      item = self._q.get()
-      if item is self._stop:
-        if self._exc is not None:
-          raise self._exc
-        raise StopIteration
-      return item
+  def _get_iter(self) -> Iterable:
+    # If we got a factory function, call it; else assume it's an iterable
+    if callable(self.source):
+      return self.source()
+    return self.source
+
+  def _producer_once(self):
+    for batch in self._get_iter():
+      batch = self._to_device(batch)
+      if self.postprocess is not None:
+        batch = self.postprocess(batch)
+      self._q.put(batch)
+
+  def _producer(self):
+    try:
+      while True:
+        self._producer_once()
+        if not self.repeat:
+          break
+      self._q.put(self._stop)
+    except BaseException as e:
+      self._exc = e
+      try:
+        self._q.put(self._stop)
+      except Exception:
+        pass
+
+  def _ensure_started(self):
+    if not self._started:
+      self._exc = None
+      self._thread = threading.Thread(target=self._producer, daemon=True)
+      self._thread.start()
+      self._started = True
+
+  def __iter__(self):
+    self._ensure_started()
+    return self
+
+  def __next__(self):
+    self._ensure_started()
+    item = self._q.get()
+    if item is self._stop:
+      if self._exc is not None:
+        raise self._exc
+      raise StopIteration
+    return item
 
 
 #################################################
@@ -249,34 +267,42 @@ class TextData:
         return x.astype(np.int32, copy=False), y.astype(np.int32, copy=False)
 
 
-def _batch_iterator(
-    dataset: TextData,
-    batch_size: int,
-) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+def make_epoch_factory(
+        ds_obj: TextData,
+        batch_size: int,
+        rng: Optional[np.random.Generator] = None
+):
     """
     Yields batches shaped like your previous collate_fn:
       - stack B sequences [B, T]
       - then transpose to [T, B]
       - targets flattened to [T*B]
-    (No shuffle to match your previous code.)
+    Returns a 0-arg factory. Each call -> one epoch iterator.
+    If rng is provided, indices are shuffled once per epoch.
     """
-    n = len(dataset)
-    T = dataset.tgt_len
-    i = 0
-    while i < n:
-        j = min(i + batch_size, n)
+    def factory():
+      n = len(ds_obj)
+      if rng is None:
+        order = np.arange(n)
+      else:
+        order = rng.permutation(n)
+
+      # same batching / shapes as _batch_iterator
+      for i in range(0, n, batch_size):
+        idxs = order[i:i + batch_size]
         xs = []
         ys = []
-        for k in range(i, j):
-            x, y = dataset[k]           # [T], [T]
-            xs.append(x)
-            ys.append(y)
-        X = np.stack(xs, axis=0)        # [B, T]
-        Y = np.stack(ys, axis=0)        # [B, T]
-        X = X.transpose(1, 0).copy()    # [T, B]
-        Y = Y.transpose(1, 0).reshape(-1).copy()  # [T*B]
-        yield X, Y
-        i = j
+        for k in idxs:
+          x, y = ds_obj[int(k)]
+          xs.append(x)
+          ys.append(y)
+        xx = np.stack(xs, axis=0)  # [B, T]
+        yy = np.stack(ys, axis=0)  # [B, T]
+        xx = xx.transpose(1, 0).copy()  # [T, B]
+        yy = yy.transpose(1, 0).reshape(-1).copy()  # [T*B]
+        yield xx, yy
+
+    return factory
 
 
 #################################################
@@ -403,15 +429,17 @@ def wt103_loader(
     train_dataset = TextData(train_ids, bptt=bptt)
     val_dataset   = TextData(val_ids,   bptt=bptt)
 
-    # 4) Build iterators (no torch DataLoader; we keep shapes identical)
-    def make_iter(ds_obj: TextData, batch_size: int) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
-        return _batch_iterator(ds_obj, batch_size)
+    # 4) Build per-epoch factories
+    rng = np.random.default_rng()  # or pass a seed from cfg if you want determinism
 
-    train_iter_np = make_iter(train_dataset, batch_size)
-    val_iter_np   = make_iter(val_dataset,   eval_batch_size or batch_size)
+    train_epoch_factory = make_epoch_factory(train_dataset, batch_size, rng=rng)
+    val_epoch_factory = make_epoch_factory(val_dataset, eval_batch_size or batch_size, rng=None)  # no shuffle for eval
 
-    train_loader = LoaderAsJaxIterator(train_iter_np, prefetch=4)
-    eval_val_loader = LoaderAsJaxIterator(val_iter_np, prefetch=2)
+    # Train: infinite stream with per-epoch shuffling
+    train_loader = LoaderAsJaxIterator(train_epoch_factory, prefetch=4, repeat=True)
+
+    # Eval: single pass, no shuffling
+    eval_val_loader = LoaderAsJaxIterator(val_epoch_factory, prefetch=2, repeat=False)
 
     # 5) Stats/info
     # class frequencies over the training ids
