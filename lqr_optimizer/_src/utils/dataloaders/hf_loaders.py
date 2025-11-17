@@ -30,7 +30,7 @@ class LoaderAsJaxIterator:
   and device_put them with a background prefetching thread.
 
   If repeat=True, it recreates a fresh epoch iterator when one finishes
-  (so training can call next(...) forever).
+  (for infinite train). For eval, usually repeat=False.
   """
 
   def __init__(
@@ -40,16 +40,29 @@ class LoaderAsJaxIterator:
           postprocess: Optional[Callable[[Any], Any]] = None,
           repeat: bool = False,
   ):
-    self.source = source  # can be an iterable OR a 0-arg factory
+    self.source = source
     self.prefetch = max(0, int(prefetch))
     self.postprocess = postprocess
     self.repeat = repeat
+    self._init_state()  # <— important
 
-    self._q: "queue.Queue[Any]" = queue.Queue(maxsize=self.prefetch if self.prefetch > 0 else 1)
+  def _init_state(self):
+    # (Re)initialize runtime state
+    self._q: "queue.Queue[Any]" = queue.Queue(
+      maxsize=self.prefetch if self.prefetch > 0 else 1
+    )
     self._stop = object()
     self._exc: Optional[BaseException] = None
     self._thread: Optional[threading.Thread] = None
     self._started = False
+
+  def reset(self):
+    """
+    Reset the iterator so it can be re-used for a new evaluation run.
+    Only works reliably if `source` is a factory (callable) that
+    returns a fresh epoch iterator each time.
+    """
+    self._init_state()
 
   def _to_device(self, obj):
     if isinstance(obj, np.ndarray):

@@ -9,7 +9,8 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
-from lqr_optimizer._src.utils.utils import normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm, get_per_layer_norm, _deep_copy_pytree
+from lqr_optimizer._src.utils.utils import (normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm,
+                                            get_per_layer_norm, _deep_copy_pytree, infer_batch_layout)
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints,
                              lqr_backward_matrices_and_adjoints)
@@ -299,24 +300,96 @@ class BasePreconditioner(abc.ABC):
                                        opt_state), ema_decay)
     else:
       # Accumulate batches until we reach (or exceed) the requested preconditioner batch size
-      batches = []
-      acc_size = 0
+      # First batch to infer layout
+      b0 = next(dataloader)
+      layout = infer_batch_layout(b0)
+      mode = layout["mode"]
+      batch_axis = layout["batch_axis"]
+      T = layout["T"]  # only used in text mode
+
+      # Now start accumulation with the first batch already taken
+      batches = [b0]
+      # "Batch size" = size along batch_axis of x
+      first_x = jax.tree_util.tree_leaves(b0)[0]
+      if not isinstance(first_x, jnp.ndarray):
+        first_x = jnp.asarray(first_x)
+      current_B = first_x.shape[batch_axis]
+      acc_size = int(current_B)
+
       while acc_size < precond_batch_size:
-        b = next(dataloader)  # can be (x, y) or any pytree of arrays
-        # Infer batch size from the first leaf
-        b_size = jax.tree_util.tree_leaves(b)[0].shape[0]
+        b = next(dataloader)
+        x_leaf = jax.tree_util.tree_leaves(b)[0]
+        if not isinstance(x_leaf, jnp.ndarray):
+          x_leaf = jnp.asarray(x_leaf)
+        B = x_leaf.shape[batch_axis]
         batches.append(b)
-        acc_size += int(b_size)
+        acc_size += int(B)
 
-      # Concatenate along the batch dimension
-      acc_batches = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *batches)
+      # Concatenate according to layout
+      def concat_fn(*xs):
+        x0 = xs[0]
+        if not isinstance(x0, jnp.ndarray):
+          x0 = jnp.asarray(x0)
 
-      # Clip so that acc_batches has exactly `precond_batch_size` elements on axis 0
-      acc_batches = jax.tree_util.tree_map(lambda x: x[:precond_batch_size], acc_batches)
+        if mode == "cv":
+          # CV: batch axis always 0 for all arrays
+          if x0.ndim >= 1:
+            return jnp.concatenate(xs, axis=0)
+          else:
+            return x0
 
+        else:  # mode == "text"
+          # For text:
+          # - inputs: [T, B] -> concat along axis=1 (batch axis)
+          # - targets: [T*B] -> concat along axis=0
+          if x0.ndim >= 2:
+            # assume it's something like [T, B, ...] and batch_axis is 1
+            return jnp.concatenate(xs, axis=batch_axis)
+          elif x0.ndim == 1:
+            # flattened targets
+            return jnp.concatenate(xs, axis=0)
+          else:
+            return x0
+
+      acc_batches = jax.tree_util.tree_map(concat_fn, *batches)
+
+      # Clip to exactly precond_batch_size along batch dimension
+      def clip_fn(x):
+        if not isinstance(x, jnp.ndarray):
+          x = jnp.asarray(x)
+
+        if mode == "cv":
+          # x: [B, ...] or [B]
+          if x.ndim >= 1:
+            return x[:precond_batch_size]
+          else:
+            return x
+
+        else:  # mode == "text"
+          if x.ndim >= 2:
+            # inputs: [T, B_total] -> [T, precond_batch_size]
+            # batch_axis is 1 here
+            idx = [slice(None)] * x.ndim
+            idx[batch_axis] = slice(0, precond_batch_size)
+            return x[tuple(idx)]
+          elif x.ndim == 1 and T is not None:
+            # targets: [T*B_total] -> [T * precond_batch_size]
+            return x[: T * precond_batch_size]
+          else:
+            return x
+
+      acc_batches = jax.tree_util.tree_map(clip_fn, acc_batches)
       self._block_structure.update_blocks(
-        self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
-                                       acc_batches, opt_state), ema_decay)
+        self._update_preconditioner_fn(
+          self._block_structure.blocks,
+          params,
+          precond_lr,
+          other_model_variables,
+          acc_batches,
+          opt_state,
+        ),
+        ema_decay,
+      )
 
     if not self._allow_grad_inversion and self._block_structure_name in ('scalar', "diagonal"):
       # We clip to (almost) 0 those 2 structures to avoid gradient inversion
@@ -332,20 +405,85 @@ class BasePreconditioner(abc.ABC):
                                        opt_state)
     else:
       # Accumulate batches until we reach (or exceed) the requested preconditioner batch size
-      batches = []
-      acc_size = 0
+      # First batch to infer layout
+      b0 = next(dataloader)
+      layout = infer_batch_layout(b0)
+      mode = layout["mode"]
+      batch_axis = layout["batch_axis"]
+      T = layout["T"]  # only used in text mode
+
+      # Now start accumulation with the first batch already taken
+      batches = [b0]
+      # "Batch size" = size along batch_axis of x
+      first_x = jax.tree_util.tree_leaves(b0)[0]
+      if not isinstance(first_x, jnp.ndarray):
+        first_x = jnp.asarray(first_x)
+      current_B = first_x.shape[batch_axis]
+      acc_size = int(current_B)
+
       while acc_size < precond_batch_size:
-        b = next(dataloader)  # can be (x, y) or any pytree of arrays
-        # Infer batch size from the first leaf
-        b_size = jax.tree_util.tree_leaves(b)[0].shape[0]
+        b = next(dataloader)
+        x_leaf = jax.tree_util.tree_leaves(b)[0]
+        if not isinstance(x_leaf, jnp.ndarray):
+          x_leaf = jnp.asarray(x_leaf)
+        B = x_leaf.shape[batch_axis]
         batches.append(b)
-        acc_size += int(b_size)
+        acc_size += int(B)
 
-      # Concatenate along the batch dimension
-      acc_batches = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *batches)
+      # Concatenate according to layout
+      def concat_fn(*xs):
+        x0 = xs[0]
+        if not isinstance(x0, jnp.ndarray):
+          x0 = jnp.asarray(x0)
 
-      # Clip so that acc_batches has exactly `precond_batch_size` elements on axis 0
-      acc_batches = jax.tree_util.tree_map(lambda x: x[:precond_batch_size], acc_batches)
+        if mode == "cv":
+          # CV: batch axis always 0 for all arrays
+          if x0.ndim >= 1:
+            return jnp.concatenate(xs, axis=0)
+          else:
+            return x0
+
+        else:  # mode == "text"
+          # For text:
+          # - inputs: [T, B] -> concat along axis=1 (batch axis)
+          # - targets: [T*B] -> concat along axis=0
+          if x0.ndim >= 2:
+            # assume it's something like [T, B, ...] and batch_axis is 1
+            return jnp.concatenate(xs, axis=batch_axis)
+          elif x0.ndim == 1:
+            # flattened targets
+            return jnp.concatenate(xs, axis=0)
+          else:
+            return x0
+
+      acc_batches = jax.tree_util.tree_map(concat_fn, *batches)
+
+      # Clip to exactly precond_batch_size along batch dimension
+      def clip_fn(x):
+        if not isinstance(x, jnp.ndarray):
+          x = jnp.asarray(x)
+
+        if mode == "cv":
+          # x: [B, ...] or [B]
+          if x.ndim >= 1:
+            return x[:precond_batch_size]
+          else:
+            return x
+
+        else:  # mode == "text"
+          if x.ndim >= 2:
+            # inputs: [T, B_total] -> [T, precond_batch_size]
+            # batch_axis is 1 here
+            idx = [slice(None)] * x.ndim
+            idx[batch_axis] = slice(0, precond_batch_size)
+            return x[tuple(idx)]
+          elif x.ndim == 1 and T is not None:
+            # targets: [T*B_total] -> [T * precond_batch_size]
+            return x[: T * precond_batch_size]
+          else:
+            return x
+
+      acc_batches = jax.tree_util.tree_map(clip_fn, acc_batches)
       blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
                                      acc_batches, opt_state)
 
