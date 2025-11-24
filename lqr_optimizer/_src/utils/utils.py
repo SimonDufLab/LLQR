@@ -222,8 +222,10 @@ def load_main_optimizer(cfg, lr_or_sched):
     model_optimizer = optax.adam(learning_rate=lr_or_sched)
   elif cfg.main_optimizer == "sgd":
     model_optimizer = optax.sgd(learning_rate=lr_or_sched)
-  elif cfg.main_optimizer == "adamw_b2-98":
+  elif cfg.main_optimizer == "adamw_b2-98": # Grokking exps #TODO: move to config files...
     model_optimizer = optax.adamw(learning_rate=lr_or_sched, b2=0.98, weight_decay=cfg.weight_decay)
+  elif cfg.main_optimizer == "adamw_b2-95": # GPT experiments
+    model_optimizer = optax.adamw(learning_rate=lr_or_sched, b2=0.95, weight_decay=cfg.weight_decay)
   else:
     raise ValueError("Unknown main optimizer")
   return model_optimizer
