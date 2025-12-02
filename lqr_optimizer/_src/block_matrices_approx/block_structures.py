@@ -151,7 +151,8 @@ class ScalarBlock(BlockStructures):
 
     return product_dict
 
-
+KERNEL_KEYS = ("kernel", "embedding", "pos_embedding")
+BIAS_KEYS = ("bias", "scale")
 class KroneckerBlock(BlockStructures):
   """
   A block structure that handles both kernel and bias parameters.
@@ -185,7 +186,7 @@ class KroneckerBlock(BlockStructures):
       layer_blocks = {}
       # Process kernel using Kronecker factorization
       for key in flat_params.keys():
-        if "kernel" in key:
+        if any(k in key for k in KERNEL_KEYS):
           kernel = flat_params[key]
           if not hasattr(kernel, "shape"):
             raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
@@ -207,7 +208,7 @@ class KroneckerBlock(BlockStructures):
           else:
             raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
         # Process bias using a diagonal approximation
-        if "bias" in key or 'scale' in key:
+        if any(k in key for k in BIAS_KEYS):
           bias = flat_params[key]
           if not hasattr(bias, "shape"):
             raise ValueError(f"Bias for layer {layer_name} does not have a shape attribute")
@@ -231,7 +232,7 @@ class KroneckerBlock(BlockStructures):
       layer_blocks = blocks[layer_name]
       layer_product = {}
       for component, vec_component in flatten_dict(layer_vectors).items():
-        if 'kernel' in component:
+        if any(k in component for k in KERNEL_KEYS):
           factor_A, factor_B = layer_blocks[component]
           # Reshape the gradient vector according to the component type
           vector_matrix = vec_component
@@ -245,7 +246,7 @@ class KroneckerBlock(BlockStructures):
           # product_matrix = factor_A @ vector_matrix @ factor_B.T
           product_matrix = jnp.einsum('mk,kn,rn->mr', factor_A, vector_matrix, factor_B)
           layer_product[component] = product_matrix.reshape(vm_shape)
-        elif 'bias' in component or 'scale' in component:
+        elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
           # Elementwise product for the diagonal approximation
           flat_product = diag * vec_component
@@ -255,63 +256,209 @@ class KroneckerBlock(BlockStructures):
       product_dict[layer_name] = unflatten_dict(layer_product)
     return product_dict
 
-  @staticmethod
-  def prepare_vectors(vectors):
-    kernel_shapes = {}
-    prepared_vectors = {}
-    for layer_name, layer_vectors in vectors.items():
-      prepared_layer_vectors = {}
-      for component, vec_component in flatten_dict(layer_vectors).items():
-        if 'kernel' in component:
-          # Reshape the gradient vector according to the component type
-          vector_matrix = vec_component
-          vm_shape = vector_matrix.shape
-          if len(vm_shape) == 4:
-            k_h, k_w, cin, cout = vm_shape
-            vector_matrix = vector_matrix.reshape((k_h * k_w * cin, cout))
-          prepared_layer_vectors[component] = vector_matrix
-          kernel_shapes[layer_name] = {component: vm_shape}
-        elif 'bias' in component or 'scale' in component:
-          prepared_layer_vectors[component] = vec_component
-        else:
-          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
-      prepared_vectors[layer_name] = prepared_layer_vectors
-    return prepared_vectors, kernel_shapes
+  # @staticmethod
+  # def prepare_vectors(vectors):
+  #   kernel_shapes = {}
+  #   prepared_vectors = {}
+  #   for layer_name, layer_vectors in vectors.items():
+  #     prepared_layer_vectors = {}
+  #     for component, vec_component in flatten_dict(layer_vectors).items():
+  #       if 'kernel' in component:
+  #         # Reshape the gradient vector according to the component type
+  #         vector_matrix = vec_component
+  #         vm_shape = vector_matrix.shape
+  #         if len(vm_shape) == 4:
+  #           k_h, k_w, cin, cout = vm_shape
+  #           vector_matrix = vector_matrix.reshape((k_h * k_w * cin, cout))
+  #         prepared_layer_vectors[component] = vector_matrix
+  #         kernel_shapes[layer_name] = {component: vm_shape}
+  #       elif 'bias' in component or 'scale' in component:
+  #         prepared_layer_vectors[component] = vec_component
+  #       else:
+  #         raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+  #     prepared_vectors[layer_name] = prepared_layer_vectors
+  #   return prepared_vectors, kernel_shapes
 
-  @staticmethod
-  def matrix_product_for_scan(blocks, prepared_vectors, kernel_shapes):
+  # @staticmethod
+  # def matrix_product_for_scan(blocks, prepared_vectors, kernel_shapes):
+  #   """
+  #   For each layer, perform the appropriate matrix–vector product for each parameter component.
+  #
+  #   - For kernel (dense or conv):
+  #       Compute vec(A @ X @ B^T), where X is the pre-reshaped gradient.
+  #       Then reshape back to the original kernel shape from kernel_shapes.
+  #   - For bias/scale:
+  #       Compute elementwise multiplication with the diagonal block.
+  #   """
+  #   product_dict = {}
+  #   for layer_name, layer_vectors in prepared_vectors.items():
+  #     layer_blocks = blocks[layer_name]
+  #     layer_product = {}
+  #
+  #     for component, vec_component in layer_vectors.items():
+  #       if "kernel" in component:
+  #             factor_A, factor_B = layer_blocks[component]
+  #             vector_matrix = vec_component  # already 2D from prepare_vectors
+  #
+  #             # Apply Kronecker product approximation
+  #             product_matrix = jnp.einsum(
+  #                 "mk,kn,rn->mr", factor_A, vector_matrix, factor_B
+  #             )
+  #
+  #             # Reshape back to the original 4D kernel shape
+  #             vm_shape = kernel_shapes[layer_name][component]
+  #             layer_product[component] = product_matrix.reshape(vm_shape)
+  #
+  #         # else: # Always called after prepare_vectors, so check is done
+  #       elif 'bias' in component or 'scale' in component:
+  #             diag = layer_blocks[component]
+  #             layer_product[component] = diag * vec_component
+  #     product_dict[layer_name] = unflatten_dict(layer_product)
+  #
+  #   return product_dict
+
+class DiagKroneckerBlock(KroneckerBlock):
+  """
+  Diagonal Kronecker-factored block structure, in the spirit of AdaFisher.
+
+  For kernel parameters:
+    - We approximate the Kronecker factors A and B by their diagonals:
+        A ≈ Diag(a),  B ≈ Diag(b)
+      so that the action on a kernel matrix X is:
+        A @ X @ B^T  ≈  Diag(a) @ X @ Diag(b)
+                     =  a[:, None] * X * b[None, :]
+
+    - Dense kernels (2D, shape (m, n)):
+        store (a ∈ R^m, b ∈ R^n)
+
+    - Conv kernels (4D, shape (k_h, k_w, cin, cout)):
+        reshape to (k_h*k_w*cin, cout) for the Kronecker structure, and store:
+        a ∈ R^{k_h*k_w*cin}, b ∈ R^{cout}
+
+  Bias parameters keep the same diagonal approximation as in KroneckerBlock.
+  """
+
+  def __init__(self, network_params, layer_names, block_structure_init):
+    super().__init__(network_params, layer_names, block_structure_init)
+
+  def _make_blocks(self, network_params, layer_names):
     """
-    For each layer, perform the appropriate matrix–vector product for each parameter component.
+    For kernels, store only the diagonal of the Kronecker factors:
 
-    - For kernel (dense or conv):
-        Compute vec(A @ X @ B^T), where X is the pre-reshaped gradient.
-        Then reshape back to the original kernel shape from kernel_shapes.
-    - For bias/scale:
-        Compute elementwise multiplication with the diagonal block.
+      - Dense: (diag_A, diag_B) with shapes (m,), (n,)
+      - Conv:  (diag_A, diag_B) with shapes (k_h*k_w*cin,), (cout,)
+
+    Bias logic is unchanged: a single diagonal vector.
+    """
+    blocks = {}
+    for layer_name in layer_names:
+      flat_params = flatten_dict(network_params[layer_name])
+      layer_blocks = {}
+      # Process kernel using *diagonal* Kronecker factorization
+      for key in flat_params.keys():
+        if any(k in key for k in KERNEL_KEYS):
+          kernel = flat_params[key]
+          if not hasattr(kernel, "shape"):
+            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
+          if len(kernel.shape) == 2:
+            # Dense layer kernel: shape (m, n)
+            m, n = kernel.shape
+            diag_A = self.identity_diag_init(m)  # a ∈ R^m
+            diag_B = self.identity_diag_init(n)  # b ∈ R^n
+            layer_blocks[key] = (diag_A, diag_B)
+          elif len(kernel.shape) == 4:
+            # Convolution layer kernel: shape (k_h, k_w, in_channels, out_channels)
+            k_h, k_w, cin, cout = kernel.shape
+            M = k_h * k_w * cin
+            N = cout
+            diag_A = self.identity_diag_init(M)  # a ∈ R^{k_h*k_w*cin}
+            diag_B = self.identity_diag_init(N)  # b ∈ R^{cout}
+            layer_blocks[key] = (diag_A, diag_B)
+          else:
+            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+
+        # Process bias using a diagonal approximation (unchanged)
+        if any(k in key for k in BIAS_KEYS):
+          bias = flat_params[key]
+          if not hasattr(bias, "shape"):
+            raise ValueError(f"Bias for layer {layer_name} does not have a shape attribute")
+          flat_bias, unravel_fn_bias = ravel_pytree(bias)
+          diag = self.identity_diag_init(flat_bias.shape[0])
+          layer_blocks[key] = diag
+
+      blocks[layer_name] = layer_blocks
+    return blocks
+
+  def matrix_product(self, blocks, vectors):
+    """
+    Apply the diagonal Kronecker block to 'vectors'.
+
+    For kernel params:
+      Dense (m, n):
+        X_out[i, j] = diag_A[i] * X[i, j] * diag_B[j]
+        implemented as:
+          jnp.einsum('i,ij,j->ij', diag_A, X, diag_B)
+
+      Conv (k_h, k_w, cin, cout):
+        reshape X -> (M, N) with M = k_h*k_w*cin, N = cout
+        X_out_2d[i, j] = diag_A[i] * X_2d[i, j] * diag_B[j]
+        implemented as:
+          jnp.einsum('i,ij,j->ij', diag_A, X_2d, diag_B)
+        then reshape back to original 4D shape.
+
+    Bias logic remains the same: elementwise multiplication by the diagonal.
     """
     product_dict = {}
-    for layer_name, layer_vectors in prepared_vectors.items():
+    for layer_name, layer_vectors in vectors.items():
       layer_blocks = blocks[layer_name]
       layer_product = {}
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          diag_A, diag_B = layer_blocks[component]
+          vector_matrix = vec_component
+          vm_shape = vector_matrix.shape
 
-      for component, vec_component in layer_vectors.items():
-        if "kernel" in component:
-              factor_A, factor_B = layer_blocks[component]
-              vector_matrix = vec_component  # already 2D from prepare_vectors
-
-              # Apply Kronecker product approximation
-              product_matrix = jnp.einsum(
-                  "mk,kn,rn->mr", factor_A, vector_matrix, factor_B
+          if len(vm_shape) == 2:
+            # Dense kernel: (m, n)
+            m, n = vm_shape
+            if diag_A.shape[0] != m or diag_B.shape[0] != n:
+              raise ValueError(
+                f"Diagonal Kronecker shapes {diag_A.shape}, {diag_B.shape} "
+                f"do not match dense kernel shape {vm_shape} for {component}"
               )
+            # X_out[i, j] = diag_A[i] * X[i, j] * diag_B[j]
+            product_matrix = jnp.einsum('i,ij,j->ij', diag_A, vector_matrix, diag_B)
+            layer_product[component] = product_matrix
 
-              # Reshape back to the original 4D kernel shape
-              vm_shape = kernel_shapes[layer_name][component]
-              layer_product[component] = product_matrix.reshape(vm_shape)
+          elif len(vm_shape) == 4:
+            # Conv kernel: (k_h, k_w, cin, cout)
+            k_h, k_w, cin, cout = vm_shape
+            M = k_h * k_w * cin
+            N = cout
+            if diag_A.shape[0] != M or diag_B.shape[0] != N:
+              raise ValueError(
+                f"Diagonal Kronecker shapes {diag_A.shape}, {diag_B.shape} "
+                f"do not match conv kernel flattened shape {(M, N)} for {component}"
+              )
+            vector_2d = vector_matrix.reshape(M, N)
+            # X_out_2d[i, j] = diag_A[i] * X_2d[i, j] * diag_B[j]
+            product_2d = jnp.einsum('i,ij,j->ij', diag_A, vector_2d, diag_B)
+            layer_product[component] = product_2d.reshape(vm_shape)
 
-          # else: # Always called after prepare_vectors, so check is done
-        elif 'bias' in component or 'scale' in component:
-              diag = layer_blocks[component]
-              layer_product[component] = diag * vec_component
+          else:
+            raise ValueError(
+              f"Unsupported kernel tensor rank {len(vm_shape)} for component {component} "
+              f"in layer {layer_name}"
+            )
+
+        elif any(k in component for k in BIAS_KEYS):
+          # Bias: elementwise product with diagonal (unchanged)
+          diag = layer_blocks[component]
+          flat_product = diag * vec_component
+          layer_product[component] = flat_product
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
       product_dict[layer_name] = unflatten_dict(layer_product)
-
     return product_dict
