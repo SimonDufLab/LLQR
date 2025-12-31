@@ -34,6 +34,7 @@ divergence_order_param: 0.5
 block_structure: diagonal
 block_structure_init: identity
 batch_solve_precond: true
+warm_start_precond: true
 multibatch_training: false
 damping: 0.0
 ema_decay: 0.0 # EMA decay value for updating the preconditioner

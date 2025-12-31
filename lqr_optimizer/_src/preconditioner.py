@@ -38,6 +38,7 @@ class BasePreconditioner(abc.ABC):
                multibatch: bool = False,
                precond_on_update: bool =False,
                normalize_grad_for_lqr = True,
+               warm_start_precond = True,
                damping: float = 0.0,
                allow_grad_inversion: bool = False,
                divergence_args_index = -1):
@@ -56,6 +57,7 @@ class BasePreconditioner(abc.ABC):
     self._preconditioner_update_steps = preconditioner_update_steps
     self._batch_solve_precond = batch_solve_precond
     self._multibatch = multibatch
+    self._warm_start_precond = warm_start_precond
     self._precond_on_update = precond_on_update
     self._allow_grad_inversion = allow_grad_inversion
     if normalize_grad_for_lqr:
@@ -380,9 +382,13 @@ class BasePreconditioner(abc.ABC):
             return x
 
       acc_batches = jax.tree_util.tree_map(clip_fn, acc_batches)
+      if self._warm_start_precond:
+        _blocks = self._block_structure.blocks
+      else:
+        _blocks = self._block_structure.reinit_blocks()
       self._block_structure.update_blocks(
         self._update_preconditioner_fn(
-          self._block_structure.blocks,
+          _blocks,
           params,
           precond_lr,
           other_model_variables,
