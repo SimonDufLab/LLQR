@@ -190,6 +190,7 @@ def main(cfg: DictConfig):
     multibatch=cfg.multibatch_training,
     precond_on_update=cfg.precond_on_update,
     normalize_grad_for_lqr = cfg.normalize_grad_for_lqr,
+    warm_start_precond = cfg.warm_start_precond,
     damping=cfg.damping,
     allow_grad_inversion=cfg.allow_grad_inversion,
     divergence_args_index=-1

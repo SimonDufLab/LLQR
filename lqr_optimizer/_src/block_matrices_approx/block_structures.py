@@ -25,6 +25,8 @@ class BlockStructures(abc.ABC):
       self._init_blocks = self.identity_block_init
     self.blocks = self._make_blocks(network_params, layer_names)
 
+    self.reinit_blocks = jax.jit(Partial(self._make_blocks, network_params, layer_names))
+
   def update_blocks(self, new_blocks, ema_decay=0):
     _new_blocks = jax.tree_map(Partial(ema_update, decay=ema_decay), self.blocks, new_blocks)
     self.blocks.update(_new_blocks)
