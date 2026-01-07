@@ -1,0 +1,30 @@
+# @package _global_
+defaults:
+  - /default        # includes default.yaml from default/
+  - /architecture: gpt2small
+  - /dataset: wikitext103
+  - /lr_scheduler: warmup_cosine_decay
+  - /precond_lr_scheduler: constant
+  - /ema_scheduler: constant
+  - /precond_update_scheduler: constant
+
+batch_size: 32
+grad_acc_steps: 16
+eval_batch_size: 128
+learning_rate: 0.01 # To explore
+momentum: 0.9
+main_optimizer: polyak
+weight_decay: 1e-4
+total_epochs: 25 # 25 for short exp (~5000 steps) 75 for long (~15000 steps)
+test_eval_freq: 100
+checkpoint_freq: 100
+init_key: 42
+rng_seed: 123 # For dropout, etc.
+
+precond_batch_size: 32
+update_preconditioner_every: 50
+block_structure: diagonal
+
+lr_scheduler.warmup_epochs: 1
+lr_scheduler.t_max: 25
+lr_scheduler.eta_min: 1e-4

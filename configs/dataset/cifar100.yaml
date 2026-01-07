@@ -1,4 +1,5 @@
 name: cifar-100
+loader: tfds
 
 augment_dataset: true
 lt_config: null

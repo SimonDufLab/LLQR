@@ -1,4 +1,5 @@
 name: mnist
+loader: tfds
 
 augment_dataset: false
 lt_config: null

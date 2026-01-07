@@ -22,7 +22,8 @@ from pathlib import Path
 
 from lqr_optimizer._src.configs.config import model_choice, divergence_choice, lr_schedule_choice
 from lqr_optimizer._src.preconditioner import BasePreconditioner
-from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, loss_eval, compute_accuracy, compute_batch_accuracy
+from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, compute_accuracy_and_loss, compute_batch_accuracy
+from lqr_optimizer._src.utils.dataloaders.hf_loaders import prepare_hf_dataset
 import lqr_optimizer._src.utils.utils as utl
 
 
@@ -63,13 +64,26 @@ def main(cfg: DictConfig):
     aim_hash = None
 
   # 1a) Create the data generators
-  dataloader, ds_info = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
+  if not cfg.eval_batch_size:
+    cfg.eval_batch_size = cfg.batch_size
+  if cfg.dataset.loader == "tfds":
+    dataloader, ds_info = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
+    # precond_dataloader, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
+    test_dataloader, _ = prepare_dataloader(batch_size=cfg.eval_batch_size, train=False, dataset=cfg.dataset.name, dataset_dir=cfg.dataset.dataset_dir)
+  elif cfg.dataset.loader == "hf":
+    dataloader, test_dataloader, ds_info = prepare_hf_dataset(cfg.dataset.name)(
+      save_path = Path(cfg.dataset.dataset_dir),
+      tokenizers_path = Path(cfg.dataset.tokenizer_dir),
+      batch_size = cfg.batch_size,
+      bptt = cfg.dataset.target_len,
+      eval_batch_size = cfg.eval_batch_size,
+      )
+  else:
+    raise ValueError(f"Loader missing or not supported for {cfg.dataset.name}")
   num_classes, train_ds_size = ds_info['num_classes'], ds_info['ds_size']
-  # precond_dataloader, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
-  test_dataloader, _ = prepare_dataloader(batch_size=cfg.batch_size, train=False, dataset=cfg.dataset.name, dataset_dir=cfg.dataset.dataset_dir)
-  steps_per_epoch_rounded = train_ds_size // cfg.batch_size
-  steps_per_epoch = train_ds_size / cfg.batch_size
-  total_steps = ((train_ds_size * cfg.total_epochs) // cfg.batch_size) + 1
+  steps_per_epoch_rounded = train_ds_size // (cfg.batch_size * cfg.grad_acc_steps)
+  steps_per_epoch = train_ds_size / (cfg.batch_size * cfg.grad_acc_steps)
+  total_steps = ((train_ds_size * cfg.total_epochs) // (cfg.batch_size * cfg.grad_acc_steps)) + 1
   if not cfg.update_preconditioner_until:
     cfg.update_preconditioner_until = total_steps + 1
 
@@ -189,39 +203,51 @@ def main(cfg: DictConfig):
   # ---------------------------------------------------------------------------------
 
   # @jax.jit
-  def loss_fn(params, apply_fn, _batch_stats, x, y):
+  def loss_fn(params, apply_fn, _batch_stats, x, y, _dropout_key):
     # Pass both params and batch_stats, and mark batch_stats as mutable.
     (log_probs, new_model_state) = apply_fn(
       {'params': params, 'batch_stats': _batch_stats},
       x,
+      rngs={'dropout': _dropout_key},
       mutable=['batch_stats']
     )
     loss = cross_entropy_loss(log_probs, y, label_smoothing=cfg.label_smoothing)
     return loss, new_model_state
 
   @jax.jit
-  def compute_updates(params, _batch_stats, x, y):
+  def compute_updates(params, _batch_stats, x, y, _dropout_key):
     """Compute standard gradient of the cross entropy loss."""
-    return jax.value_and_grad(loss_fn, argnums=0, has_aux=True)(params, model.apply, _batch_stats, x, y)
+    return jax.value_and_grad(loss_fn, argnums=0, has_aux=True)(params, model.apply, _batch_stats, x, y, _dropout_key)
 
   signal.signal(signal.SIGTERM, utl.signal_handler)  # Before getting pre-empted and requeued.
   signal.signal(signal.SIGUSR1, utl.signal_handler)  # Before reaching the end of the time limit.
 
   # @jax.jit
-  def train_step(state, x, y):
-    (loss, new_model_state), grads = compute_updates(state.params, state.batch_stats, x, y)
+  def train_step(state, train_dataloader, _dropout_key):
+    x, y = next(train_dataloader)
+    _dropout_key, consumed_key = jax.random.split(_dropout_key)
+    (running_loss, new_model_state), running_grads = compute_updates(state.params, state.batch_stats, x, y, _dropout_key)
+    for i in range(cfg.grad_acc_steps - 1):
+      x, y = next(train_dataloader)
+      _dropout_key, consumed_key = jax.random.split(_dropout_key)
+      (loss, new_model_state), grads = compute_updates(state.params, state.batch_stats, x, y, _dropout_key)
+      running_grads = jax.tree_util.tree_map(jnp.add, running_grads, grads)
+      running_loss += loss
+    running_loss /= cfg.grad_acc_steps
+    running_grads = jax.tree_util.tree_map(lambda v : v/cfg.grad_acc_steps, running_grads)
+    #TODO might want to revisit new_model_state handling with grad accumulation, no impact with current configs however
 
     if cfg.precond_on_update:
-      new_state = state.apply_gradients_and_precond(grads=grads, precond_apply=preconditioner.apply,
+      new_state = state.apply_gradients_and_precond(grads=running_grads, precond_apply=preconditioner.apply,
                                                     normalize_conv_params=cfg.normalize_conv_params,
                                                     batch_stats=new_model_state['batch_stats'])
     else:
       # Apply the preconditioner on the gradient
-      precond_grads = preconditioner.apply(grads)
+      precond_grads = preconditioner.apply(running_grads)
       new_state = state.apply_gradients(grads=precond_grads, normalize_conv_params=cfg.normalize_conv_params,
                                         batch_stats=new_model_state['batch_stats'])
 
-    return new_state, loss
+    return new_state, running_loss, x, y
 
   # Start timer
   start_time = time.time()
@@ -275,9 +301,10 @@ def main(cfg: DictConfig):
       print(f"Preconditioner was updated in {time.time()-precond_update_start_time:.2f} seconds")
 
     # Grab the next batch for normal training
-    x_batch, y_batch = next(dataloader)
-
-    state, loss = train_step(state, x_batch, y_batch)
+    # x_batch, y_batch = next(dataloader)
+    #
+    dropout_key, consumed_key = jax.random.split(dropout_key)
+    state, loss, x_batch, y_batch = train_step(state, dataloader, consumed_key)
 
     # Logging or testing every so often
     if step % cfg.logging_freq == 0:
@@ -288,7 +315,7 @@ def main(cfg: DictConfig):
       run.track(train_loss, name="train loss", step=step)
       run.track(train_loss, name="train loss|t", step=elapsed_time*100)
       # Compute batch accuracy
-      batch_accuracy = compute_batch_accuracy(state, x_batch, y_batch)
+      batch_accuracy, _ = compute_batch_accuracy(state, x_batch, y_batch)
       run.track(batch_accuracy, name="train accuracy", step=step)
       run.track(batch_accuracy, name="train accuracy|t", step=elapsed_time*100)
       if step % cfg.report_freq == 0:
@@ -297,9 +324,7 @@ def main(cfg: DictConfig):
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
     if step % cfg.test_eval_freq == 0:
       test_time_start = time.time()
-      test_accuracy = compute_accuracy(state, test_dataloader)
-      x_test, y_test = next(test_dataloader)
-      test_loss = loss_eval(state, x_test, y_test)
+      test_accuracy, test_loss = compute_accuracy_and_loss(state, test_dataloader)
       elapsed_time = time.time() - start_time + prev_elapsed_time
       run.track(test_accuracy, name="test accuracy", step=step)
       run.track(test_loss, name="test loss", step=step)

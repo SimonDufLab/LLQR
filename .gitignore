@@ -159,3 +159,6 @@ aim_csv/
 
 # Any generated figures
 *.pdf
+
+# Any locallly saved training data
+data/

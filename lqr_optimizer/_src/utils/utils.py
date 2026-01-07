@@ -222,8 +222,10 @@ def load_main_optimizer(cfg, lr_or_sched):
     model_optimizer = optax.adam(learning_rate=lr_or_sched)
   elif cfg.main_optimizer == "sgd":
     model_optimizer = optax.sgd(learning_rate=lr_or_sched)
-  elif cfg.main_optimizer == "adamw_b2-98":
+  elif cfg.main_optimizer == "adamw_b2-98": # Grokking exps #TODO: move to config files...
     model_optimizer = optax.adamw(learning_rate=lr_or_sched, b2=0.98, weight_decay=cfg.weight_decay)
+  elif cfg.main_optimizer == "adamw_b2-95": # GPT experiments
+    model_optimizer = optax.adamw(learning_rate=lr_or_sched, b2=0.95, weight_decay=cfg.weight_decay)
   else:
     raise ValueError("Unknown main optimizer")
   return model_optimizer
@@ -620,6 +622,7 @@ def compute_batch_accuracy(state, x_batch, y_batch):
 
   Returns:
       Accuracy for the batch as a percentage (float).
+      And Loss
   """
   # Forward pass to compute logits
   variables = {'params': state.params, 'batch_stats': state.batch_stats}
@@ -633,9 +636,9 @@ def compute_batch_accuracy(state, x_batch, y_batch):
 
   # Compute accuracy
   accuracy = (correct_predictions / y_batch.shape[0]) * 100
-  return accuracy
+  return accuracy, cross_entropy_loss(log_probs, y_batch)
 
-def compute_accuracy(state, dataloader):
+def compute_accuracy_and_loss(state, dataloader):
   """
   Computes accuracy for the given model parameters and dataloader.
 
@@ -646,21 +649,36 @@ def compute_accuracy(state, dataloader):
 
   Returns:
       Accuracy as a percentage (float).
+      Averaged loss
   """
-  correct_predictions = 0
-  total_samples = 0
+  # If this is a custom loader, reset it to ensure we get a fresh epoch
+  if hasattr(dataloader, "reset"):
+    dataloader.reset()
+  init_batch = next(dataloader)
+  batch_axis = infer_batch_layout(init_batch)["batch_axis"]
+  x_batch, y_batch = init_batch
+  batch_size = x_batch.shape[batch_axis]
+  pred_size = y_batch.shape[0]
+  acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
+  correct_predictions = acc * pred_size
+  running_loss = loss * pred_size
+  final_pred_size = pred_size
+  total_samples = batch_size
 
   for x_batch, y_batch in dataloader:
     # Compute model predictions
-    batch_size = y_batch.shape[0]
-    correct_predictions += compute_batch_accuracy(state, x_batch, y_batch) * batch_size
+    pred_size = y_batch.shape[0]
+    acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
+    correct_predictions += acc * pred_size
+    running_loss += loss * pred_size
     total_samples += batch_size
+    final_pred_size += pred_size
     if total_samples >= 10000:
       break
 
   # Compute accuracy as a percentage
-  accuracy = (correct_predictions / total_samples)
-  return accuracy
+  accuracy = (correct_predictions / final_pred_size)
+  return accuracy, running_loss / final_pred_size
 
 
  # Prepare the train state for the model parameters
@@ -801,6 +819,46 @@ def mask_from_flat_keys(pytree, substrings, delimiter="/"):
     new_flat_dict[k] = not any(n in s for s in k for n in subs)
   return unflatten_dict(new_flat_dict)
 
+
+def infer_batch_layout(batch): # TODO: potentially not robust, might be preferable to add a batch_axis arg to dataset configs
+    """
+    Infer where the batch dimension lives and how to treat targets.
+
+    Assumes `batch` is (x, y) or a pytree whose first two leaves are (x, y)
+    with either:
+      - CV-style:   x: [B, ...], y: [B] or [B, ...]
+      - Text-style: x: [T, B],   y: [T*B]
+
+    Returns:
+      layout = {
+        "mode": "cv" or "text",
+        "batch_axis": int,          # axis of batch dim in x
+        "T": int | None,            # sequence length for text mode
+      }
+    """
+    leaves = jax.tree_util.tree_leaves(batch)
+    assert len(leaves) >= 2, "Expected at least (x, y) in batch pytree"
+    x, y = leaves[0], leaves[1]
+
+    if not isinstance(x, jnp.ndarray):
+        x = jnp.asarray(x)
+    if not isinstance(y, jnp.ndarray):
+        y = jnp.asarray(y)
+
+    # Default assumption: CV-like
+    layout = {"mode": "cv", "batch_axis": 0, "T": None}
+
+    # Text-mode pattern: x: [T, B], y: [T*B]
+    if x.ndim == 2 and y.ndim == 1:
+        T0, B1 = x.shape
+        # If y is T*B and != B (avoid ambiguous case where T==1)
+        if y.shape[0] % B1 == 0 and y.shape[0] != T0:
+            T = y.shape[0] // B1
+            layout = {"mode": "text", "batch_axis": 1, "T": int(T)}
+            return layout
+
+    # CV fallback: batch axis is 0 (x: [B, ...], y: [B] or [B, ...])
+    return layout
 
 #################################
 # Checkpointing utils

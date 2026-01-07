@@ -1,4 +1,5 @@
 name: mod_exp
+loader: tfds
 
 augment_dataset: false
 lt_config: null
