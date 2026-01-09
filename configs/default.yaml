@@ -17,6 +17,7 @@ rng_seed: 123 # For dropout, etc.
 
 update_preconditioner_every: 1000
 update_preconditioner_until: null
+precond_rank: null
 precond_steps: 50
 precond_batch_size: 64
 precond_lr: 0.001

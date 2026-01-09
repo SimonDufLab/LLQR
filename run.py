@@ -186,6 +186,7 @@ def main(cfg: DictConfig):
     optax_solver=precond_optimizer,
     trainstate_solver=state.tx,
     preconditioner_update_steps=cfg.precond_steps,
+    precond_rank = cfg.precond_rank,
     batch_solve_precond=cfg.batch_solve_precond,
     multibatch=cfg.multibatch_training,
     precond_on_update=cfg.precond_on_update,

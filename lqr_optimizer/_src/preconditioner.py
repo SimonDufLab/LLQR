@@ -21,6 +21,7 @@ BLOCK_STRUCTURE_DICT = {
   'scalar': block_structures.ScalarBlock,
   'kfac': block_structures.KroneckerBlock,
   'diag-kfac': block_structures.DiagKroneckerBlock,
+  'low-rank-memory': block_structures.LowRankBlockMemory
 }
 
 class BasePreconditioner(abc.ABC):
@@ -34,6 +35,7 @@ class BasePreconditioner(abc.ABC):
                optax_solver,
                trainstate_solver,
                preconditioner_update_steps,
+               precond_rank,
                batch_solve_precond: bool = True,
                multibatch: bool = False,
                precond_on_update: bool =False,
@@ -48,7 +50,7 @@ class BasePreconditioner(abc.ABC):
     self._optax_solver = optax_solver
     self._trainstate_solver = trainstate_solver
     self._layer_names = list(network_params.keys())
-    self._block_structure = BLOCK_STRUCTURE_DICT[block_structure](network_params, self._layer_names, block_structure_init)
+    self._block_structure = BLOCK_STRUCTURE_DICT[block_structure](network_params, self._layer_names, block_structure_init, precond_rank)
     self._block_structure_name = block_structure
     # self._block_structure.make_blocks(network_params, model.layer_names)
     self._layer_apply = model.apply_block_from_params
@@ -120,8 +122,8 @@ class BasePreconditioner(abc.ABC):
         a, b, q_backward, r_backward, m_backward, final_q, final_lin_cost = operators
         cost = 0
         x = jnp.zeros(input_size)
-        # u_dict = self._block_structure.matrix_product_for_scan(_preconditioner, gradients, kernel_shapes)
-        u_dict = self._block_structure.matrix_product(_preconditioner, gradients)
+        # u_dict = self._block_structure.train_matrix_product_for_scan(_preconditioner, gradients, kernel_shapes)
+        u_dict = self._block_structure.train_matrix_product(_preconditioner, gradients)
         for i, layer_name in enumerate(self._layer_names):
           u, _ = ravel_pytree(u_dict[layer_name])
           cost += (x.T @ q_backward[-i - 1](x) + u.T @ r_backward[-i - 1](u)) / 2 + u.T @ m_backward[-i - 1](x)
@@ -213,7 +215,7 @@ class BasePreconditioner(abc.ABC):
         def lqr_cost(_preconditioner):
           cost = 0
           x = jnp.zeros(states[0].size)
-          u_dict = self._block_structure.matrix_product(_preconditioner, gradients)
+          u_dict = self._block_structure.train_matrix_product(_preconditioner, gradients)
           for i, layer_name in enumerate(self._layer_names):
             u, _ = ravel_pytree(u_dict[layer_name])
             cost += (x.T @ q_backward[-i - 1](x) + u.T @ r_backward[-i - 1](u)) / 2 + u.T @ m_backward[-i - 1](x)

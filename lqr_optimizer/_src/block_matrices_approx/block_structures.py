@@ -15,15 +15,17 @@ class BlockStructures(abc.ABC):
   def __init__(self,
                network_params,
                layer_names,
-               block_structure_init):
+               block_structure_init,
+               rank = None):
     """The abstract base class for all block structures.
 
     Attributes:
       block_structure_init: Initialization value for all blocks. Currently, only support 'identity'
     """
+    self.rank = rank
     if block_structure_init == 'identity':
       self._init_blocks = self.identity_block_init
-    self.blocks = self._make_blocks(network_params, layer_names)
+    self.blocks = self._make_blocks(network_params, layer_names, initialization=True)
 
     self.reinit_blocks = jax.jit(Partial(self._make_blocks, network_params, layer_names))
 
@@ -35,6 +37,15 @@ class BlockStructures(abc.ABC):
     block_clip_fn = Partial(jnp.clip, min=min_for_block, max=max_for_block)
     self.blocks = jax.tree_map(block_clip_fn, self.blocks)
 
+  def train_matrix_product(self,
+                     blocks,
+                     vectors,
+                     ):
+    """
+    Usually, same as train_matrix_product. Redefined by blocks using a memory
+    """
+    return self.matrix_product(blocks, vectors)
+
   @abc.abstractmethod
   def identity_block_init(self, shape:Optional[Tuple[int, ...]]) -> jnp.ndarray:
     """Initialize the blocks so that the matrix product function at initialization is equivalent to
@@ -44,7 +55,8 @@ class BlockStructures(abc.ABC):
   @abc.abstractmethod
   def _make_blocks(self,
                   network_params,
-                  layer_names
+                  layer_names,
+                  initialization = False,
                   ):
     """Create the preconditioner block for every layer. Can be used to impose structure to reduce memory usage.
        For example, by using a diagonal representation or a kronecker factorization"""
@@ -70,15 +82,17 @@ class DenseBlock(BlockStructures):
                network_params,
                layer_names,
                block_structure_init,
+               rank,
                ):
-    super().__init__(network_params, layer_names, block_structure_init)
+    super().__init__(network_params, layer_names, block_structure_init, rank)
 
   def identity_block_init(self, shape:Tuple[int, ...]) -> jnp.ndarray:
     return jnp.eye(*shape)
 
   def _make_blocks(self,
                   network_params,
-                  layer_names
+                  layer_names,
+                  initialization=False,
                   ):
     blocks = {layer_name: self._init_blocks((ravel_pytree(network_params[layer_name])[0].size,)*2)
                    for layer_name in layer_names}
@@ -101,15 +115,17 @@ class DiagonalBlock(BlockStructures):
                network_params,
                layer_names,
                block_structure_init,
+               rank,
                ):
-    super().__init__(network_params, layer_names, block_structure_init)
+    super().__init__(network_params, layer_names, block_structure_init, rank)
 
   def identity_block_init(self, shape:int) -> jnp.ndarray:
     return jnp.ones(shape)
 
   def _make_blocks(self,
                   network_params,
-                  layer_names
+                  layer_names,
+                  initialization=False,
                   ):
     blocks = {layer_name: self._init_blocks(ravel_pytree(network_params[layer_name])[0].size)
                    for layer_name in layer_names}
@@ -130,15 +146,17 @@ class ScalarBlock(BlockStructures):
                network_params,
                layer_names,
                block_structure_init,
+               rank,
                ):
-    super().__init__(network_params, layer_names, block_structure_init)
+    super().__init__(network_params, layer_names, block_structure_init, rank)
 
   def identity_block_init(self, shape) -> jnp.ndarray:
     return jnp.ones((1,))
 
   def _make_blocks(self,
                   network_params,
-                  layer_names
+                  layer_names,
+                  initialization=False,
                   ):
     blocks = {layer_name: self._init_blocks(None)
                    for layer_name in layer_names}
@@ -170,8 +188,8 @@ class KroneckerBlock(BlockStructures):
     - A diagonal approximation is applied (elementwise multiplication with a diagonal vector).
   """
 
-  def __init__(self, network_params, layer_names, block_structure_init):
-    super().__init__(network_params, layer_names, block_structure_init)
+  def __init__(self, network_params, layer_names, block_structure_init, rank):
+    super().__init__(network_params, layer_names, block_structure_init, rank)
 
   def identity_block_init(self, dim: int) -> jnp.ndarray:
     """Used for initializing Kronecker factors (as an identity matrix)."""
@@ -181,7 +199,7 @@ class KroneckerBlock(BlockStructures):
     """Used for initializing diagonal blocks (as a vector of ones)."""
     return jnp.ones((dim,))
 
-  def _make_blocks(self, network_params, layer_names):
+  def _make_blocks(self, network_params, layer_names, initialization=False):
     blocks = {}
     for layer_name in layer_names:
       flat_params = flatten_dict(network_params[layer_name])
@@ -201,9 +219,9 @@ class KroneckerBlock(BlockStructures):
           elif len(kernel.shape) == 4:
             # Convolution layer kernel: shape (k_h, k_w, in_channels, out_channels)
             k_h, k_w, cin, cout = kernel.shape
-            param_shape = kernel.shape
+            # param_shape = kernel.shape
             # Reshape the kernel to 2D: (k_h*k_w*cin, cout)
-            reshaped_kernel = kernel.reshape((k_h * k_w * cin, cout))
+            # reshaped_kernel = kernel.reshape((k_h * k_w * cin, cout))
             factor_A = self.identity_block_init(k_h * k_w * cin)
             factor_B = self.identity_block_init(cout)
             layer_blocks[key] = (factor_A, factor_B)
@@ -340,10 +358,10 @@ class DiagKroneckerBlock(KroneckerBlock):
   Bias parameters keep the same diagonal approximation as in KroneckerBlock.
   """
 
-  def __init__(self, network_params, layer_names, block_structure_init):
-    super().__init__(network_params, layer_names, block_structure_init)
+  def __init__(self, network_params, layer_names, block_structure_init, rank):
+    super().__init__(network_params, layer_names, block_structure_init, rank)
 
-  def _make_blocks(self, network_params, layer_names):
+  def _make_blocks(self, network_params, layer_names, initialization=False):
     """
     For kernels, store only the diagonal of the Kronecker factors:
 
@@ -463,4 +481,121 @@ class DiagKroneckerBlock(KroneckerBlock):
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
 
       product_dict[layer_name] = unflatten_dict(layer_product)
+    return product_dict
+
+##################################################################
+## Block Structures inspired by Sherman-Morrison-Woodbury formula
+##################################################################
+class LowRankBlockMemory(BlockStructures):
+  """
+  A per-layer block structure with two components:
+    1) A diagonal part (same as DiagonalBlock): shape (d,)
+    2) A scalar part (same as ScalarBlock): shape (1,)
+
+  Stored per layer as:
+    blocks[layer_name] = {
+      "diag":   <jnp.ndarray shape (d,)>,
+      "scalar": <jnp.ndarray shape (1,)>,
+    }
+
+  Notes:
+    - The scalar init can be configured to start at 1 or 0.
+    - matrix_product is intentionally left unimplemented (pass).
+  """
+
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank):
+
+    assert isinstance(rank, int), "rank must be an int"
+    self._memory = {l_name: {"diag": [], "scalar": 1.0} for l_name in layer_names}
+    super().__init__(network_params, layer_names, block_structure_init, rank)
+
+  # update rule now need to account for memory
+  def update_blocks(self, new_blocks, ema_decay=0):
+    """
+    Instead of updating `self.blocks`, push the incoming `new_blocks` into
+    `self.memory` with a FIFO replacement policy.
+
+    - `self.memory` is created on first call.
+    - For each layer, we maintain two FIFO lists: "diag" and "scalar".
+    - The length of each list is bounded by `self.rank`.
+    - `new_blocks[layer]` may contain only one of {"diag", "scalar"}; we only
+      append what is present.
+    """
+    if not hasattr(self, "rank"):
+      raise AttributeError("LowRankBlock must define `self.rank` to bound the FIFO memory.")
+
+    for layer_name, layer_new in new_blocks.items():
+      # Ensure per-layer containers exist
+      if layer_name not in self._memory:
+        self._memory[layer_name] = {"diag": [], "scalar": 1.0}
+
+      # `layer_new` is expected to be a dict that contains either "diag" or "scalar" (or both)
+      if "scalar" in layer_new:
+        self._memory[layer_name]["scalar"] = (layer_new["scalar"])
+
+      if "diag" in layer_new:
+        self._memory[layer_name]["diag"].append(layer_new["diag"])
+        # FIFO truncation
+        if len(self._memory[layer_name]["diag"]) > self.rank:
+          self._memory[layer_name]["diag"].pop(0)
+    self.blocks = self.reinit_blocks()
+
+  # --- Init helpers ---
+  def identity_block_init(self, shape: int) -> jnp.ndarray:
+    """Diagonal identity init: vector of ones."""
+    return jnp.ones((shape,))
+
+  def scalar_block_init(self,) -> jnp.ndarray:
+    """Scalar init: either 1 or 0, as shape (1,)."""
+    return jnp.ones((1,))
+
+  # --- Block construction ---
+  def _make_blocks(self,
+                   network_params,
+                   layer_names,
+                   initialization=False,):
+    blocks = {}
+    for layer_name in layer_names:
+      d = ravel_pytree(network_params[layer_name])[0].size
+      if initialization:
+        blocks[layer_name] = {
+          "scalar": self.scalar_block_init(),  # identical to ScalarBlock (init selectable)
+        }
+      else:
+        blocks[layer_name] = {
+          "diag": self._init_blocks(d),  # identical to DiagonalBlock
+        }
+    return blocks
+
+  # --- Product ---
+  def matrix_product(self, blocks, vectors):
+    """Ignore blocks, take memory only"""
+    product_dict = {}
+    for layer_name, block_vector in vectors.items():
+      flat_vector, unravel_fn = ravel_pytree(block_vector)
+      flat_vector = self._memory[layer_name]["scalar"] * flat_vector
+      for u in self._memory[layer_name]["diag"]:
+        flat_vector += u * jnp.dot(u, flat_vector)
+      product_dict[layer_name] = unravel_fn(flat_vector)
+
+    return product_dict
+
+  def train_matrix_product(self, blocks, vectors):
+    product_dict = {}
+    for layer_name, block_vector in vectors.items():
+      flat_vector, unravel_fn = ravel_pytree(block_vector)
+      flat_vector = self._memory[layer_name]["scalar"] * flat_vector
+      if "scalar" in blocks[layer_name]:
+        flat_vector = blocks[layer_name]["scalar"] * flat_vector
+      start = min(0, len(self._memory[layer_name]["diag"])-self.rank + 1)
+      for u in self._memory[layer_name]["diag"][start::]:
+        flat_vector += u * jnp.dot(u, flat_vector)
+        if "diag" in blocks[layer_name]:
+          flat_vector += blocks[layer_name]["diag"] * jnp.dot(blocks[layer_name]["diag"], flat_vector)
+      product_dict[layer_name] = unravel_fn(flat_vector)
+
     return product_dict
