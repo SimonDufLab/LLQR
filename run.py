@@ -246,6 +246,7 @@ def main(cfg: DictConfig):
     else:
       # Apply the preconditioner on the gradient
       precond_grads = preconditioner.apply(running_grads)
+      # print(utl.pytree_l2_norm(precond_grads) - utl.pytree_l2_norm(running_grads))
       new_state = state.apply_gradients(grads=precond_grads, normalize_conv_params=cfg.normalize_conv_params,
                                         batch_stats=new_model_state['batch_stats'])
 

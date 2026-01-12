@@ -510,8 +510,12 @@ class LowRankBlockMemory(BlockStructures):
                rank):
 
     assert isinstance(rank, int), "rank must be an int"
+    self._key = jax.random.PRNGKey(42)
     self._memory = {l_name: {"diag": [], "scalar": 1.0} for l_name in layer_names}
     super().__init__(network_params, layer_names, block_structure_init, rank)
+
+  def get_memory(self):
+    return {k:val['diag'] for k,val in self._memory.items()}
 
   # update rule now need to account for memory
   def update_blocks(self, new_blocks, ema_decay=0):
@@ -545,11 +549,12 @@ class LowRankBlockMemory(BlockStructures):
     self.blocks = self.reinit_blocks()
 
   # --- Init helpers ---
-  def identity_block_init(self, shape: int) -> jnp.ndarray:
-    """Diagonal identity init: vector of ones."""
-    return jnp.ones((shape,))
+  def diag_block_init(self, d: int) -> jnp.ndarray:
+    """Diagonal init: random small vectors."""
+    consumable, self._key = jax.random.split(self._key)
+    return jax.random.normal(consumable, (d,)) / jnp.sqrt(d)
 
-  def scalar_block_init(self,) -> jnp.ndarray:
+  def identity_block_init(self, shape: int) -> jnp.ndarray:
     """Scalar init: either 1 or 0, as shape (1,)."""
     return jnp.ones((1,))
 
@@ -561,14 +566,15 @@ class LowRankBlockMemory(BlockStructures):
     blocks = {}
     for layer_name in layer_names:
       d = ravel_pytree(network_params[layer_name])[0].size
-      if initialization:
-        blocks[layer_name] = {
-          "scalar": self.scalar_block_init(),  # identical to ScalarBlock (init selectable)
-        }
-      else:
-        blocks[layer_name] = {
-          "diag": self._init_blocks(d),  # identical to DiagonalBlock
-        }
+      ## Scaling identity init when training begin is unstable, removing
+      # if initialization:
+      #   blocks[layer_name] = {
+      #     "scalar": self.scalar_block_init(),  # identical to ScalarBlock (init selectable)
+      #   }
+      # else:
+      blocks[layer_name] = {
+        "diag": self.diag_block_init(d),  # identical to DiagonalBlock
+      }
     return blocks
 
   # --- Product ---
@@ -577,7 +583,7 @@ class LowRankBlockMemory(BlockStructures):
     product_dict = {}
     for layer_name, block_vector in vectors.items():
       flat_vector, unravel_fn = ravel_pytree(block_vector)
-      flat_vector = self._memory[layer_name]["scalar"] * flat_vector
+      # flat_vector = self._memory[layer_name]["scalar"] * flat_vector
       for u in self._memory[layer_name]["diag"]:
         flat_vector += u * jnp.dot(u, flat_vector)
       product_dict[layer_name] = unravel_fn(flat_vector)
@@ -588,14 +594,14 @@ class LowRankBlockMemory(BlockStructures):
     product_dict = {}
     for layer_name, block_vector in vectors.items():
       flat_vector, unravel_fn = ravel_pytree(block_vector)
-      flat_vector = self._memory[layer_name]["scalar"] * flat_vector
-      if "scalar" in blocks[layer_name]:
-        flat_vector = blocks[layer_name]["scalar"] * flat_vector
-      start = min(0, len(self._memory[layer_name]["diag"])-self.rank + 1)
+      # flat_vector = self._memory[layer_name]["scalar"] * flat_vector
+      # if "scalar" in blocks[layer_name]:
+      #   flat_vector = blocks[layer_name]["scalar"] * flat_vector
+      start = max(0, len(self._memory[layer_name]["diag"])-self.rank + 1)
       for u in self._memory[layer_name]["diag"][start::]:
         flat_vector += u * jnp.dot(u, flat_vector)
-        if "diag" in blocks[layer_name]:
-          flat_vector += blocks[layer_name]["diag"] * jnp.dot(blocks[layer_name]["diag"], flat_vector)
+      if "diag" in blocks[layer_name]:
+        flat_vector += blocks[layer_name]["diag"] * jnp.dot(blocks[layer_name]["diag"], flat_vector)
       product_dict[layer_name] = unravel_fn(flat_vector)
 
     return product_dict

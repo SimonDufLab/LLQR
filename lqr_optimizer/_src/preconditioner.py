@@ -78,9 +78,14 @@ class BasePreconditioner(abc.ABC):
     return self._jit_apply_fn(self._block_structure.blocks, update)
 
   def get_stats(self):
-    precond_max, precond_min = pytree_max_min(self._block_structure.blocks)
-    precond_norm = pytree_l2_norm(self._block_structure.blocks)
-    per_layer_norm = get_per_layer_norm(self._block_structure.blocks)
+    if hasattr(self._block_structure, "_memory"):
+      precond_max, precond_min = pytree_max_min(self._block_structure.get_memory())
+      precond_norm = pytree_l2_norm(self._block_structure.get_memory())
+      per_layer_norm = get_per_layer_norm(self._block_structure.get_memory())
+    else:
+      precond_max, precond_min = pytree_max_min(self._block_structure.blocks)
+      precond_norm = pytree_l2_norm(self._block_structure.blocks)
+      per_layer_norm = get_per_layer_norm(self._block_structure.blocks)
     return precond_max, precond_min, precond_norm, per_layer_norm
 
   def _get_evaluate_lqr(self, optax_solver=None, steps=1, batch_solve_precond=True, multibatch=False, precond_on_update=False):
