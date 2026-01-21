@@ -605,3 +605,53 @@ class LowRankBlockMemory(BlockStructures):
       product_dict[layer_name] = unravel_fn(flat_vector)
 
     return product_dict
+
+class LowRankBlockMemoryAsym(LowRankBlockMemory):
+  """
+  Asymmetric version of LowRankBlockMemory
+  """
+
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank):
+    super().__init__(network_params, layer_names, block_structure_init, rank)
+
+  # --- Block construction ---
+  def _make_blocks(self,
+                   network_params,
+                   layer_names,
+                   initialization=False,):
+    blocks = {}
+    for layer_name in layer_names:
+      d = ravel_pytree(network_params[layer_name])[0].size
+      blocks[layer_name] = {
+        "diag": (self.diag_block_init(d), self.diag_block_init(d)),  # identical to DiagonalBlock
+      }
+    return blocks
+
+  # --- Product ---
+  def matrix_product(self, blocks, vectors):
+    """Ignore blocks, take memory only"""
+    product_dict = {}
+    for layer_name, block_vector in vectors.items():
+      flat_vector, unravel_fn = ravel_pytree(block_vector)
+      for u, v in self._memory[layer_name]["diag"]:
+        flat_vector += u * jnp.dot(v, flat_vector)
+      product_dict[layer_name] = unravel_fn(flat_vector)
+
+    return product_dict
+
+  def train_matrix_product(self, blocks, vectors):
+    product_dict = {}
+    for layer_name, block_vector in vectors.items():
+      flat_vector, unravel_fn = ravel_pytree(block_vector)
+      start = max(0, len(self._memory[layer_name]["diag"])-self.rank + 1)
+      for u, v in self._memory[layer_name]["diag"][start::]:
+        flat_vector += u * jnp.dot(u, flat_vector)
+      if "diag" in blocks[layer_name]:
+        flat_vector += blocks[layer_name]["diag"][0] * jnp.dot(blocks[layer_name]["diag"][1], flat_vector)
+      product_dict[layer_name] = unravel_fn(flat_vector)
+
+    return product_dict

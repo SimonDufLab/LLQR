@@ -21,7 +21,8 @@ BLOCK_STRUCTURE_DICT = {
   'scalar': block_structures.ScalarBlock,
   'kfac': block_structures.KroneckerBlock,
   'diag-kfac': block_structures.DiagKroneckerBlock,
-  'low-rank-memory': block_structures.LowRankBlockMemory
+  'low-rank-memory': block_structures.LowRankBlockMemory,
+  'low-rank-memory-asym': block_structures.LowRankBlockMemoryAsym
 }
 
 class BasePreconditioner(abc.ABC):
