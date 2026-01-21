@@ -1152,6 +1152,116 @@ def warmup_piecewise_decay_schedule(
 
 
 ##################################
+# Measuring matrix asymmetry
+##################################
+def _check_square(A: jnp.ndarray):
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError(
+            f"Expected a square matrix, got shape {A.shape}."
+        )
+
+
+@jax.jit
+def rel_skew_energy_fro_vs_sym(A: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    """
+    Relative skew-energy using Frobenius norms, reporting skew vs symmetric part:
+        ||S||_F / (||H||_F + eps)
+    where H = (A + A^T)/2, S = (A - A^T)/2.
+    """
+    H = 0.5 * (A + A.T)
+    S = 0.5 * (A - A.T)
+    return jnp.linalg.norm(S, ord="fro") / (jnp.linalg.norm(H, ord="fro") + eps)
+
+
+def _spectral_norm_power_iteration(
+    M: jnp.ndarray, iters: int = 25, eps: float = 1e-12
+) -> jnp.ndarray:
+    """
+    Estimates ||M||_2 (largest singular value) via power iteration on M^T M.
+    Deterministic initialization (all-ones vector) to avoid RNG in the signature.
+    """
+    n = M.shape[1]
+    v0 = jnp.ones((n,), dtype=M.dtype)
+    v0 = v0 / (jnp.linalg.norm(v0, ord=2) + eps)
+
+    def body(v, _):
+        v = M.T @ (M @ v)
+        v = v / (jnp.linalg.norm(v, ord=2) + eps)
+        return v, None
+
+    v, _ = jax.lax.scan(body, v0, xs=None, length=iters)
+    return jnp.linalg.norm(M @ v, ord=2)
+
+
+@jax.jit
+def rel_skew_operator_norm(
+    A: jnp.ndarray, iters: int = 25, eps: float = 1e-12
+) -> jnp.ndarray:
+    """
+    Relative skew measured in operator (induced 2-) norm:
+        ||A - A^T||_2 / (||A||_2 + eps)
+    with ||·||_2 estimated by power iteration.
+    """
+    D = A - A.T
+    num = _spectral_norm_power_iteration(D, iters=iters, eps=eps)
+    den = _spectral_norm_power_iteration(A, iters=iters, eps=eps)
+    return num / (den + eps)
+
+
+def report_skews(A: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  _check_square(A)
+
+  frob_skew = rel_skew_energy_fro_vs_sym(A)
+  spectral_skew = rel_skew_operator_norm(A)
+  return frob_skew, spectral_skew
+
+
+def get_per_layer_skews(precond):
+  skews_dict = {}
+  for _layer, _block in precond.items():
+    layer_skews = []
+    for leaf in jax.tree_leaves(_block):
+      if leaf.ndim == 2:
+        layer_skews.append(report_skews(leaf))
+    skews_dict[_layer] = layer_skews
+
+  return skews_dict
+
+def average_skews(
+        skews_dict: Dict[str, List[Tuple[jnp.ndarray, jnp.ndarray]]],
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """
+  Averages Frobenius and spectral skews across all leaves in skews_dict.
+
+  Args:
+    skews_dict: {layer: [(frob_skew, spectral_skew), ...], ...}
+    eps: numerical guard in case no leaves are present.
+
+  Returns:
+    (avg_frob_skew, avg_spectral_skew)
+  """
+  frob_vals = []
+  spectral_vals = []
+
+  for layer_skews in skews_dict.values():
+    for frob_skew, spectral_skew in layer_skews:
+      frob_vals.append(frob_skew)
+      spectral_vals.append(spectral_skew)
+
+  if len(frob_vals) == 0:
+    # No valid leaves: return zeros with correct dtype semantics
+    zero = jnp.array(0.0)
+    return zero, zero
+
+  frob_stack = jnp.stack(frob_vals)
+  spectral_stack = jnp.stack(spectral_vals)
+
+  avg_frob = jnp.mean(frob_stack)
+  avg_spectral = jnp.mean(spectral_stack)
+
+  return avg_frob, avg_spectral
+
+##################################
 # "Trick" utils
 ##################################
 def normalize_conv_params_l2(params):

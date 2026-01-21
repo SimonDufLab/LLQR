@@ -29,6 +29,7 @@ normalize_grad_for_lqr: false
 normalize_conv_params: false
 allow_grad_inversion: false
 use_preconditioner: true
+measure_asymmetry: false
 
 divergence: ngd
 divergence_order_param: 0.5

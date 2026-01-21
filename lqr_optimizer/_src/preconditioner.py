@@ -10,7 +10,7 @@ from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
 from lqr_optimizer._src.utils.utils import (normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm,
-                                            get_per_layer_norm, _deep_copy_pytree, infer_batch_layout)
+                                            get_per_layer_norm, _deep_copy_pytree, infer_batch_layout, get_per_layer_skews)
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints,
                              lqr_backward_matrices_and_adjoints)
@@ -87,6 +87,14 @@ class BasePreconditioner(abc.ABC):
       precond_norm = pytree_l2_norm(self._block_structure.blocks)
       per_layer_norm = get_per_layer_norm(self._block_structure.blocks)
     return precond_max, precond_min, precond_norm, per_layer_norm
+
+  def get_precond_asymmetry(self):
+    if hasattr(self._block_structure, "_memory"):
+      skews = get_per_layer_skews(self._block_structure.get_memory())
+    else:
+      skews = get_per_layer_skews(self._block_structure.blocks)
+    return skews
+
 
   def _get_evaluate_lqr(self, optax_solver=None, steps=1, batch_solve_precond=True, multibatch=False, precond_on_update=False):
     def compute_loss(_params, _other_model_variables, x, y):

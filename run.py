@@ -303,6 +303,34 @@ def main(cfg: DictConfig):
         run.track(l_norm, name=f"{layer} l2 norm", step=step)
       print(f"Preconditioner was updated in {time.time()-precond_update_start_time:.2f} seconds")
 
+      # Asymmetry check
+      if cfg.measure_asymmetry:
+        skews_dict = preconditioner.get_precond_asymmetry()
+        for layer, layer_skews in skews_dict.items():
+          # layer_skews: List[Tuple[frob, spectral]]
+          if len(layer_skews) == 0:
+            continue
+
+          if len(layer_skews) == 1:
+            frob_skew, spectral_skew = layer_skews[0]
+            run.track(frob_skew, name=f"{layer}/frob skew", step=step)
+            run.track(spectral_skew, name=f"{layer}/spectral skew", step=step)
+          else:
+            for i, (frob_skew, spectral_skew) in enumerate(layer_skews, start=1):
+              run.track(
+                frob_skew,
+                name=f"{layer}/part {i}/frob skew",
+                step=step,
+              )
+              run.track(
+                spectral_skew,
+                name=f"{layer}/part {i}/spectral skew",
+                step=step,
+              )
+        avg_frob_skew, avg_spectral_skew = utl.average_skews(skews_dict)
+        run.track(avg_frob_skew, name="Average frob skew across preconditioner", step=step)
+        run.track(avg_spectral_skew, name="Average spectral skew across preconditioner", step=step)
+
     # Grab the next batch for normal training
     # x_batch, y_batch = next(dataloader)
     #
