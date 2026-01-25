@@ -20,6 +20,9 @@ model_choice = {
 divergence_choice = {
   "ngd": divergence.ngd_divergence_f,
   "renyi": divergence.renyi_divergence,
+  "renyi_inf": divergence.renyi_inf,
+  "renyi_zero": divergence.renyi_zero,
+  "reverse_kl": divergence.reverse_kl,
   "newton": None, # special case where we linearize the known loss function grad to retrieve the final Q of the LQR
 }
 

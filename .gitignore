@@ -156,6 +156,7 @@ py310jax_tf/*
 
 # Custom folder for local csv
 aim_csv/
+aim_mnist/
 
 # Any generated figures
 *.pdf
