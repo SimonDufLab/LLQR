@@ -20,7 +20,7 @@ model_choice = {
 divergence_choice = {
   "ngd": divergence.ngd_divergence_f,
   "renyi": divergence.renyi_divergence,
-  "neg_renyi": divergence.negative_renyi_divergence,
+  "stable_renyi": divergence.renyi_divergence_stable,
   "renyi_inf": divergence.renyi_inf,
   "renyi_zero": divergence.renyi_zero,
   "renyi_2": divergence.renyi_two,

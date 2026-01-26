@@ -1,6 +1,8 @@
 """ Contain main divergence functions that give rise to specific steepest descent methods like NGD and Newton's descent"""
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import logsumexp
+
 
 # Divergence function (for NGD):
 def ngd_divergence_f(px, px_):
@@ -9,13 +11,13 @@ def ngd_divergence_f(px, px_):
   return (-jnp.exp(px) * px_).sum()
 
 def renyi_divergence(px, px_, order=1/2):
-  # return (1/order-1) * jnp.log((jnp.exp(px)**order / (jnp.exp(px_)**(order-1) + 1e-12)).sum())
+  # return 1/(order-1) * jnp.log((jnp.exp(px)**order / (jnp.exp(px_)**(order-1) + 1e-12)).sum())
   # More stable under exponentiation
-  return (1/order-1) * jnp.log(((jnp.exp(px)/(jnp.exp(px_)))**(order-1) * jnp.exp(px)).sum())
-  # return (1 / order - 1) * jnp.log(((jnp.exp(px) / (jnp.exp(px_))) ** (order - 1) * jnp.exp(px)).sum())
+  return 1/(order-1) * jnp.log(((jnp.exp(px)/(jnp.exp(px_)))**(order-1) * jnp.exp(px)).sum())
 
-def negative_renyi_divergence(px, px_, order=1/2): # This should not work...
-  return -(1/order-1) * jnp.log(((jnp.exp(px)/(jnp.exp(px_)))**(order-1) * jnp.exp(px)).sum())
+def renyi_divergence_stable(px, px_, order=1/2):
+  z = order * px - (order - 1.0) * px_
+  return 1.0 / (order - 1.0) * logsumexp(z)
 
 # Special case of renyi when order tend to infinity
 def renyi_inf(px, px_):
