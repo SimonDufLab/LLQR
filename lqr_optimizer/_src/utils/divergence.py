@@ -14,6 +14,9 @@ def renyi_divergence(px, px_, order=1/2):
   return (1/order-1) * jnp.log(((jnp.exp(px)/(jnp.exp(px_) + 1e-12))**(order-1) * jnp.exp(px)).sum())
   # return (1 / order - 1) * jnp.log(((jnp.exp(px) / (jnp.exp(px_))) ** (order - 1) * jnp.exp(px)).sum())
 
+def negative_renyi_divergence(px, px_, order=1/2):
+  return -(1/order-1) * jnp.log(((jnp.exp(px)/(jnp.exp(px_) + 1e-12))**(order-1) * jnp.exp(px)).sum())
+
 # Special case of renyi when order tend to infinity
 def renyi_inf(px, px_):
   return jnp.log(jnp.max(jnp.exp(px)/(jnp.exp(px_) + 1e-12)))
