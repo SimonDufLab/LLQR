@@ -23,6 +23,8 @@ divergence_choice = {
   "neg_renyi": divergence.negative_renyi_divergence,
   "renyi_inf": divergence.renyi_inf,
   "renyi_zero": divergence.renyi_zero,
+  "renyi_2": divergence.renyi_two,
+  "renyi_half": divergence.renyi_half,
   "reverse_kl": divergence.reverse_kl,
   "newton": None, # special case where we linearize the known loss function grad to retrieve the final Q of the LQR
 }
