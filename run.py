@@ -187,6 +187,7 @@ def main(cfg: DictConfig):
     trainstate_solver=state.tx,
     preconditioner_update_steps=cfg.precond_steps,
     precond_rank = cfg.precond_rank,
+    precond_identity_scaling = cfg.precond_identity_scaling,
     batch_solve_precond=cfg.batch_solve_precond,
     multibatch=cfg.multibatch_training,
     precond_on_update=cfg.precond_on_update,

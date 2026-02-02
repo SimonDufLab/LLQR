@@ -29,7 +29,10 @@ def renyi_zero(px, px_):
 
 # Special case when order is 2
 def renyi_two(px, px_):
-  return jnp.log(jnp.average(jnp.exp(px)/(jnp.exp(px_)), weights=px))
+  return jnp.log(jnp.average(jnp.exp(px)/(jnp.exp(px_)), weights=px)) #TODO: should be `weights=jnp.exp(px)`, surprising that it works
+
+def renyi_surrogate(px, px_, order=2): # TODO: If we double down on above
+  return (1/(order-1)) * jnp.log(jnp.average((jnp.exp(px)/(jnp.exp(px_)))**(order-1), weights=px)) #TODO: should be `weights=jnp.exp(px)`
 
 # Special case when order is 0.5
 def renyi_half(px, px_):

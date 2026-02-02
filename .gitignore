@@ -160,6 +160,7 @@ aim_mnist/
 
 # Any generated figures
 *.pdf
+figures/
 
 # Any locallly saved training data
 data/

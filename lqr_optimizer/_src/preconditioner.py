@@ -37,6 +37,7 @@ class BasePreconditioner(abc.ABC):
                trainstate_solver,
                preconditioner_update_steps,
                precond_rank,
+               precond_identity_scaling,
                batch_solve_precond: bool = True,
                multibatch: bool = False,
                precond_on_update: bool =False,
@@ -51,7 +52,9 @@ class BasePreconditioner(abc.ABC):
     self._optax_solver = optax_solver
     self._trainstate_solver = trainstate_solver
     self._layer_names = list(network_params.keys())
-    self._block_structure = BLOCK_STRUCTURE_DICT[block_structure](network_params, self._layer_names, block_structure_init, precond_rank)
+    self._block_structure = BLOCK_STRUCTURE_DICT[block_structure](network_params, self._layer_names,
+                                                                  block_structure_init, rank=precond_rank,
+                                                                  identity_scale=precond_identity_scaling)
     self._block_structure_name = block_structure
     # self._block_structure.make_blocks(network_params, model.layer_names)
     self._layer_apply = model.apply_block_from_params
