@@ -1041,6 +1041,7 @@ def cosine_annealing_schedule_per_epoch(
         steps_per_epoch: float,
         t_max: int,
         eta_min: float = 0.0,
+        cycle: bool = True, # Whether we cycle through lr after t_max is reached, or fix lr to eta_min.
 ) -> optax.Schedule:
   """
   Optax-compatible schedule that mimics PyTorch's CosineAnnealingLR
@@ -1061,12 +1062,17 @@ def cosine_annealing_schedule_per_epoch(
     raise ValueError(f"steps_per_epoch must be positive, got {steps_per_epoch}")
   step_max = steps_per_epoch * t_max
 
-  def schedule(step_count):
-    # t = jnp.floor_divide(step_count, steps_per_epoch).astype(jnp.float32)
-    t = step_count
-    # t = jnp.minimum(t, t_max)  # TODO: double check, but it seems that Pytorch implementation use warm restart ie lr grows back after t_max
-    cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / step_max))
-    return eta_min + (base_lr - eta_min) * cosine_decay
+  if cycle:
+    def schedule(t):
+      # t = jnp.floor_divide(step_count, steps_per_epoch).astype(jnp.float32)
+      # t = jnp.minimum(t, t_max)
+      cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / step_max))
+      return eta_min + (base_lr - eta_min) * cosine_decay
+  else:
+    def schedule(t):
+      t = jnp.minimum(t, t_max)
+      cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / step_max))
+      return eta_min + (base_lr - eta_min) * cosine_decay
 
   return schedule
 

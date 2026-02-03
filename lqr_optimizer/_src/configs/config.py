@@ -1,4 +1,5 @@
 """Simple dictionary file to match string identifiers to the desired output"""
+from jax.tree_util import Partial
 from lqr_optimizer._src.models.mlp import create_mlp
 from lqr_optimizer._src.models.resnet import create_resnet18, create_resnet50
 from lqr_optimizer._src.models.grok_model import create_grok_model
@@ -31,6 +32,7 @@ divergence_choice = {
 
 lr_schedule_choice = {
   "cosine_annealing": cosine_annealing_schedule_per_epoch,
+  "cosine_decay_with_floor": Partial(cosine_annealing_schedule_per_epoch, cycle=False),
   "warmup_cosine_decay": warmup_cosine_annealing_schedule,
   "step_warmup": step_warmup,
   "linear": linear_schedule,
