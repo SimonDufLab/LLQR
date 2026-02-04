@@ -1035,7 +1035,7 @@ def signal_handler(signum: int, frame: Optional[
   ##################################
   # Hyperparam utils
   ##################################
-def cosine_annealing_schedule_per_epoch(
+def cosine_annealing_schedule_per_epoch( #TODO: rename, not per epoch anymore
         base_lr: float,
         total_epochs: int,
         steps_per_epoch: float,
@@ -1066,11 +1066,12 @@ def cosine_annealing_schedule_per_epoch(
     def schedule(t):
       # t = jnp.floor_divide(step_count, steps_per_epoch).astype(jnp.float32)
       # t = jnp.minimum(t, t_max)
+      # cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / t_max))
       cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / step_max))
       return eta_min + (base_lr - eta_min) * cosine_decay
   else:
     def schedule(t):
-      t = jnp.minimum(t, t_max)
+      t = jnp.minimum(t, step_max)
       cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / step_max))
       return eta_min + (base_lr - eta_min) * cosine_decay
 
