@@ -22,7 +22,8 @@ BLOCK_STRUCTURE_DICT = {
   'kfac': block_structures.KroneckerBlock,
   'diag-kfac': block_structures.DiagKroneckerBlock,
   'low-rank-memory': block_structures.LowRankBlockMemory,
-  'low-rank-memory-asym': block_structures.LowRankBlockMemoryAsym
+  'low-rank-memory-asym': block_structures.LowRankBlockMemoryAsym,
+  'sym_swm_kfac': block_structures.Sym_SWM_KFAC
 }
 
 class BasePreconditioner(abc.ABC):
@@ -401,7 +402,7 @@ class BasePreconditioner(abc.ABC):
             return x
 
       acc_batches = jax.tree_util.tree_map(clip_fn, acc_batches)
-      if self._warm_start_precond:
+      if self._warm_start_precond and not hasattr(self._block_structure, "_memory"):
         _blocks = self._block_structure.blocks
       else:
         _blocks = self._block_structure.reinit_blocks()

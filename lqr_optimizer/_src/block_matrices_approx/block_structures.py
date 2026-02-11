@@ -1,5 +1,5 @@
 import abc
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any
 import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
@@ -670,3 +670,160 @@ class LowRankBlockMemoryAsym(LowRankBlockMemory):
       product_dict[layer_name] = unravel_fn(flat_vector)
 
     return product_dict
+
+
+@jax.jit
+def sherman_morrison_rank1(
+    inv_matrix: jnp.ndarray,
+    vectors: Tuple[jnp.ndarray, jnp.ndarray],
+    eps: float = 1e-8,
+) -> jnp.ndarray:
+    """
+    Compute (A + u v^T)^(-1) from A^(-1) via Sherman–Morrison, with epsilon-stabilized denom.
+
+    Supports:
+      - inv_matrix shape (n, n): dense A^{-1}
+      - inv_matrix shape (n,): interpreted as diagonal A^{-1} (i.e., diag(inv_matrix))
+
+    Args:
+        inv_matrix: A_inv, shape (n,n) or (n,)
+        vectors: (u, v) with shape (n,) or (n,1)
+        eps: small stabilization constant for the denominator
+
+    Returns:
+        Updated inverse (dense), shape (n, n)
+    """
+    Ainv = inv_matrix
+    u, v = vectors
+    u = jnp.reshape(u, (-1,))
+    v = jnp.reshape(v, (-1,))
+
+    # Promote diagonal representation to dense (note: rank-1 update yields dense inverse in general)
+    # This creates a dense matrix to capture second order moment and bias and norm param # TODO is it better to stick with vector approximation?
+    # Ainv = jnp.diag(inv_matrix) if inv_matrix.ndim == 1 else inv_matrix
+
+    Au = Ainv @ u             # (n,)
+    vA = v @ Ainv             # (n,)
+    denom = 1.0 + (v @ Au)    # ()
+
+    # Epsilon-stabilize denom to avoid division by ~0
+    sign = jnp.where(denom >= 0, 1.0, -1.0)
+    denom_safe = jnp.where(jnp.abs(denom) < eps, denom + (sign * eps), denom)
+
+    return Ainv - jnp.outer(Au, vA) / denom_safe
+
+
+def upgrade_1d_leaves_to_diag(pytree: Any) -> Any:
+  """
+  Traverse a pytree and replace every 1D array leaf (shape (n,)) with jnp.diag(leaf) (shape (n, n)).
+  Non-array leaves and arrays with ndim != 1 are returned unchanged.
+  """
+
+  def f(leaf: Any) -> Any:
+    if isinstance(leaf, jnp.ndarray) and leaf.ndim == 1:
+      return jnp.diag(leaf)
+    return leaf
+
+  return jax.tree_map(f, pytree)
+
+
+class Sym_SWM_KFAC(KroneckerBlock):
+  """Shermann-Woodbury-Morisson KFAC structure
+  Kronecker structure for the preconditioner, but with rank-one update"""
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank=None,
+               identity_scale=1.0,
+               ):
+
+    self._key = jax.random.PRNGKey(42)
+    self._identity_scale = identity_scale
+    self._memory = upgrade_1d_leaves_to_diag(super()._make_blocks(network_params, layer_names, initialization=True))  # Memory initialized to identity
+    super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
+
+  def get_memory(self):
+    return self._memory
+
+  def matrix_product(self, blocks, vectors): # Only use memory outside of training.
+    # return super().train_matrix_product(self._memory, vectors)
+    """Same as kfac, but ignore blocks, use memory instead"""
+    product_dict = {}
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = self._memory[layer_name]
+      layer_product = {}
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          factor_A, factor_B = layer_blocks[component]
+          # Reshape the gradient vector according to the component type
+          vector_matrix = vec_component
+          vm_shape = vector_matrix.shape
+          if len(vm_shape) == 4:
+            k_h, k_w, cin, cout = vm_shape
+            vector_matrix = vector_matrix.reshape((k_h * k_w * cin, cout))
+          product_matrix = jnp.einsum('mk,kn,rn->mr', factor_A, vector_matrix, factor_B)
+          layer_product[component] = product_matrix.reshape(vm_shape)
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          # rank-1 update
+          flat_product = diag @ vec_component
+          layer_product[component] = flat_product
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+      product_dict[layer_name] = unflatten_dict(layer_product)
+    return product_dict
+
+  def diag_block_init(self, d: int) -> jnp.ndarray:
+    """Diagonal init: random small vectors."""
+    consumable, self._key = jax.random.split(self._key)
+    return self._identity_scale * jax.random.normal(consumable, (d,)) / jnp.sqrt(d)
+
+  def _make_blocks(self,
+                   network_params,
+                   layer_names,
+                   initialization=False,):
+    def pytee_init(leaf):
+      d = leaf.shape[0]
+      return self.diag_block_init(d)
+    # blocks = {}
+    # for layer_name in layer_names:
+    #   for key, struc in self._memory[layer_name].items():
+    #     d = struc.shape[0] # struct is either a square matrix or a vector
+    #     blocks[layer_name][key] = self.diag_block_init(d)  # identical to DiagonalBlock
+    # return blocks
+    return jax.tree_map(pytee_init, self._memory)
+
+  def sym_shermann_morisson_update(self, u):
+    return jax.tree_map(lambda A, x: sherman_morrison_rank1(A, (x, x)), self._memory, u)
+
+  def train_matrix_product(self, blocks, vectors):
+    blocks = self.sym_shermann_morisson_update(blocks)
+    product_dict = {}
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          factor_A, factor_B = layer_blocks[component]
+          # Reshape the gradient vector according to the component type
+          vector_matrix = vec_component
+          vm_shape = vector_matrix.shape
+          if len(vm_shape) == 4:
+            k_h, k_w, cin, cout = vm_shape
+            vector_matrix = vector_matrix.reshape((k_h * k_w * cin, cout))
+          product_matrix = jnp.einsum('mk,kn,rn->mr', factor_A, vector_matrix, factor_B)
+          layer_product[component] = product_matrix.reshape(vm_shape)
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          # Now a matrix with rank-1 update, not a vector anymore
+          flat_product = diag @ vec_component
+          layer_product[component] = flat_product
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+      product_dict[layer_name] = unflatten_dict(layer_product)
+    return product_dict
+
+  def update_blocks(self, new_blocks, ema_decay=0):
+    self._memory = self.sym_shermann_morisson_update(new_blocks)
+    self.blocks = self.reinit_blocks()
