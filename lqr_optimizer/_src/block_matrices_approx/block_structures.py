@@ -708,7 +708,7 @@ def sherman_morrison_rank1(
 
     # Epsilon-stabilize denom to avoid division by ~0
     sign = jnp.where(denom >= 0, 1.0, -1.0)
-    denom_safe = jnp.where(jnp.abs(denom) < eps, denom + (sign * eps), denom)
+    denom_safe = jnp.where(jnp.abs(denom) < eps, sign * eps, denom)
 
     return Ainv - jnp.outer(Au, vA) / denom_safe
 
@@ -786,19 +786,14 @@ class Sym_SWM_KFAC(KroneckerBlock):
     def pytee_init(leaf):
       d = leaf.shape[0]
       return self.diag_block_init(d)
-    # blocks = {}
-    # for layer_name in layer_names:
-    #   for key, struc in self._memory[layer_name].items():
-    #     d = struc.shape[0] # struct is either a square matrix or a vector
-    #     blocks[layer_name][key] = self.diag_block_init(d)  # identical to DiagonalBlock
-    # return blocks
     return jax.tree_map(pytee_init, self._memory)
 
-  def sym_shermann_morisson_update(self, u):
+  def _shermann_morisson_update(self, u):
+    """Symmetric version"""
     return jax.tree_map(lambda A, x: sherman_morrison_rank1(A, (x, x)), self._memory, u)
 
   def train_matrix_product(self, blocks, vectors):
-    blocks = self.sym_shermann_morisson_update(blocks)
+    blocks = self._shermann_morisson_update(blocks)
     product_dict = {}
     for layer_name, layer_vectors in vectors.items():
       layer_blocks = blocks[layer_name]
@@ -825,5 +820,56 @@ class Sym_SWM_KFAC(KroneckerBlock):
     return product_dict
 
   def update_blocks(self, new_blocks, ema_decay=0):
-    self._memory = self.sym_shermann_morisson_update(new_blocks)
+    self._memory = self._shermann_morisson_update(new_blocks)
     self.blocks = self.reinit_blocks()
+
+
+class Asym_SWM_KFAC(Sym_SWM_KFAC):
+  """Shermann-Woodbury-Morisson KFAC structure - -asymmetric version
+  Kronecker structure for the preconditioner, but with rank-one update"""
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank=None,
+               identity_scale=1.0,
+               ):
+    super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
+
+  def _make_blocks(self,
+                   network_params,
+                   layer_names,
+                   initialization=False, ):
+    def pytee_init(leaf):
+      d = leaf.shape[0]
+      return self.diag_block_init(d), self.diag_block_init(d)
+
+    return jax.tree_map(pytee_init, self._memory)
+
+  def _shermann_morisson_update(self, uv):
+    """asymmetric version"""
+    # print(jax.tree_map(jnp.shape, uv))
+    # is_tuple_leaf = lambda x: isinstance(x, tuple)
+    # u = jax.tree_map(lambda t: t[0], uv, is_leaf=is_tuple_leaf)
+    # v = jax.tree_map(lambda t: t[1], uv, is_leaf=is_tuple_leaf)
+    #
+    # print(jax.tree_map(jnp.shape, u))
+    # print(jax.tree_map(jnp.shape, v))
+    def _select_pair(t, i: int):
+      """Recursively pick element i from nested (len-2) tuple pairs."""
+      if not (isinstance(t, tuple) and len(t) == 2):
+        raise TypeError(f"Expected a length-2 tuple, got {type(t)}")
+      a, b = t
+
+      # Base case: (array, array)  -> pick one
+      if not (isinstance(a, tuple) and len(a) == 2) and not (isinstance(b, tuple) and len(b) == 2):
+        return t[i]
+
+      # Nested case: ((..., ...), (..., ...)) -> recurse, preserving structure
+      return (_select_pair(a, i), _select_pair(b, i))
+
+    is_pair = lambda x: isinstance(x, tuple) and len(x) == 2
+
+    u = jax.tree_map(lambda t: _select_pair(t, 0), uv, is_leaf=is_pair)
+    v = jax.tree_map(lambda t: _select_pair(t, 1), uv, is_leaf=is_pair)
+    return jax.tree_map(lambda A, x, y: sherman_morrison_rank1(A, (x, y)), self._memory, u, v)

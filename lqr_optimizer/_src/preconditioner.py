@@ -23,7 +23,8 @@ BLOCK_STRUCTURE_DICT = {
   'diag-kfac': block_structures.DiagKroneckerBlock,
   'low-rank-memory': block_structures.LowRankBlockMemory,
   'low-rank-memory-asym': block_structures.LowRankBlockMemoryAsym,
-  'sym_swm_kfac': block_structures.Sym_SWM_KFAC
+  'sym_swm_kfac': block_structures.Sym_SWM_KFAC,
+  'asym_swm_kfac': block_structures.Asym_SWM_KFAC,
 }
 
 class BasePreconditioner(abc.ABC):
