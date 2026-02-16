@@ -3,6 +3,7 @@ import time
 import os
 import pickle
 import signal
+from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -14,6 +15,7 @@ import tensorflow_datasets as tfds
 import flax.linen as nn
 from flax.linen import Sequential
 from flax.core.frozen_dict import FrozenDict
+from flax import struct
 from flax.training import train_state
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -684,7 +686,7 @@ def compute_accuracy_and_loss(state, dataloader):
  # Prepare the train state for the model parameters
   # (Using Flax's train_state for convenience)
 class TrainState(train_state.TrainState):
-  apply_inf_fn: Callable
+  apply_inf_fn: Callable = struct.field(pytree_node=False)
   batch_stats: Any
 
   def apply_gradients(self, *, grads, normalize_conv_params=False, **kwargs):
@@ -859,6 +861,24 @@ def infer_batch_layout(batch): # TODO: potentially not robust, might be preferab
 
     # CV fallback: batch axis is 0 (x: [B, ...], y: [B] or [B, ...])
     return layout
+
+
+# ---------------------------------------------------------
+# 1) Jit helpers for train_step
+# ---------------------------------------------------------
+def next_accumulated_batches(train_dataloader, acc_steps):
+  xs, ys = [], []
+  for _ in range(acc_steps):
+    x, y = next(train_dataloader)
+    xs.append(x)
+    ys.append(y)
+
+  # If x,y are already jax arrays, jnp.stack is fine.
+  # If they're numpy, jnp.asarray will transfer to device once (good).
+  x_acc = jnp.stack([jnp.asarray(x) for x in xs], axis=0)
+  y_acc = jnp.stack([jnp.asarray(y) for y in ys], axis=0)
+  return x_acc, y_acc
+
 
 #################################
 # Checkpointing utils

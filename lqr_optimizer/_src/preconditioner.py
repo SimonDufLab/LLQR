@@ -21,6 +21,9 @@ BLOCK_STRUCTURE_DICT = {
   'scalar': block_structures.ScalarBlock,
   'kfac': block_structures.KroneckerBlock,
   'diag-kfac': block_structures.DiagKroneckerBlock,
+  'sym-kfac' : block_structures.MirrorSymKroneckerBlock,
+  'psd-sym-kfac' : block_structures.PSDSymKroneckerBlock,
+  'sds-sym-kfac' : block_structures.SDSSymKroneckerBlock,
   'low-rank-memory': block_structures.LowRankBlockMemory,
   'low-rank-memory-asym': block_structures.LowRankBlockMemoryAsym,
   'sym_swm_kfac': block_structures.Sym_SWM_KFAC,
@@ -77,11 +80,12 @@ class BasePreconditioner(abc.ABC):
                                                             batch_solve_precond=self._batch_solve_precond,
                                                             multibatch=self._multibatch,
                                                             precond_on_update=self._precond_on_update)
-    self._jit_apply_fn = jax.jit(
-      lambda blocks, update: self._block_structure.matrix_product(blocks, update)
-    )
-  def apply(self, update):
-    return self._jit_apply_fn(self._block_structure.blocks, update)
+    # self._jit_apply_fn = jax.jit(
+    #   lambda blocks, update: self._block_structure.matrix_product(blocks, update)
+    # )
+  def apply(self, blocks, update):
+    # return self._jit_apply_fn(self._block_structure.blocks, update)
+    return self._block_structure.matrix_product(blocks, update)
 
   def get_stats(self):
     if hasattr(self._block_structure, "_memory"):

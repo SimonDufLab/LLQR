@@ -225,33 +225,91 @@ def main(cfg: DictConfig):
   signal.signal(signal.SIGTERM, utl.signal_handler)  # Before getting pre-empted and requeued.
   signal.signal(signal.SIGUSR1, utl.signal_handler)  # Before reaching the end of the time limit.
 
-  # @jax.jit
-  def train_step(state, train_dataloader, _dropout_key):
-    x, y = next(train_dataloader)
-    _dropout_key, consumed_key = jax.random.split(_dropout_key)
-    (running_loss, new_model_state), running_grads = compute_updates(state.params, state.batch_stats, x, y, _dropout_key)
-    for i in range(cfg.grad_acc_steps - 1):
-      x, y = next(train_dataloader)
-      _dropout_key, consumed_key = jax.random.split(_dropout_key)
-      (loss, new_model_state), grads = compute_updates(state.params, state.batch_stats, x, y, _dropout_key)
-      running_grads = jax.tree_util.tree_map(jnp.add, running_grads, grads)
-      running_loss += loss
-    running_loss /= cfg.grad_acc_steps
-    running_grads = jax.tree_util.tree_map(lambda v : v/cfg.grad_acc_steps, running_grads)
-    #TODO might want to revisit new_model_state handling with grad accumulation, no impact with current configs however
+  # # @jax.jit
+  # def train_step(state, train_dataloader, _dropout_key):
+  #   x, y = next(train_dataloader)
+  #   _dropout_key, consumed_key = jax.random.split(_dropout_key)
+  #   (running_loss, new_model_state), running_grads = compute_updates(state.params, state.batch_stats, x, y, _dropout_key)
+  #   for i in range(cfg.grad_acc_steps - 1):
+  #     x, y = next(train_dataloader)
+  #     _dropout_key, consumed_key = jax.random.split(_dropout_key)
+  #     (loss, new_model_state), grads = compute_updates(state.params, state.batch_stats, x, y, _dropout_key)
+  #     running_grads = jax.tree_util.tree_map(jnp.add, running_grads, grads)
+  #     running_loss += loss
+  #   running_loss /= cfg.grad_acc_steps
+  #   running_grads = jax.tree_util.tree_map(lambda v : v/cfg.grad_acc_steps, running_grads)
+  #   #TODO might want to revisit new_model_state handling with grad accumulation, no impact with current configs however
+  #
+  #   if cfg.precond_on_update:
+  #     new_state = state.apply_gradients_and_precond(grads=running_grads, precond_apply=preconditioner.apply,
+  #                                                   normalize_conv_params=cfg.normalize_conv_params,
+  #                                                   batch_stats=new_model_state['batch_stats'])
+  #   else:
+  #     # Apply the preconditioner on the gradient
+  #     precond_grads = preconditioner.apply(running_grads)
+  #     # print(utl.pytree_l2_norm(precond_grads) - utl.pytree_l2_norm(running_grads))
+  #     new_state = state.apply_gradients(grads=precond_grads, normalize_conv_params=cfg.normalize_conv_params,
+  #                                       batch_stats=new_model_state['batch_stats'])
+  #
+  #   return new_state, running_loss, x, y
+
+  def precond_apply_fn(blocks, grads):
+    return preconditioner.apply(blocks, grads)
+
+  @jax.jit
+  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+    acc_steps = x_acc.shape[0]
+
+    key, subkey0 = jax.random.split(dropout_key)
+    (loss0, new_model_state0), grads0 = compute_updates(
+      state.params, state.batch_stats, x_acc[0], y_acc[0], subkey0
+    )
+
+    def body(carry, inp):
+      sum_loss, sum_grads, batch_stats, key = carry
+      x, y = inp
+      key, subkey = jax.random.split(key)
+      (loss, new_model_state), grads = compute_updates(
+        state.params, batch_stats, x, y, subkey
+      )
+      sum_loss = sum_loss + loss
+      sum_grads = jax.tree_util.tree_map(jnp.add, sum_grads, grads)
+      batch_stats = new_model_state["batch_stats"]
+      return (sum_loss, sum_grads, batch_stats, key), None
+
+    init = (loss0, grads0, new_model_state0["batch_stats"], key)
+    (sum_loss, sum_grads, final_batch_stats, key_out), _ = jax.lax.scan(
+      body, init, (x_acc[1:], y_acc[1:])
+    )
+
+    mean_loss = sum_loss / acc_steps
+    mean_grads = jax.tree_util.tree_map(lambda v: v / acc_steps, sum_grads)
 
     if cfg.precond_on_update:
-      new_state = state.apply_gradients_and_precond(grads=running_grads, precond_apply=preconditioner.apply,
-                                                    normalize_conv_params=cfg.normalize_conv_params,
-                                                    batch_stats=new_model_state['batch_stats'])
+      new_state = state.apply_gradients_and_precond(
+        grads=mean_grads,
+        precond_apply=lambda g: precond_apply_fn(precond_blocks, g),
+        normalize_conv_params=cfg.normalize_conv_params,
+        batch_stats=final_batch_stats,
+      )
     else:
-      # Apply the preconditioner on the gradient
-      precond_grads = preconditioner.apply(running_grads)
-      # print(utl.pytree_l2_norm(precond_grads) - utl.pytree_l2_norm(running_grads))
-      new_state = state.apply_gradients(grads=precond_grads, normalize_conv_params=cfg.normalize_conv_params,
-                                        batch_stats=new_model_state['batch_stats'])
+      precond_grads = precond_apply_fn(precond_blocks, mean_grads)
+      new_state = state.apply_gradients(
+        grads=precond_grads,
+        normalize_conv_params=cfg.normalize_conv_params,
+        batch_stats=final_batch_stats,
+      )
 
-    return new_state, running_loss, x, y
+    return new_state, mean_loss, key_out
+
+  def train_step(state, precond_blocks, train_dataloader, dropout_key):
+    x_acc, y_acc = utl.next_accumulated_batches(train_dataloader, cfg.grad_acc_steps)
+
+    new_state, mean_loss, dropout_key = train_step_jit(
+      state, precond_blocks, x_acc, y_acc, dropout_key
+    )
+
+    return new_state, mean_loss, x_acc[-1], y_acc[-1]
 
   # Start timer
   start_time = time.time()
@@ -336,7 +394,7 @@ def main(cfg: DictConfig):
     # x_batch, y_batch = next(dataloader)
     #
     dropout_key, consumed_key = jax.random.split(dropout_key)
-    state, loss, x_batch, y_batch = train_step(state, dataloader, consumed_key)
+    state, loss, x_batch, y_batch = train_step(state, preconditioner.expose_blocks(), dataloader, consumed_key)
 
     # Logging or testing every so often
     if step % cfg.logging_freq == 0:

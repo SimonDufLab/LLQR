@@ -494,6 +494,496 @@ class DiagKroneckerBlock(KroneckerBlock):
       product_dict[layer_name] = unflatten_dict(layer_product)
     return product_dict
 
+
+##################################################################
+## KFAC block structures enforcing symmetry
+##################################################################
+
+# -----------------------------
+# Packed-triangular utilities
+# -----------------------------
+def _tril_size(n: int) -> int:
+  return (n * (n + 1)) // 2
+
+
+def _diag_pos_in_packed(n: int) -> jnp.ndarray:
+  """Positions of diagonal entries in row-major packed tril."""
+  i = jnp.arange(n)
+  return (i * (i + 1)) // 2 + i
+
+
+def _packed_diag(packed_L: jnp.ndarray, n: int) -> jnp.ndarray:
+  """Extract diagonal vector from packed lower-triangular."""
+  return packed_L[_diag_pos_in_packed(n)]
+
+
+# @Partial(jax.jit, static_argnums=2)
+def _dense_lower_from_packed(packed_L: jnp.ndarray, n: int, dtype=None) -> jnp.ndarray:
+  """Materialize dense lower-triangular matrix from packed storage."""
+  if dtype is None:
+    dtype = packed_L.dtype
+  ii, jj = jnp.tril_indices(n)
+  L = jnp.zeros((n, n), dtype=dtype)
+  return L.at[ii, jj].set(packed_L.astype(dtype))
+
+
+# @jax.jit
+def _dense_diag_from_packed(packed_L: jnp.ndarray, n: int) -> jnp.ndarray:
+  """Extract diagonal (length n) from packed lower-triangular (row-major)."""
+  i = jnp.arange(n)
+  diag_pos = (i * (i + 1)) // 2 + i
+  return packed_L[diag_pos]
+
+
+@jax.jit
+def _tri_left_mul_packed(packed_L: jnp.ndarray, X: jnp.ndarray) -> jnp.ndarray:
+  """
+  Compute (L @ X) if transpose=False, else (L.T @ X),
+  where L is lower-triangular and stored in packed lower-triangular format.
+
+  packed_L: (n*(n+1)//2,)
+  X: (n, d)
+  returns: (n, d)
+
+  Implementation uses scatter-add to avoid materializing L as an (n,n) matrix.
+  """
+  n = X.shape[0]
+  d = X.shape[1]
+  ii, jj = jnp.tril_indices(n)  # (nnz,), (nnz,)
+
+  # Y[i] += L[i,j] * X[j]
+  rows, cols = ii, jj
+
+  # Gather X[cols, :] for each nonzero, scale by packed values, scatter-add into rows.
+  Xg = X[cols, :]                               # (nnz, d)
+  contrib = packed_L[:, None] * Xg              # (nnz, d)
+
+  Y = jnp.zeros((n, d), dtype=X.dtype)
+  # scatter_add expects indices with shape (nnz, 1) for axis=0 updates
+  Y = Y.at[rows, :].add(contrib)
+  return Y
+
+
+@jax.jit
+def _transpose_tri_left_mul_packed(packed_L: jnp.ndarray, X: jnp.ndarray) -> jnp.ndarray:
+  """
+  Compute (L @ X) if transpose=False, else (L.T @ X),
+  where L is lower-triangular and stored in packed lower-triangular format.
+
+  packed_L: (n*(n+1)//2,)
+  X: (n, d)
+  returns: (n, d)
+
+  Implementation uses scatter-add to avoid materializing L as an (n,n) matrix.
+  """
+  n = X.shape[0]
+  d = X.shape[1]
+  ii, jj = jnp.tril_indices(n)  # (nnz,), (nnz,)
+
+  # L.T has nonzeros at (j,i) with same values
+  # Y[j] += L[i,j] * X[i]
+  rows, cols = jj, ii
+
+  # Gather X[cols, :] for each nonzero, scale by packed values, scatter-add into rows.
+  Xg = X[cols, :]                               # (nnz, d)
+  contrib = packed_L[:, None] * Xg              # (nnz, d)
+
+  Y = jnp.zeros((n, d), dtype=X.dtype)
+  # scatter_add expects indices with shape (nnz, 1) for axis=0 updates
+  Y = Y.at[rows, :].add(contrib)
+  return Y
+
+@jax.jit
+def _sym_apply_from_cholesky_packed(packed_L: jnp.ndarray, X: jnp.ndarray) -> jnp.ndarray:
+  """
+  Apply a symmetric matrix A to X without materializing A:
+    A := L @ L.T  (PSD, symmetric by construction)
+    returns A @ X
+
+  packed_L stores lower-triangular L.
+  """
+  # tmp = L.T @ X
+  tmp = _transpose_tri_left_mul_packed(packed_L, X)
+  # out = L @ tmp
+  out = _tri_left_mul_packed(packed_L, tmp)
+  return out
+
+@jax.jit
+def _apply_sym_mirror_from_lower_packed(packed_T: jnp.ndarray, X: jnp.ndarray) -> jnp.ndarray:
+  """
+  Apply P @ X where P is defined from a stored lower-triangular T (packed):
+    P = T + T^T - diag(T)
+
+  This enforces symmetry but NOT PSD.
+
+  No full reconstruction: compute T@X and T^T@X implicitly, then subtract diag(T)*X.
+  """
+  n, d = X.shape
+  TX = _tri_left_mul_packed(packed_T, X)
+  TtX = _transpose_tri_left_mul_packed(packed_T, X)
+  diagT = _packed_diag(packed_T, n)[:, None]  # (n,1)
+  return TX + TtX - diagT * X
+
+# @jax.jit
+def _apply_SDS_from_lower_packed(
+    packed_S: jnp.ndarray,
+    D: jnp.ndarray,
+    X: jnp.ndarray,
+    *,
+    normalize_D: bool,
+    eps: float,
+) -> jnp.ndarray:
+  """
+  Apply P @ X for P = S D S^T
+  where S is lower-triangular stored packed, D is diagonal vector (length n).
+
+  - Symmetric always.
+  - Indefinite allowed if D has negative entries.
+  - No full reconstruction (triangular multiplies + diag scaling).
+
+  normalize_D: if True, rescales D by max(|D|) to stabilize magnitude.
+  """
+  n, _ = X.shape
+  if normalize_D:
+    scale = jnp.max(jnp.abs(D)) + eps
+    D_eff = D / scale
+  else:
+    D_eff = D
+
+  StX = _transpose_tri_left_mul_packed(packed_S, X)  # S^T @ X
+  DStX = D_eff[:, None] * StX                              # D @ (S^T X)
+  SDStX = _tri_left_mul_packed(packed_S, DStX)  # S @ ...
+  return SDStX
+
+
+def _packed_lower_identity(dim: int, *, diag_value: float, dtype=jnp.float32) -> jnp.ndarray:
+  """Packed lower-triangular with diag=diag_value and zeros elsewhere."""
+  nnz = _tril_size(dim)
+  packed = jnp.zeros((nnz,), dtype=dtype)
+  diag_pos = _diag_pos_in_packed(dim)
+  packed = packed.at[diag_pos].set(jnp.asarray(diag_value, dtype=dtype))
+  return packed
+
+
+# ---------------------------------------------------------
+# 1) Mirror-symmetric factors: P = T + T^T - diag(T)
+# ---------------------------------------------------------
+class MirrorSymKroneckerBlock(KroneckerBlock):
+  """
+  Kronecker factors enforced symmetric by mirroring a stored lower-triangular T:
+    P = T + T^T - diag(T)
+
+  - Symmetric by construction.
+  - Not PSD-constrained (indefinite allowed).
+  - Memory: store packed T (n(n+1)/2) per factor.
+  - Matrix products avoid reconstructing full P.
+  """
+
+  def identity_block_init(self, dim: int) -> jnp.ndarray:
+    """
+    Initialize packed T so that P = identity_scale * I.
+
+    If T = a I, then:
+      P = T + T^T - diag(T) = a I + a I - a I = a I.
+    So pick a = identity_scale.
+    """
+    return _packed_lower_identity(dim, diag_value=self._identity_scale, dtype=jnp.float32)
+
+  def train_matrix_product(self, blocks, vectors):
+    product_dict = {}
+
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          packed_TA, packed_TB = layer_blocks[component]
+
+          X = vec_component
+          orig_shape = X.shape
+          if X.ndim == 4:
+            k_h, k_w, cin, cout = orig_shape
+            X2d = X.reshape((k_h * k_w * cin, cout))
+          elif X.ndim == 2:
+            X2d = X
+          else:
+            raise ValueError(f"Kernel shape {orig_shape} not supported for layer {layer_name}")
+
+          m, n = X2d.shape
+
+          TA = _dense_lower_from_packed(packed_TA, m, dtype=X2d.dtype)
+          TB = _dense_lower_from_packed(packed_TB, n, dtype=X2d.dtype)
+
+          diagTA = _dense_diag_from_packed(packed_TA, m).astype(X2d.dtype)[:, None]
+          diagTB = _dense_diag_from_packed(packed_TB, n).astype(X2d.dtype)[:, None]
+
+          # Apply A @ X with A = T + T^T - diag(T)
+          AX = (TA @ X2d) + (TA.T @ X2d) - diagTA * X2d
+
+          # Right multiply by B sym: AX@B = (B@AX.T).T
+          BXt = (TB @ AX.T) + (TB.T @ AX.T) - diagTB * AX.T
+          out2d = BXt.T
+
+          layer_product[component] = out2d.reshape(orig_shape)
+
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          layer_product[component] = diag * vec_component
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return product_dict
+
+
+# ---------------------------------------------------------
+# 2) PSD symmetric factors: P = LL^T
+# ---------------------------------------------------------
+class PSDSymKroneckerBlock(KroneckerBlock):
+  """
+  Symmetric Kronecker factors with reduced storage.
+
+  Kernel blocks:
+    - Store each factor as a *packed lower-triangular* matrix L (including diag),
+      representing a symmetric PSD matrix A = L L^T (and similarly for B).
+    - Memory per factor reduced from O(n^2) to O(n(n+1)/2).
+
+  Matrix product for kernel:
+    vec( A @ X @ B ), with A = L_A L_A^T and B = L_B L_B^T,
+  computed without reconstructing A or B.
+
+  Bias blocks:
+    - unchanged (diagonal vector).
+  """
+
+  def identity_block_init(self, dim: int) -> jnp.ndarray:
+    """
+    Initialize a packed lower-triangular factor L such that:
+      A = L L^T = (identity_scale) * I
+
+    Choose L = sqrt(identity_scale) * I, stored in packed form.
+    """
+    s = jnp.sqrt(self._identity_scale).astype(jnp.float32)
+    # Packed lower-triangular: only diagonal entries are non-zero for identity.
+    nnz = _tril_size(dim)
+    packed = jnp.zeros((nnz,), dtype=jnp.float32)
+
+    # Indices of diagonal entries in the row-major packed tril:
+    # diag positions are at offsets: 0, 2, 5, 9, ... (cumulative)
+    # offset(i,i) = i*(i+1)//2 + i
+    diag_pos = (jnp.arange(dim) * (jnp.arange(dim) + 1)) // 2 + jnp.arange(dim)
+    packed = packed.at[diag_pos].set(s)
+    return packed
+
+  def train_matrix_product(self, blocks, vectors):
+    product_dict = {}
+
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          packed_LA, packed_LB = layer_blocks[component]
+
+          X = vec_component
+          orig_shape = X.shape
+          if X.ndim == 4:
+            k_h, k_w, cin, cout = orig_shape
+            X2d = X.reshape((k_h * k_w * cin, cout))
+          elif X.ndim == 2:
+            X2d = X
+          else:
+            raise ValueError(f"Kernel shape {orig_shape} not supported for layer {layer_name}")
+
+          m, n = X2d.shape
+
+          # Reconstruct dense triangular factors
+          LA = _dense_lower_from_packed(packed_LA, m, dtype=X2d.dtype)
+          LB = _dense_lower_from_packed(packed_LB, n, dtype=X2d.dtype)
+
+          # A@X = (LA @ (LA.T @ X))
+          AX = LA @ (LA.T @ X2d)
+
+          # (A@X)@B where B = LB LB^T:  (A@X)@B = ((LB @ (LB.T @ (A@X).T)).T)
+          out2d = (LB @ (LB.T @ AX.T)).T
+
+          layer_product[component] = out2d.reshape(orig_shape)
+
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          layer_product[component] = diag * vec_component
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return product_dict
+
+
+# ---------------------------------------------------------
+# 2) Spectral-ish symmetric factors: P = S D S^T
+# ---------------------------------------------------------
+class SDSSymKroneckerBlock(KroneckerBlock):
+  """
+  Kronecker factors parameterized as:
+    P = S D S^T
+
+  Storage:
+    - S stored as packed lower-triangular (memory n(n+1)/2)
+    - D stored as diagonal vector (memory n)
+
+  Properties:
+    - Symmetric always
+    - Not PSD-constrained unless D >= 0
+    - Optionally normalize D by max(|D|) at application time
+    - Optionally (experimental) orthonormalize S (see notes below)
+  """
+
+  def __init__(
+      self,
+      network_params,
+      layer_names,
+      block_structure_init,
+      rank=None,
+      identity_scale=1.0,
+      *,
+      normalize_D: bool = False,
+      orthonormal_S: bool = False,
+      eps: float = 1e-12,
+  ):
+    self._normalize_D = normalize_D
+    self._orthonormal_S = orthonormal_S
+    self._eps = eps
+    super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
+
+  def identity_block_init(self, dim: int):
+    """
+    Initialize (packed_S, D) so that P = identity_scale * I:
+      choose S = I, D = identity_scale * 1.
+
+    If normalize_D=True, the effective scaling becomes 1 at application time
+    (since D / max(|D|) -> 1), so normalization is mainly for training dynamics,
+    not for preserving absolute scale.
+    """
+    packed_S = _packed_lower_identity(dim, diag_value=1.0, dtype=jnp.float32)
+    D = self._identity_scale * jnp.ones((dim,), dtype=jnp.float32)
+    return packed_S, D
+
+  def _make_blocks(self, network_params, layer_names, initialization=False):
+    blocks = {}
+    for layer_name in layer_names:
+      flat_params = flatten_dict(network_params[layer_name])
+      layer_blocks = {}
+
+      for key in flat_params.keys():
+        if any(k in key for k in KERNEL_KEYS):
+          kernel = flat_params[key]
+          if not hasattr(kernel, "shape"):
+            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
+
+          if len(kernel.shape) == 2:
+            m, n = kernel.shape
+            SA = self.identity_block_init(m)  # (packed_SA, DA)
+            SB = self.identity_block_init(n)  # (packed_SB, DB)
+            layer_blocks[key] = (SA, SB)
+
+          elif len(kernel.shape) == 4:
+            k_h, k_w, cin, cout = kernel.shape
+            m = k_h * k_w * cin
+            n = cout
+            SA = self.identity_block_init(m)
+            SB = self.identity_block_init(n)
+            layer_blocks[key] = (SA, SB)
+
+          else:
+            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+
+        if any(k in key for k in BIAS_KEYS):
+          bias = flat_params[key]
+          if not hasattr(bias, "shape"):
+            raise ValueError(f"Bias for layer {layer_name} does not have a shape attribute")
+          flat_bias, _ = ravel_pytree(bias)
+          diag = self.identity_diag_init(flat_bias.shape[0])
+          layer_blocks[key] = diag
+
+      blocks[layer_name] = layer_blocks
+
+    return blocks
+
+  def _materialize_lower_from_packed(self, packed_S: jnp.ndarray, n: int, dtype):
+    """
+    Materialize S (lower-triangular) as dense (n,n).
+    ONLY used if orthonormal_S=True (QR).
+    """
+    ii, jj = jnp.tril_indices(n)
+    S = jnp.zeros((n, n), dtype=dtype)
+    S = S.at[ii, jj].set(packed_S.astype(dtype))
+    return S
+
+  def _apply_SDS_dense(self, packed_S: jnp.ndarray, D: jnp.ndarray, X: jnp.ndarray) -> jnp.ndarray:
+    n, _ = X.shape
+    S = _dense_lower_from_packed(packed_S, n, dtype=X.dtype)
+
+    if self._orthonormal_S:
+      Q, _ = jnp.linalg.qr(S)
+      S_eff = Q
+    else:
+      S_eff = S
+
+    if self._normalize_D:
+      scale = jnp.max(jnp.abs(D)) + self._eps
+      D_eff = (D / scale).astype(X.dtype)
+    else:
+      D_eff = D.astype(X.dtype)
+
+    # S D S^T X = S @ (D * (S^T @ X))
+    StX = S_eff.T @ X
+    DStX = D_eff[:, None] * StX
+    return S_eff @ DStX
+
+  def train_matrix_product(self, blocks, vectors):
+    product_dict = {}
+
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          (packed_SA, DA), (packed_SB, DB) = layer_blocks[component]
+
+          X = vec_component
+          orig_shape = X.shape
+          if X.ndim == 4:
+            k_h, k_w, cin, cout = orig_shape
+            X2d = X.reshape((k_h * k_w * cin, cout))
+          elif X.ndim == 2:
+            X2d = X
+          else:
+            raise ValueError(f"Kernel shape {orig_shape} not supported for layer {layer_name}")
+
+          AX = self._apply_SDS_dense(packed_SA, DA, X2d)
+          out2d = self._apply_SDS_dense(packed_SB, DB, AX.T).T
+
+          layer_product[component] = out2d.reshape(orig_shape)
+
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          layer_product[component] = diag * vec_component
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return product_dict
+
+
 ##################################################################
 ## Block Structures inspired by Sherman-Morrison-Woodbury formula
 ##################################################################
