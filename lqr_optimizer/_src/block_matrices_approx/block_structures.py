@@ -1015,6 +1015,196 @@ class EKFACBlock(KroneckerBlock):
     return product_dict
 
 
+# -----------------------------
+# 3) Householder orthogonal ekfac
+# -----------------------------
+@jax.jit
+def _safe_unit(v: jnp.ndarray, eps: float) -> jnp.ndarray:
+  """u = v / (||v|| + eps). If v==0 => u==0 => Householder becomes identity."""
+  norm = jnp.linalg.norm(v)
+  return v / (norm + eps)
+
+
+@jax.jit
+def _householder_apply_one(v: jnp.ndarray, X: jnp.ndarray, eps: float) -> jnp.ndarray:
+  """
+  Apply a single Householder reflection H(v) to X:
+    X <- (I - 2 u u^T) X
+  where u = v/(||v||+eps).
+  X shape: (n, d)
+  v shape: (n,)
+  """
+  u = _safe_unit(v, eps)  # (n,)
+  # proj = u^T X : (d,)
+  proj = jnp.dot(u, X)    # (d,)
+  # X - 2 u proj^T
+  return X - 2.0 * (u[:, None] * proj[None, :])
+
+
+def _apply_householder_stack(V: jnp.ndarray, X: jnp.ndarray, eps: float, reverse: bool) -> jnp.ndarray:
+  """
+  Apply Q X where Q = Π_i H(V[i]).
+  If reverse=True, applies reflections in reverse order, which equals Q^T since H is symmetric.
+  V shape: (k, n)
+  X shape: (n, d)
+  """
+  V_eff = V[::-1] if reverse else V
+
+  def body(X_carry, v):
+    return _householder_apply_one(v, X_carry, eps), None
+
+  X_out, _ = jax.lax.scan(body, X, V_eff)
+  return X_out
+
+
+@jax.jit
+def _apply_QDQ(V: jnp.ndarray, d: jnp.ndarray, X: jnp.ndarray, eps: float) -> jnp.ndarray:
+  """
+  Apply P X with P = Q diag(d) Q^T, Q = product of Householders from V.
+  V: (k, n), d: (n,), X: (n, d2)
+  """
+  # Q^T X
+  Xh = _apply_householder_stack(V, X, eps=eps, reverse=True)
+  # diag(d) (Q^T X)
+  Xh = d[:, None] * Xh
+  # Q (diag(d) Q^T X)
+  return _apply_householder_stack(V, Xh, eps=eps, reverse=False)
+
+
+def _reshape_kernel_to_2d(vec_component: jnp.ndarray):
+  orig_shape = vec_component.shape
+  if vec_component.ndim == 4:
+    k_h, k_w, cin, cout = orig_shape
+    return vec_component.reshape((k_h * k_w * cin, cout)), orig_shape
+  elif vec_component.ndim == 2:
+    return vec_component, orig_shape
+  else:
+    raise ValueError(f"Kernel shape {orig_shape} not supported")
+
+
+class HouseholderDiagKroneckerBlock(KroneckerBlock):
+  """
+  EKFAC-like *basis learning* but cheaper than full eigenbases:
+
+    P = Q diag(d) Q^T,  Q = Π_{i=1..k} Householder(v_i)
+
+  Storage per factor (size n):
+    - V: (k, n)  Householder vectors
+    - d: (n,)    diagonal in that basis
+
+  Symmetry:
+    - enforced by construction. No need to store upper/lower separately.
+
+  Notes:
+    - PSD if d >= 0 (you can enforce via update rule / projection if desired).
+    - Indefinite allowed if d has mixed signs (your “inverting direction can help” regime).
+  """
+
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank=None,
+               identity_scale=1.0,
+               *,
+               num_reflections: int = 4,  #keep small for compute efficiency
+               eps: float = 1e-8):
+    self._num_reflections = int(num_reflections)
+    self._eps = float(eps)
+    super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
+
+  # ---- factor init ----
+  def identity_block_init(self, dim: int):
+    """
+    Initialize (V, d) so that P = identity_scale * I.
+
+    - V = 0 => each Householder is identity (safe normalization => u=0)
+    - d = identity_scale * 1  => P = identity_scale I
+    """
+    V = jnp.zeros((self._num_reflections, dim), dtype=jnp.float32)
+    d = (self._identity_scale * jnp.ones((dim,), dtype=jnp.float32))
+    return V, d
+
+  def _make_blocks(self, network_params, layer_names, initialization=False):
+    """
+    Override because each kernel factor is (V, d), not a single matrix.
+    """
+    blocks = {}
+    for layer_name in layer_names:
+      flat_params = flatten_dict(network_params[layer_name])
+      layer_blocks = {}
+
+      for key in flat_params.keys():
+        if any(k in key for k in KERNEL_KEYS):
+          kernel = flat_params[key]
+          if not hasattr(kernel, "shape"):
+            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
+
+          if len(kernel.shape) == 2:
+            m, n = kernel.shape
+          elif len(kernel.shape) == 4:
+            k_h, k_w, cin, cout = kernel.shape
+            m, n = k_h * k_w * cin, cout
+          else:
+            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+
+          # Left factor acts on rows (m), right factor on cols (n)
+          FA = self.identity_block_init(m)  # (V_A, d_A)
+          FB = self.identity_block_init(n)  # (V_B, d_B)
+          layer_blocks[key] = (FA, FB)
+
+        if any(k in key for k in BIAS_KEYS):
+          bias = flat_params[key]
+          if not hasattr(bias, "shape"):
+            raise ValueError(f"Bias for layer {layer_name} does not have a shape attribute")
+          flat_bias, _ = ravel_pytree(bias)
+          layer_blocks[key] = self.identity_diag_init(flat_bias.shape[0])
+
+      blocks[layer_name] = layer_blocks
+    return blocks
+
+  # ---- apply ----
+  def train_matrix_product(self, blocks, vectors):
+    """
+    Kernel: apply vec( A X B^T ) where:
+      A = Q_A diag(d_A) Q_A^T
+      B = Q_B diag(d_B) Q_B^T
+
+    Implemented as:
+      AX = A @ X
+      out = (B @ AX^T)^T  (since B symmetric)
+    """
+    product_dict = {}
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          (V_A, d_A), (V_B, d_B) = layer_blocks[component]
+
+          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+
+          # Left apply: (m,m) operator on rows
+          AX = _apply_QDQ(V_A, d_A.astype(X2d.dtype), X2d, eps=self._eps)
+
+          # Right apply using transpose trick: X @ B  == (B @ X^T)^T
+          out2d = _apply_QDQ(V_B, d_B.astype(X2d.dtype), AX.T, eps=self._eps).T
+
+          layer_product[component] = out2d.reshape(orig_shape)
+
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          layer_product[component] = diag * vec_component
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return product_dict
+
+
 ##################################################################
 ## Block Structures inspired by Sherman-Morrison-Woodbury formula
 ##################################################################

@@ -21,6 +21,7 @@ BLOCK_STRUCTURE_DICT = {
   'scalar': block_structures.ScalarBlock,
   'kfac': block_structures.KroneckerBlock,
   'e-kfac': block_structures.EKFACBlock,
+  'h-kfac': block_structures.HouseholderDiagKroneckerBlock,
   'diag-kfac': block_structures.DiagKroneckerBlock,
   'sym-kfac' : block_structures.MirrorSymKroneckerBlock,
   'psd-sym-kfac' : block_structures.PSDSymKroneckerBlock,
