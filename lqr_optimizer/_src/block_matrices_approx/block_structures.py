@@ -897,9 +897,7 @@ class EKFACBlock(KroneckerBlock):
                layer_names,
                block_structure_init,
                rank=None,
-               identity_scale=1.0,
-               eps: float = 1e-12):
-    self._eps = eps
+               identity_scale=1.0):
     super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
 
   def identity_block_init(self, shape_or_dim):
@@ -1015,8 +1013,449 @@ class EKFACBlock(KroneckerBlock):
     return product_dict
 
 
+# --------------------------
+# Normalization utilities
+# --------------------------
+def _normalize_diag(d: jnp.ndarray, mode: str, eps: float) -> jnp.ndarray:
+  """
+  Normalize a 1D vector d according to mode.
+  Returns d_eff with the SAME shape.
+  """
+  if mode == "none":
+    return d
+  if mode == "maxabs":
+    s = jnp.max(jnp.abs(d)) + eps
+    return d / s
+  if mode == "rms":
+    s = jnp.sqrt(jnp.mean(d * d)) + eps
+    return d / s
+  if mode == "meanabs":
+    s = jnp.mean(jnp.abs(d)) + eps
+    return d / s
+  if mode == "medianabs":
+    s = jnp.median(jnp.abs(d)) + eps
+    return d / s
+  raise ValueError(f"Unknown normalization mode: {mode}")
+
+
+class EKFACBlockNormalized(EKFACBlock):
+  """
+  Full EKFAC block with optional diagonal normalization at APPLY TIME.
+
+  Stored per kernel:
+    - QA: (m,m)
+    - QG: (n,n)
+    - inv_diag: (m*n,)  (can be indefinite)
+
+  Apply:
+    X_hat = QA^T X QG
+    X_hat_scaled = diag_eff * vec(X_hat)  (diag_eff derived from inv_diag with normalization)
+    out = QA X_hat_scaled QG^T
+
+  Normalization rationale:
+    - controls global gain drift while keeping anisotropy ("shape") of inv_diag
+    - reduces LR sensitivity; prevents hidden effective LR schedules
+    - stabilizes EMA+momentum updates of the diagonal in your LQR-trained setting
+
+  Options:
+    norm_mode in {"none","rms","maxabs","meanabs","medianabs","tanh"}
+    - "tanh" performs soft clipping: d_eff = c * tanh(d/c)
+
+  Optional calibration:
+    - use_alpha=True: multiply normalized diag by a scalar alpha per kernel component.
+      alpha is stored in the blocks and updated by your existing update mechanism.
+      Initialize alpha so that overall init acts like identity.
+
+  Identity init convention:
+    Your BlockStructures.matrix_product divides by identity_scale after train_matrix_product.
+    So we want train_matrix_product to output identity_scale * X at init.
+
+    - If norm_mode="none": set inv_diag = identity_scale * 1
+    - If norm_mode normalizes to unit scale: set alpha = identity_scale, and inv_diag = 1
+  """
+
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank=None,
+               identity_scale=1.0,
+               *,
+               norm_mode: str = "none",
+               eps: float = 1e-12,
+               tanh_c: float = 10.0,
+               use_alpha: bool = False):
+    self._norm_mode = norm_mode
+    self._eps = float(eps)
+    self._tanh_c = float(tanh_c)
+    self._use_alpha = bool(use_alpha)
+    super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
+
+  def identity_block_init(self, shape):
+    if len(shape) != 2:
+      raise ValueError(f"EKFACBlockNormalized.identity_block_init expects (m,n), got {shape}")
+    m, n = shape
+    QA = jnp.eye(m, dtype=jnp.float32)
+    QG = jnp.eye(n, dtype=jnp.float32)
+
+    if self._norm_mode == "none" and (not self._use_alpha):
+      # Make train_matrix_product = identity_scale * X directly via inv_diag
+      inv_diag = self._identity_scale * jnp.ones((m * n,), dtype=jnp.float32)
+      return (QA, QG, inv_diag)
+
+    # Otherwise, set diag "shape" to ones, and let alpha handle scale if requested.
+    inv_diag = jnp.ones((m * n,), dtype=jnp.float32)
+
+    if self._use_alpha:
+      alpha = jnp.asarray(self._identity_scale, dtype=jnp.float32)
+      return (QA, QG, inv_diag, alpha)
+
+    # If no alpha, we can still try to preserve scaling by multiplying inv_diag itself,
+    # but normalization will undo absolute scale. So best-effort: keep inv_diag ones.
+    return (QA, QG, inv_diag)
+
+
+  def _effective_diag(self, inv_diag: jnp.ndarray) -> jnp.ndarray:
+    """Compute d_eff from stored inv_diag according to norm_mode."""
+    if self._norm_mode == "tanh":
+      c = jnp.asarray(self._tanh_c, dtype=inv_diag.dtype)
+      return c * jnp.tanh(inv_diag / c)
+
+    return _normalize_diag(inv_diag, self._norm_mode, self._eps)
+
+  def train_matrix_product(self, blocks, vectors):
+    product_dict = {}
+
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          blk = layer_blocks[component]
+
+          if self._use_alpha:
+            QA, QG, inv_diag, alpha = blk
+          else:
+            QA, QG, inv_diag = blk
+            alpha = None
+
+          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+
+          d_eff = self._effective_diag(inv_diag).astype(X2d.dtype)
+          if alpha is not None:
+            d_eff = (alpha.astype(X2d.dtype)) * d_eff
+
+          out2d = self._ekfac_apply(QA, QG, d_eff, X2d)
+          layer_product[component] = out2d.reshape(orig_shape)
+
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          layer_product[component] = diag * vec_component
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return product_dict
+
+
 # -----------------------------
-# 3) Householder orthogonal ekfac
+# 2) Separable diagonal ekfac
+# -----------------------------
+@jax.jit
+def _apply_QdiagQt(Q: jnp.ndarray, diag: jnp.ndarray, X: jnp.ndarray) -> jnp.ndarray:
+  """Apply (Q diag(diag) Q^T) @ X without materializing."""
+  return Q @ (diag[:, None] * (Q.T @ X))
+
+
+class SeparableEKFACBlock(EKFACBlock):
+  """
+  Separable EKFAC-style block (EKFAC-lite):
+
+    A = QA diag(a) QA^T
+    G = QG diag(g) QG^T
+    P(X) = A X G
+
+  Stored per kernel:
+    - QA: (m,m) orthonormal-ish basis
+    - QG: (n,n) orthonormal-ish basis
+    - a: (m,) diagonal (can be indefinite)
+    - g: (n,) diagonal (can be indefinite)
+
+  Bias blocks unchanged (vector diag).
+
+  Identity init:
+    choose QA=I, QG=I, a=identity_scale * 1, g=1
+    so train_matrix_product returns identity_scale * X (then base class divides by identity_scale).
+  """
+
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank=None,
+               identity_scale=1.0):
+    super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
+
+  def identity_block_init(self, shape):
+    if len(shape) != 2:
+      raise ValueError(f"SeparableEKFACBlock.identity_block_init expects (m,n), got {shape}")
+    m, n = shape
+    QA = jnp.eye(m, dtype=jnp.float32)
+    QG = jnp.eye(n, dtype=jnp.float32)
+
+    # Make train_matrix_product equal to identity_scale * X:
+    a = self._identity_scale * jnp.ones((m,), dtype=jnp.float32)
+    g = jnp.ones((n,), dtype=jnp.float32)
+
+    return (QA, QG, a, g)
+
+  def train_matrix_product(self, blocks, vectors):
+    product_dict = {}
+
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          QA, QG, a, g = layer_blocks[component]
+
+          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+
+          a_eff = a.astype(X2d.dtype)  # (m,)
+          g_eff = g.astype(X2d.dtype)  # (n,)
+
+          # Left apply: A @ X
+          AX = _apply_QdiagQt(QA, a_eff, X2d)
+
+          # Right apply: X @ G (use symmetry trick: XG = (G @ X^T)^T)
+          XGt = _apply_QdiagQt(QG, g_eff, AX.T)  # (n,m)
+          out2d = XGt.T                          # (m,n)
+
+          layer_product[component] = out2d.reshape(orig_shape)
+
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          layer_product[component] = diag * vec_component
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return product_dict
+
+
+# -----------------------------
+# 3) Symmetry enforce variants
+# -----------------------------
+@jax.jit
+def _psd_diag_from_raw(raw: jnp.ndarray, eps: float) -> jnp.ndarray:
+  """
+  Map unconstrained raw -> strictly positive diagonal entries.
+  Using square keeps it simple and fast; eps prevents exact zeros.
+  """
+  return raw * raw + eps
+
+
+@jax.jit
+def _ekfac_apply_psd(QA: jnp.ndarray,
+                     QG: jnp.ndarray,
+                     raw_s: jnp.ndarray,
+                     X2d: jnp.ndarray,
+                     eps: float) -> jnp.ndarray:
+  """
+  Apply P@X where
+    P = (QG ⊗ QA) diag(s^2) (QG ⊗ QA)^T   (PSD)
+  without forming Kronecker matrices.
+
+  raw_s: (m*n,) parameters; effective diag = raw_s^2 + eps
+  """
+  m, n = X2d.shape
+  # rotate into eigenbasis
+  X_hat = (QA.T @ X2d) @ QG                 # (m, n)
+
+  # apply PSD diagonal in that basis
+  diag = _psd_diag_from_raw(raw_s, eps)     # (m*n,)
+  X_hat = (diag * X_hat.reshape(-1)).reshape((m, n))
+
+  # rotate back
+  return (QA @ X_hat) @ QG.T
+
+
+@jax.jit
+def _psd_from_raw(raw: jnp.ndarray, eps: float) -> jnp.ndarray:
+  """PSD diagonal entries from unconstrained raw parameters."""
+  return raw * raw + eps
+
+
+class PSDEKFACBlock(EKFACBlock):
+  """
+  EKFAC-style block, but PSD enforced like PSDSymKroneckerBlock:
+
+    inv_precond ≈ (Q ⊗ Q) diag(s^2) (Q ⊗ Q)^T
+
+  where diag(s^2) is always >= eps, so the operator is symmetric PSD.
+
+  Stored per kernel:
+    - QA: (m,m) orthonormal-ish basis
+    - QG: (n,n) orthonormal-ish basis
+    - raw_s: (m*n,) unconstrained parameters; effective diag = raw_s^2 + eps
+
+  Bias blocks unchanged (vector diag).
+  """
+
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank=None,
+               identity_scale=1.0,
+               *,
+               eps: float = 1e-12):
+    self._eps = float(eps)
+    super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
+
+  def identity_block_init(self, shape):
+    """
+    Initialize so that matrix_product is identity at init (given BlockStructures divides by identity_scale).
+
+    We want train_matrix_product to output identity_scale * X, so effective diag in EKFAC basis should be identity_scale.
+    Here diag = raw_s^2 + eps, so choose raw_s = sqrt(identity_scale) and eps small.
+    """
+    if len(shape) != 2:
+      raise ValueError(f"PSDEKFACBlock.identity_block_init expects (m,n), got {shape}")
+    m, n = shape
+    QA = jnp.eye(m, dtype=jnp.float32)
+    QG = jnp.eye(n, dtype=jnp.float32)
+
+    # raw_s^2 ≈ identity_scale => raw_s = sqrt(identity_scale)
+    raw_s = jnp.sqrt(jnp.asarray(self._identity_scale, dtype=jnp.float32)) * jnp.ones((m * n,), dtype=jnp.float32)
+    return (QA, QG, raw_s)
+
+
+  def train_matrix_product(self, blocks, vectors):
+    product_dict = {}
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          QA, QG, raw_s = layer_blocks[component]
+
+          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          out2d = _ekfac_apply_psd(QA, QG, raw_s, X2d, eps=self._eps)
+
+          layer_product[component] = out2d.reshape(orig_shape)
+
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          layer_product[component] = diag * vec_component
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return product_dict
+
+
+class PSDSeparableEKFACBlock(EKFACBlock):
+  """
+  PSD-separable EKFAC-style block:
+
+    A = QA diag(a) QA^T,   a = raw_a^2 + eps
+    G = QG diag(g) QG^T,   g = raw_g^2 + eps
+
+    P(X) = A X G
+
+  Stored per kernel:
+    - QA: (m,m)
+    - QG: (n,n)
+    - raw_a: (m,)  -> a = raw_a^2 + eps
+    - raw_g: (n,)  -> g = raw_g^2 + eps
+
+  Bias blocks unchanged (vector diag).
+
+  Identity init:
+    choose raw_a = sqrt(identity_scale), raw_g = 1
+    so train_matrix_product returns identity_scale * X (then base class divides by identity_scale).
+  """
+
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank=None,
+               identity_scale=1.0,
+               *,
+               eps: float = 1e-12):
+    self._eps = float(eps)
+    super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
+
+  def identity_block_init(self, shape):
+    """
+    Initialize (QA, QG, raw_a, raw_g) such that P acts like identity_scale * I at train_matrix_product time.
+
+    Set QA=I, QG=I.
+    Want A = identity_scale * I and G = I, so that A X G = identity_scale * X.
+    That makes overall matrix_product = (identity_scale*X)/identity_scale = X (identity).
+    """
+    if len(shape) != 2:
+      raise ValueError(f"PSDSeparableEKFACBlock.identity_block_init expects (m,n), got {shape}")
+    m, n = shape
+    QA = jnp.eye(m, dtype=jnp.float32)
+    QG = jnp.eye(n, dtype=jnp.float32)
+
+    raw_a = jnp.sqrt(jnp.asarray(self._identity_scale, dtype=jnp.float32)) * jnp.ones((m,), dtype=jnp.float32)
+    raw_g = jnp.ones((n,), dtype=jnp.float32)  # so g ≈ 1
+
+    return (QA, QG, raw_a, raw_g)
+
+
+  def train_matrix_product(self, blocks, vectors):
+    product_dict = {}
+
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          QA, QG, raw_a, raw_g = layer_blocks[component]
+
+          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+
+          a = _psd_from_raw(raw_a, self._eps).astype(X2d.dtype)  # (m,)
+          g = _psd_from_raw(raw_g, self._eps).astype(X2d.dtype)  # (n,)
+
+          # Left apply: A @ X
+          AX = _apply_QdiagQt(QA, a, X2d)
+
+          # Right apply: X @ G (use symmetry trick: XG = (G @ X^T)^T)
+          XGt = _apply_QdiagQt(QG, g, AX.T)   # (n,m)
+          out2d = XGt.T                        # (m,n)
+
+          layer_product[component] = out2d.reshape(orig_shape)
+
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          layer_product[component] = diag * vec_component
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return product_dict
+
+
+# -----------------------------
+# 4) Householder orthogonal ekfac
 # -----------------------------
 @jax.jit
 def _safe_unit(v: jnp.ndarray, eps: float) -> jnp.ndarray:
@@ -1069,17 +1508,6 @@ def _apply_QDQ(V: jnp.ndarray, d: jnp.ndarray, X: jnp.ndarray, eps: float) -> jn
   Xh = d[:, None] * Xh
   # Q (diag(d) Q^T X)
   return _apply_householder_stack(V, Xh, eps=eps, reverse=False)
-
-
-def _reshape_kernel_to_2d(vec_component: jnp.ndarray):
-  orig_shape = vec_component.shape
-  if vec_component.ndim == 4:
-    k_h, k_w, cin, cout = orig_shape
-    return vec_component.reshape((k_h * k_w * cin, cout)), orig_shape
-  elif vec_component.ndim == 2:
-    return vec_component, orig_shape
-  else:
-    raise ValueError(f"Kernel shape {orig_shape} not supported")
 
 
 class HouseholderDiagKroneckerBlock(KroneckerBlock):
