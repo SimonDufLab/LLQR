@@ -38,6 +38,8 @@ BLOCK_STRUCTURE_DICT = {
   'low-rank-memory-asym': block_structures.LowRankBlockMemoryAsym,
   'sym_swm_kfac': block_structures.Sym_SWM_KFAC,
   'asym_swm_kfac': block_structures.Asym_SWM_KFAC,
+  'sym_swm_e-kfac': block_structures.Sym_SWM_EKFAC,
+  'sym_swm_sep-e-kfac': block_structures.Sym_SWM_SeparableEKFAC,
 }
 
 class BasePreconditioner(abc.ABC):

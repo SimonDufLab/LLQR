@@ -2012,3 +2012,468 @@ class Asym_SWM_KFAC(Sym_SWM_KFAC):
     u = jax.tree_map(lambda t: _select_pair(t, 0), uv, is_leaf=is_pair)
     v = jax.tree_map(lambda t: _select_pair(t, 1), uv, is_leaf=is_pair)
     return jax.tree_map(lambda A, x, y: sherman_morrison_rank1(A, (x, y)), self._memory, u, v)
+
+
+# -----------------------------
+#   Rank-1 symmetric update for ekfac
+# -----------------------------
+class Sym_SWM_EKFAC(EKFACBlock):
+  """
+  EKFACBlock variant where Q_A and Q_G are NOT learned directly, but updated via a
+  symmetric rank-1 Sherman–Morrison rule driven by *rank-1 vectors* provided by
+  the preconditioner-learning pipeline.
+
+  Memory (apply-time, persistent):
+    kernel -> (Q_A_mem, Q_G_mem, inv_diag_mem)
+    bias   -> diag vector
+
+  Train-time blocks (what your learning pipeline updates):
+    kernel -> (u_A, u_G, inv_diag)
+      u_A: (m,) rank-1 vector for SM update of Q_A_mem
+      u_G: (n,) rank-1 vector for SM update of Q_G_mem
+      inv_diag: (m*n,) learned as-is (same semantics as EKFACBlock)
+    bias -> diag vector (unchanged)
+
+  Behavior:
+    - matrix_product: uses ONLY memory (ignores blocks), like Sym_SWM_KFAC
+    - train_matrix_product: applies SM updates to memory using u_A/u_G, then applies EKFAC with inv_diag
+      => provides training signal w.r.t. u_A/u_G and inv_diag.
+    - update_blocks: commits SM-updated Q's to memory and EMA-updates inv_diag and bias diag into memory,
+      then refreshes train-time blocks via reinit_blocks().
+  """
+
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank=None,
+               identity_scale=1.0,
+               *,
+               sm_eps: float = 1e-8,
+               seed: int = 42):
+    self._sm_eps = float(sm_eps)
+    self._key = jax.random.PRNGKey(seed)
+
+    # Initialize train-time blocks (u_A,u_G,inv_diag) via our overridden _make_blocks.
+    super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
+
+    # Persistent memory initialized using EKFACBlock's identity initialization.
+    # Note: EKFACBlock._make_blocks returns kernels as (Q_A,Q_G,inv_diag) and bias as diag vector.
+    self._memory = super()._make_blocks(network_params, layer_names, initialization=True)
+
+  def get_memory(self):
+    return self._memory
+
+  # -----------------------
+  # Train-time blocks init
+  # -----------------------
+  def _rand_vec(self, n: int) -> jnp.ndarray:
+    k, self._key = jax.random.split(self._key)
+    v = jax.random.normal(k, (n,), dtype=jnp.float32)
+    # Small init; scaled similarly to your Sym_SWM_KFAC.diag_block_init spirit
+    return (self._identity_scale * v) / jnp.sqrt(jnp.asarray(n, dtype=jnp.float32))
+
+  def _make_blocks(self, network_params, layer_names, initialization=False):
+    """
+    Produce train-time blocks:
+      kernel -> (u_A, u_G, inv_diag)  [u_A/u_G provide rank-1 training signal for Q updates]
+      bias   -> diagonal vector (same as EKFACBlock)
+    """
+    blocks = {}
+    for layer_name in layer_names:
+      flat_params = flatten_dict(network_params[layer_name])
+      layer_blocks = {}
+
+      for key in flat_params.keys():
+        if any(k in key for k in KERNEL_KEYS):
+          kernel = flat_params[key]
+          if not hasattr(kernel, "shape"):
+            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
+
+          if len(kernel.shape) == 2:
+            m, n = kernel.shape
+          elif len(kernel.shape) == 4:
+            k_h, k_w, cin, cout = kernel.shape
+            m, n = k_h * k_w * cin, cout
+          else:
+            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+
+          u_A = self._rand_vec(m)
+          u_G = self._rand_vec(n)
+
+          # inv_diag learned "as-is"; initialize with same scaling convention as EKFACBlock
+          inv_diag = self._identity_scale * jnp.ones((m * n,), dtype=jnp.float32)
+
+          layer_blocks[key] = (u_A, u_G, inv_diag)
+
+        if any(k in key for k in BIAS_KEYS):
+          bias = flat_params[key]
+          if not hasattr(bias, "shape"):
+            raise ValueError(f"Bias for layer {layer_name} does not have a shape attribute")
+          flat_bias, _ = ravel_pytree(bias)
+          layer_blocks[key] = self.identity_diag_init(flat_bias.shape[0])
+
+      blocks[layer_name] = layer_blocks
+    return blocks
+
+  # -----------------------
+  # SM update helper
+  # -----------------------
+  def _sm_update_Qs(self, train_blocks):
+    """
+    Build a temporary structure shaped like EKFACBlock blocks:
+      kernel -> (Q_A_new, Q_G_new, inv_diag_from_train_blocks)
+      bias   -> diag vector (from train_blocks)
+
+    where:
+      Q_A_new = SM(Q_A_mem, (u_A,u_A))
+      Q_G_new = SM(Q_G_mem, (u_G,u_G))
+    """
+    updated = {}
+    for layer_name, layer_blk in train_blocks.items():
+      mem_layer = self._memory[layer_name]
+      upd_layer = {}
+
+      for comp, blk in layer_blk.items():
+        if any(k in comp for k in KERNEL_KEYS):
+          u_A, u_G, inv_diag = blk
+          Q_A_mem, Q_G_mem, _inv_mem = mem_layer[comp]
+
+          Q_A_new = sherman_morrison_rank1(Q_A_mem, (u_A, u_A), eps=self._sm_eps)
+          Q_G_new = sherman_morrison_rank1(Q_G_mem, (u_G, u_G), eps=self._sm_eps)
+
+          upd_layer[comp] = (Q_A_new, Q_G_new, inv_diag)
+
+        elif any(k in comp for k in BIAS_KEYS):
+          # bias is already a diagonal vector for multiplication
+          upd_layer[comp] = blk
+        else:
+          raise ValueError(f"Unknown block type for {comp} in layer {layer_name}")
+
+      updated[layer_name] = upd_layer
+
+    return updated
+
+  # -----------------------
+  # Apply-time product uses memory only
+  # -----------------------
+  def matrix_product(self, blocks, vectors):
+    """
+    Apply using ONLY persistent memory (ignore incoming blocks),
+    consistent with Sym_SWM_KFAC behavior.
+
+    Keep the scaling convention from BlockStructures.matrix_product:
+      output = train_matrix_product(...) / identity_scale
+    Here we replicate that by dividing at the end.
+    """
+    product_dict = {}
+
+    for layer_name, layer_vectors in vectors.items():
+      mem_layer = self._memory[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          Q_A, Q_G, inv_diag = mem_layer[component]
+
+          X = vec_component
+          orig_shape = X.shape
+          if X.ndim == 4:
+            k_h, k_w, cin, cout = orig_shape
+            X2d = X.reshape((k_h * k_w * cin, cout))
+          elif X.ndim == 2:
+            X2d = X
+          else:
+            raise ValueError(f"Kernel shape {orig_shape} not supported for layer {layer_name}")
+
+          out2d = self._ekfac_apply(Q_A, Q_G, inv_diag, X2d)
+          layer_product[component] = out2d.reshape(orig_shape)
+
+        elif any(k in component for k in BIAS_KEYS):
+          diag = mem_layer[component]
+          layer_product[component] = diag * vec_component
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return jax.tree_map(lambda v: v / self._identity_scale, product_dict)
+
+  # -----------------------
+  # Train-time product uses SM-updated Qs (differentiable w.r.t u_A/u_G)
+  # -----------------------
+  def train_matrix_product(self, blocks, vectors):
+    """
+    Build temporary EKFAC parameters by SM-updating the memory Q_A/Q_G using u_A/u_G,
+    then apply EKFAC with the learned inv_diag from blocks.
+    """
+    ekfac_like_blocks = self._sm_update_Qs(blocks)
+    # Reuse EKFACBlock's train_matrix_product, which applies (Q_A,Q_G,inv_diag).
+    return super().train_matrix_product(ekfac_like_blocks, vectors)
+
+  # -----------------------
+  # Commit updates to memory + refresh train blocks
+  # -----------------------
+  def update_blocks(self, new_blocks, ema_decay=0):
+    """
+    Commit:
+      - Q_A/Q_G updated via SM using u_A/u_G from new_blocks
+      - inv_diag EMA-updated into memory from new_blocks
+      - bias diag EMA-updated into memory from new_blocks
+
+    Then refresh train-time blocks via reinit_blocks().
+    """
+    # Compute SM-updated (Q_A_new, Q_G_new) using memory + u_A/u_G
+    upd = self._sm_update_Qs(new_blocks)
+
+    mem2 = {}
+    for layer_name, upd_layer in upd.items():
+      mem_layer = self._memory[layer_name]
+      mem2_layer = {}
+
+      for comp, val in upd_layer.items():
+        if any(k in comp for k in KERNEL_KEYS):
+          Q_A_new, Q_G_new, inv_diag_new = val
+          Q_A_old, Q_G_old, inv_diag_old = mem_layer[comp]
+
+          inv_diag_mem = ema_update(inv_diag_old, inv_diag_new, decay=ema_decay)
+          mem2_layer[comp] = (Q_A_new, Q_G_new, inv_diag_mem)
+
+        elif any(k in comp for k in BIAS_KEYS):
+          mem2_layer[comp] = ema_update(mem_layer[comp], val, decay=ema_decay)
+
+        else:
+          raise ValueError(f"Unknown block type for {comp} in layer {layer_name}")
+
+      mem2[layer_name] = mem2_layer
+
+    self._memory = mem2
+
+    # Refresh train-time blocks (new u_A/u_G draws + reset inv_diag init)
+    self.blocks = self.reinit_blocks()
+
+
+class Sym_SWM_SeparableEKFAC(SeparableEKFACBlock):
+  """
+  SeparableEKFACBlock analogue of Sym_SWM_EKFAC.
+
+  Memory (apply-time, persistent):
+    kernel -> (QA_mem, QG_mem, a_mem, g_mem)
+    bias   -> diag vector
+
+  Train-time blocks (what your learning pipeline updates):
+    kernel -> (uA, uG, a, g)
+      uA: (m,) rank-1 vector for SM update of QA_mem
+      uG: (n,) rank-1 vector for SM update of QG_mem
+      a:  (m,) learned as-is
+      g:  (n,) learned as-is
+    bias -> diag vector (learned as-is)
+
+  Behavior:
+    - matrix_product: ignores incoming blocks, applies using memory only
+    - train_matrix_product: SM-update QA/QG from memory using uA/uG, then apply separable EKFAC using (a,g)
+      => provides training signal w.r.t. uA/uG and (a,g)
+    - update_blocks: commits SM-updated QA/QG into memory and EMA-updates (a,g) and bias diag into memory,
+      then refreshes train-time blocks via reinit_blocks().
+  """
+
+  def __init__(self,
+               network_params,
+               layer_names,
+               block_structure_init,
+               rank=None,
+               identity_scale=1.0,
+               *,
+               sm_eps: float = 1e-8,
+               seed: int = 42):
+    self._sm_eps = float(sm_eps)
+    self._key = jax.random.PRNGKey(seed)
+
+    # Initialize train-time blocks (uA,uG,a,g) via our overridden _make_blocks.
+    super().__init__(network_params, layer_names, block_structure_init, rank, identity_scale)
+
+    # Persistent memory initialized as identity separable EKFAC
+    self._memory = super()._make_blocks(network_params, layer_names, initialization=True)
+
+  def get_memory(self):
+    return self._memory
+
+  # -----------------------
+  # Train-time blocks init
+  # -----------------------
+  def _rand_vec(self, n: int) -> jnp.ndarray:
+    k, self._key = jax.random.split(self._key)
+    v = jax.random.normal(k, (n,), dtype=jnp.float32)
+    return (self._identity_scale * v) / jnp.sqrt(jnp.asarray(n, dtype=jnp.float32))
+
+  def _make_blocks(self, network_params, layer_names, initialization=False):
+    """
+    Train-time blocks:
+      kernel -> (uA, uG, a, g)
+      bias   -> diag vector
+    """
+    blocks = {}
+    for layer_name in layer_names:
+      flat_params = flatten_dict(network_params[layer_name])
+      layer_blocks = {}
+
+      for key in flat_params.keys():
+        if any(k in key for k in KERNEL_KEYS):
+          kernel = flat_params[key]
+          if not hasattr(kernel, "shape"):
+            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
+
+          if len(kernel.shape) == 2:
+            m, n = kernel.shape
+          elif len(kernel.shape) == 4:
+            k_h, k_w, cin, cout = kernel.shape
+            m, n = k_h * k_w * cin, cout
+          else:
+            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+
+          uA = self._rand_vec(m)
+          uG = self._rand_vec(n)
+
+          # learned diagonals (a, g) initialized to reproduce identity_scale * X at train time
+          a = self._identity_scale * jnp.ones((m,), dtype=jnp.float32)
+          g = jnp.ones((n,), dtype=jnp.float32)
+
+          layer_blocks[key] = (uA, uG, a, g)
+
+        if any(k in key for k in BIAS_KEYS):
+          bias = flat_params[key]
+          if not hasattr(bias, "shape"):
+            raise ValueError(f"Bias for layer {layer_name} does not have a shape attribute")
+          flat_bias, _ = ravel_pytree(bias)
+          layer_blocks[key] = self.identity_diag_init(flat_bias.shape[0])
+
+      blocks[layer_name] = layer_blocks
+    return blocks
+
+  # -----------------------
+  # SM update helper
+  # -----------------------
+  def _sm_update_Qs(self, train_blocks):
+    """
+    Build a temporary structure shaped like SeparableEKFACBlock blocks:
+      kernel -> (QA_new, QG_new, a, g)
+      bias   -> diag vector
+
+    where:
+      QA_new = SM(QA_mem, (uA,uA))
+      QG_new = SM(QG_mem, (uG,uG))
+    """
+    updated = {}
+    for layer_name, layer_blk in train_blocks.items():
+      mem_layer = self._memory[layer_name]
+      upd_layer = {}
+
+      for comp, blk in layer_blk.items():
+        if any(k in comp for k in KERNEL_KEYS):
+          uA, uG, a, g = blk
+          QA_mem, QG_mem, _a_mem, _g_mem = mem_layer[comp]
+
+          QA_new = sherman_morrison_rank1(QA_mem, (uA, uA), eps=self._sm_eps)
+          QG_new = sherman_morrison_rank1(QG_mem, (uG, uG), eps=self._sm_eps)
+
+          upd_layer[comp] = (QA_new, QG_new, a, g)
+
+        elif any(k in comp for k in BIAS_KEYS):
+          upd_layer[comp] = blk
+
+        else:
+          raise ValueError(f"Unknown block type for {comp} in layer {layer_name}")
+
+      updated[layer_name] = upd_layer
+
+    return updated
+
+  # -----------------------
+  # Apply-time product uses memory only
+  # -----------------------
+  def matrix_product(self, blocks, vectors):
+    """
+    Ignore incoming blocks and apply using memory only.
+    Keep BlockStructures scaling convention by dividing identity_scale at the end.
+    """
+    product_dict = {}
+
+    for layer_name, layer_vectors in vectors.items():
+      mem_layer = self._memory[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          QA, QG, a, g = mem_layer[component]
+          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+
+          a_eff = a.astype(X2d.dtype)
+          g_eff = g.astype(X2d.dtype)
+
+          AX = _apply_QdiagQt(QA, a_eff, X2d)
+          XGt = _apply_QdiagQt(QG, g_eff, AX.T)
+          out2d = XGt.T
+
+          layer_product[component] = out2d.reshape(orig_shape)
+
+        elif any(k in component for k in BIAS_KEYS):
+          diag = mem_layer[component]
+          layer_product[component] = diag * vec_component
+
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+
+    return jax.tree_map(lambda v: v / self._identity_scale, product_dict)
+
+  # -----------------------
+  # Train-time product uses SM-updated Qs (differentiable w.r.t uA/uG)
+  # -----------------------
+  def train_matrix_product(self, blocks, vectors):
+    """
+    SM-update QA/QG from memory using uA/uG (from blocks),
+    then apply separable EKFAC using learned (a,g).
+    """
+    sep_like_blocks = self._sm_update_Qs(blocks)
+    return super().train_matrix_product(sep_like_blocks, vectors)
+
+  # -----------------------
+  # Commit updates to memory + refresh train blocks
+  # -----------------------
+  def update_blocks(self, new_blocks, ema_decay=0):
+    """
+    Commit:
+      - QA/QG updated via SM using uA/uG from new_blocks
+      - (a,g) EMA-updated into memory from new_blocks
+      - bias diag EMA-updated into memory
+    Then refresh train-time blocks via reinit_blocks().
+    """
+    upd = self._sm_update_Qs(new_blocks)
+
+    mem2 = {}
+    for layer_name, upd_layer in upd.items():
+      mem_layer = self._memory[layer_name]
+      mem2_layer = {}
+
+      for comp, val in upd_layer.items():
+        if any(k in comp for k in KERNEL_KEYS):
+          QA_new, QG_new, a_new, g_new = val
+          QA_old, QG_old, a_old, g_old = mem_layer[comp]
+
+          a_mem = ema_update(a_old, a_new, decay=ema_decay)
+          g_mem = ema_update(g_old, g_new, decay=ema_decay)
+
+          mem2_layer[comp] = (QA_new, QG_new, a_mem, g_mem)
+
+        elif any(k in comp for k in BIAS_KEYS):
+          mem2_layer[comp] = ema_update(mem_layer[comp], val, decay=ema_decay)
+
+        else:
+          raise ValueError(f"Unknown block type for {comp} in layer {layer_name}")
+
+      mem2[layer_name] = mem2_layer
+
+    self._memory = mem2
+    self.blocks = self.reinit_blocks()
