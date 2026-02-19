@@ -1038,6 +1038,19 @@ def _normalize_diag(d: jnp.ndarray, mode: str, eps: float) -> jnp.ndarray:
   raise ValueError(f"Unknown normalization mode: {mode}")
 
 
+def _postprocess_inv_diag(inv_diag: jnp.ndarray,
+                          norm_mode: str,
+                          eps: float,
+                          tanh_c: float) -> jnp.ndarray:
+  """Project inv_diag after EMA. Shape preserved."""
+  if norm_mode == "none":
+    return inv_diag
+  if norm_mode == "tanh":
+    c = jnp.asarray(tanh_c, dtype=inv_diag.dtype)
+    return c * jnp.tanh(inv_diag / c)
+  return _normalize_diag(inv_diag, norm_mode, eps)
+
+
 class EKFACBlockNormalized(EKFACBlock):
   """
   Full EKFAC block with optional diagonal normalization at APPLY TIME.
@@ -1115,13 +1128,13 @@ class EKFACBlockNormalized(EKFACBlock):
     return (QA, QG, inv_diag)
 
 
-  def _effective_diag(self, inv_diag: jnp.ndarray) -> jnp.ndarray:
-    """Compute d_eff from stored inv_diag according to norm_mode."""
-    if self._norm_mode == "tanh":
-      c = jnp.asarray(self._tanh_c, dtype=inv_diag.dtype)
-      return c * jnp.tanh(inv_diag / c)
-
-    return _normalize_diag(inv_diag, self._norm_mode, self._eps)
+  # def _effective_diag(self, inv_diag: jnp.ndarray) -> jnp.ndarray:
+  #   """Compute d_eff from stored inv_diag according to norm_mode."""
+  #   if self._norm_mode == "tanh":
+  #     c = jnp.asarray(self._tanh_c, dtype=inv_diag.dtype)
+  #     return c * jnp.tanh(inv_diag / c)
+  #
+  #   return _normalize_diag(inv_diag, self._norm_mode, self._eps)
 
   def train_matrix_product(self, blocks, vectors):
     product_dict = {}
@@ -1142,7 +1155,7 @@ class EKFACBlockNormalized(EKFACBlock):
 
           X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
 
-          d_eff = self._effective_diag(inv_diag).astype(X2d.dtype)
+          d_eff = inv_diag.astype(X2d.dtype)
           if alpha is not None:
             d_eff = (alpha.astype(X2d.dtype)) * d_eff
 
@@ -1159,6 +1172,50 @@ class EKFACBlockNormalized(EKFACBlock):
       product_dict[layer_name] = unflatten_dict(layer_product)
 
     return product_dict
+
+  def update_blocks(self, new_blocks, ema_decay=0):
+    # 1) EMA update (same as parent)
+    ema_blocks = jax.tree_map(
+      Partial(ema_update, decay=ema_decay),
+      self.blocks,
+      new_blocks,
+    )
+
+    # 2) Post-EMA projection: normalize/clip ONLY inv_diag for kernel components.
+    projected = {}
+
+    for layer_name, layer_blk in ema_blocks.items():
+      out_layer = {}
+
+      for component, blk in layer_blk.items():
+        if any(k in component for k in KERNEL_KEYS):
+          if self._use_alpha:
+            QA, QG, inv_diag, alpha = blk
+            inv_diag = _postprocess_inv_diag(
+              inv_diag,
+              norm_mode=self._norm_mode,
+              eps=self._eps,
+              tanh_c=self._tanh_c,
+            )
+            out_layer[component] = (QA, QG, inv_diag, alpha)
+          else:
+            QA, QG, inv_diag = blk
+            inv_diag = _postprocess_inv_diag(
+              inv_diag,
+              norm_mode=self._norm_mode,
+              eps=self._eps,
+              tanh_c=self._tanh_c,
+            )
+            out_layer[component] = (QA, QG, inv_diag)
+
+        else:
+          # Bias blocks (and anything else you might have) are untouched.
+          out_layer[component] = blk
+
+      projected[layer_name] = out_layer
+
+    # 3) Commit
+    self.blocks.update(projected)
 
 
 # -----------------------------
