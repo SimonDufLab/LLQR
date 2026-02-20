@@ -131,6 +131,7 @@ def main(cfg: DictConfig):
       apply_inf_fn=inf_model.apply,
       params=state["params"],
       gbar=state["gbar"],
+      g_last=state["g_last"],
       tx=model_optimizer,
       opt_state=state["opt_state"],
       batch_stats=state["batch_stats"],
@@ -141,6 +142,7 @@ def main(cfg: DictConfig):
       apply_inf_fn=inf_model.apply,
       params=params,
       gbar=utl.tree_zeros_like(params),
+      g_last=utl.tree_zeros_like(params),
       tx=model_optimizer,
       batch_stats=init_batch_stats
     )
@@ -311,14 +313,14 @@ def main(cfg: DictConfig):
 
       # -----------------------------
       # 0) Build perturbation epsilon
+      #    (noise-aligned: g_last - g_bar)
       # -----------------------------
-      # If you haven't initialized state.g_bar yet, it should be zeros_like(params)
-      eps_tree = utl.make_perturbation_from_gbar(
+      eps_tree = utl.make_perturbation_from_noise(
         precond_blocks=precond_blocks,
-        g_bar=state.gbar,
+        g_last=state.g_last,  # stored last gradient (perturbed)
+        g_bar=state.gbar,  # running EMA buffer
         precond_apply_fn=precond_apply_fn,
         rho=cfg.asam_rho,
-        mode=cfg.gbar_mode,  # "ema_grad" | "ema_precond_grad" | "ema_direction"
         eps=cfg.gbar_eps,
       )
 
@@ -337,7 +339,6 @@ def main(cfg: DictConfig):
         x, y = inp
         key, subkey = jax.random.split(key)
 
-        # IMPORTANT: params_pert stays fixed during accumulation for this step
         (loss, new_model_state), grads = compute_updates(
           params_pert, batch_stats, x, y, subkey
         )
@@ -353,7 +354,7 @@ def main(cfg: DictConfig):
       )
 
       mean_loss = sum_loss / acc_steps
-      mean_grads = jax.tree_map(lambda v: v / acc_steps, sum_grads)  # these are grads at θ+ε
+      mean_grads = jax.tree_map(lambda v: v / acc_steps, sum_grads)  # grads at θ+ε
 
       # --------------------------------
       # 2) Apply (preconditioned) update
@@ -381,12 +382,19 @@ def main(cfg: DictConfig):
         mean_grads_pert=mean_grads,
         precond_blocks=precond_blocks,
         precond_apply_fn=precond_apply_fn,
-        beta=cfg.gbar_beta,  # e.g., 0.9–0.99
+        beta=cfg.gbar_beta,
         mode=cfg.gbar_mode,
         eps=cfg.gbar_eps,
       )
 
-      new_state = new_state.replace(gbar=new_gbar)
+      # --------------------------------------
+      # 4) Update last-gradient buffer g_last
+      #    (store what we actually computed)
+      # --------------------------------------
+      new_state = new_state.replace(
+        gbar=new_gbar,
+        g_last=jax.lax.stop_gradient(mean_grads),
+      )
 
       return new_state, mean_loss, key_out
 

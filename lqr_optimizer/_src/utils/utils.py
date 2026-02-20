@@ -689,6 +689,7 @@ class TrainState(train_state.TrainState):
   apply_inf_fn: Callable = struct.field(pytree_node=False)
   batch_stats: Any
   gbar: Any
+  g_last: Any
 
   def apply_gradients(self, *, grads, normalize_conv_params=False, **kwargs):
     """Updates ``step``, ``params``, ``opt_state`` and ``**kwargs`` in return value.
@@ -909,51 +910,52 @@ def tree_normalize(tree, eps=1e-12):
   return tree_mul_scalar(tree, 1.0 / n)
 
 
-def make_perturbation_from_gbar(
+# -----------------------------
+# New strategy: noise-aligned perturbation
+#   v := g_last - g_bar   (proxy for batch noise)
+#   eps := rho * P v / sqrt(v^T P v)
+# -----------------------------
+def make_perturbation_from_noise(
     precond_blocks,
+    g_last,
     g_bar,
     precond_apply_fn,
     rho: float,
+    eps: float = 1e-12,
+):
+  """
+  Returns epsilon pytree to add to params, where direction is aligned with
+  the "noise proxy" v = g_last - g_bar, and scaled in the P^{-1}-metric.
+
+  epsilon = rho * P v / sqrt(v^T P v)
+
+  All computations are stop_gradient'ed to avoid higher-order deps.
+  """
+  g_last = jax.lax.stop_gradient(g_last)
+  g_bar  = jax.lax.stop_gradient(g_bar)
+
+  v = tree_sub(g_last, g_bar)                 # noise proxy
+  Pv = precond_apply_fn(precond_blocks, v)        # P v
+  denom = jnp.sqrt(tree_dot(v, Pv) + eps)     # sqrt(v^T P v)
+
+  direction = tree_mul_scalar(Pv, 1.0 / denom)
+  eps_tree = tree_mul_scalar(direction, rho)
+  return eps_tree
+
+
+def update_gbar(
+    g_bar,
+    mean_grads_pert,
+    precond_blocks,
+    precond_apply_fn,
+    beta: float,
     mode: str,
     eps: float = 1e-12,
 ):
   """
-  Returns epsilon pytree to add to params.
-  All computations are stop_gradient'ed to avoid higher-order deps.
-  """
-  g_bar = jax.lax.stop_gradient(g_bar)
+  Keep the same 3 modes as before, but note the training step now uses g_last - g_bar
+  to build perturbations.
 
-  if mode == "ema_grad":
-    # epsilon = rho * P g_bar / sqrt(g_bar^T P g_bar)
-    Pg = precond_apply_fn(precond_blocks, g_bar)
-    denom = jnp.sqrt(tree_dot(g_bar, Pg) + eps)
-    direction = tree_mul_scalar(Pg, 1.0 / denom)
-    eps_tree = tree_mul_scalar(direction, rho)
-    return eps_tree
-
-  elif mode == "ema_precond_grad":
-    # g_bar already lives in the "P g" space, so just normalize Euclidean
-    direction = tree_normalize(g_bar, eps)
-    return tree_mul_scalar(direction, rho)
-
-  elif mode == "ema_direction":
-    # g_bar is already an approximate unit direction (we still renormalize)
-    direction = tree_normalize(g_bar, eps)
-    return tree_mul_scalar(direction, rho)
-
-  else:
-    raise ValueError(f"Unknown gbar_mode: {mode}")
-
-def update_gbar(
-        g_bar,
-        mean_grads_pert,
-        precond_blocks,
-        precond_apply_fn,
-        beta: float,
-        mode: str,
-        eps: float = 1e-12,
-):
-  """
   mean_grads_pert = ∇L(θ + ε) averaged across accumulation steps.
   """
   if mode == "ema_grad":
@@ -969,14 +971,17 @@ def update_gbar(
   else:
     raise ValueError(f"Unknown gbar_mode: {mode}")
 
-  # EMA: g_bar <- beta*g_bar + (1-beta)*target
-  new_gbar = tree_add(tree_mul_scalar(g_bar, beta), tree_mul_scalar(target, 1.0 - beta))
+  new_gbar = tree_add(
+    tree_mul_scalar(g_bar, beta),
+    tree_mul_scalar(target, 1.0 - beta),
+  )
 
-  # For direction mode, keep it normalized (helps prevent magnitude drift)
   if mode == "ema_direction":
     new_gbar = tree_normalize(new_gbar, eps)
 
   return jax.lax.stop_gradient(new_gbar)
+
+
 #################################
 # Checkpointing utils
 #################################
@@ -1092,6 +1097,7 @@ def save_trainstate_and_precond(parent_dir: str, trainstate, preconditioner_bloc
   trainstate_dir = os.path.join(parent_dir, "trainstate")
   params_dirs = os.path.join(trainstate_dir, "params")
   gbar_dirs = os.path.join(trainstate_dir, "gbar")
+  g_last_dirs = os.path.join(trainstate_dir, "g_last")
   opt_state_dir = os.path.join(trainstate_dir, "opt_state")
   batch_stats_dir = os.path.join(trainstate_dir, "batch_stats")
 
@@ -1099,6 +1105,7 @@ def save_trainstate_and_precond(parent_dir: str, trainstate, preconditioner_bloc
   os.makedirs(trainstate_dir, exist_ok=True)
   os.makedirs(params_dirs, exist_ok=True)
   os.makedirs(gbar_dirs, exist_ok=True)
+  os.makedirs(g_last_dirs, exist_ok=True)
   os.makedirs(opt_state_dir, exist_ok=True)
   os.makedirs(batch_stats_dir, exist_ok=True)
   os.makedirs(precond_dir, exist_ok=True)
@@ -1106,6 +1113,7 @@ def save_trainstate_and_precond(parent_dir: str, trainstate, preconditioner_bloc
   # Use the existing save function
   save_pytree_state(params_dirs, trainstate.params)
   save_pytree_state(gbar_dirs, trainstate.gbar)
+  save_pytree_state(g_last_dirs, trainstate.g_last)
   save_pytree_state(opt_state_dir, trainstate.opt_state)
   save_pytree_state(batch_stats_dir, trainstate.batch_stats)
   save_pytree_state(precond_dir, preconditioner_blocks)
@@ -1117,17 +1125,19 @@ def restore_trainstate_and_precond(parent_dir: str):
   precond_dir = os.path.join(parent_dir, "preconditioner")
   params_dirs = os.path.join(trainstate_dir, "params")
   gbar_dirs = os.path.join(trainstate_dir, "gbar")
+  g_last_dirs = os.path.join(trainstate_dir, "g_last")
   opt_state_dir = os.path.join(trainstate_dir, "opt_state")
   batch_stats_dir = os.path.join(trainstate_dir, "batch_stats")
 
   # Use the existing restore function
   restored_params = restore_pytree_state(params_dirs)
   restored_gbar = restore_pytree_state(gbar_dirs)
+  restored_g_last = restore_pytree_state(g_last_dirs)
   restored_opt_state = restore_pytree_state(opt_state_dir)
   restored_batch_stats = restore_pytree_state(batch_stats_dir)
   restored_preconditioner_blocks = restore_pytree_state(precond_dir)
 
-  return {"params": restored_params, "gbar":restored_gbar, "opt_state": restored_opt_state, "batch_stats":restored_batch_stats}, restored_preconditioner_blocks
+  return {"params": restored_params, "gbar":restored_gbar, "g_last":restored_g_last, "opt_state": restored_opt_state, "batch_stats":restored_batch_stats}, restored_preconditioner_blocks
 
 def checkpoint_exp(run_state: RunState, trainstate, precond_blocks, curr_epoch: int, curr_step: int,
                    dropout_key, best_acc, training_time):
