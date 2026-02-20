@@ -130,6 +130,7 @@ def main(cfg: DictConfig):
       apply_fn=model.apply,
       apply_inf_fn=inf_model.apply,
       params=state["params"],
+      gbar=state["gbar"],
       tx=model_optimizer,
       opt_state=state["opt_state"],
       batch_stats=state["batch_stats"],
@@ -139,6 +140,7 @@ def main(cfg: DictConfig):
       apply_fn=model.apply,
       apply_inf_fn=inf_model.apply,
       params=params,
+      gbar=utl.tree_zeros_like(params),
       tx=model_optimizer,
       batch_stats=init_batch_stats
     )
@@ -256,51 +258,137 @@ def main(cfg: DictConfig):
   def precond_apply_fn(blocks, grads):
     return preconditioner.apply(blocks, grads)
 
-  @jax.jit
-  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
-    acc_steps = x_acc.shape[0]
+  if not cfg.asam_training:
+    @jax.jit
+    def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+      acc_steps = x_acc.shape[0]
 
-    key, subkey0 = jax.random.split(dropout_key)
-    (loss0, new_model_state0), grads0 = compute_updates(
-      state.params, state.batch_stats, x_acc[0], y_acc[0], subkey0
-    )
-
-    def body(carry, inp):
-      sum_loss, sum_grads, batch_stats, key = carry
-      x, y = inp
-      key, subkey = jax.random.split(key)
-      (loss, new_model_state), grads = compute_updates(
-        state.params, batch_stats, x, y, subkey
-      )
-      sum_loss = sum_loss + loss
-      sum_grads = jax.tree_util.tree_map(jnp.add, sum_grads, grads)
-      batch_stats = new_model_state["batch_stats"]
-      return (sum_loss, sum_grads, batch_stats, key), None
-
-    init = (loss0, grads0, new_model_state0["batch_stats"], key)
-    (sum_loss, sum_grads, final_batch_stats, key_out), _ = jax.lax.scan(
-      body, init, (x_acc[1:], y_acc[1:])
-    )
-
-    mean_loss = sum_loss / acc_steps
-    mean_grads = jax.tree_util.tree_map(lambda v: v / acc_steps, sum_grads)
-
-    if cfg.precond_on_update:
-      new_state = state.apply_gradients_and_precond(
-        grads=mean_grads,
-        precond_apply=lambda g: precond_apply_fn(precond_blocks, g),
-        normalize_conv_params=cfg.normalize_conv_params,
-        batch_stats=final_batch_stats,
-      )
-    else:
-      precond_grads = precond_apply_fn(precond_blocks, mean_grads)
-      new_state = state.apply_gradients(
-        grads=precond_grads,
-        normalize_conv_params=cfg.normalize_conv_params,
-        batch_stats=final_batch_stats,
+      key, subkey0 = jax.random.split(dropout_key)
+      (loss0, new_model_state0), grads0 = compute_updates(
+        state.params, state.batch_stats, x_acc[0], y_acc[0], subkey0
       )
 
-    return new_state, mean_loss, key_out
+      def body(carry, inp):
+        sum_loss, sum_grads, batch_stats, key = carry
+        x, y = inp
+        key, subkey = jax.random.split(key)
+        (loss, new_model_state), grads = compute_updates(
+          state.params, batch_stats, x, y, subkey
+        )
+        sum_loss = sum_loss + loss
+        sum_grads = jax.tree_util.tree_map(jnp.add, sum_grads, grads)
+        batch_stats = new_model_state["batch_stats"]
+        return (sum_loss, sum_grads, batch_stats, key), None
+
+      init = (loss0, grads0, new_model_state0["batch_stats"], key)
+      (sum_loss, sum_grads, final_batch_stats, key_out), _ = jax.lax.scan(
+        body, init, (x_acc[1:], y_acc[1:])
+      )
+
+      mean_loss = sum_loss / acc_steps
+      mean_grads = jax.tree_util.tree_map(lambda v: v / acc_steps, sum_grads)
+
+      if cfg.precond_on_update:
+        new_state = state.apply_gradients_and_precond(
+          grads=mean_grads,
+          precond_apply=lambda g: precond_apply_fn(precond_blocks, g),
+          normalize_conv_params=cfg.normalize_conv_params,
+          batch_stats=final_batch_stats,
+        )
+      else:
+        precond_grads = precond_apply_fn(precond_blocks, mean_grads)
+        new_state = state.apply_gradients(
+          grads=precond_grads,
+          normalize_conv_params=cfg.normalize_conv_params,
+          batch_stats=final_batch_stats,
+        )
+
+      return new_state, mean_loss, key_out
+  else:
+    @jax.jit
+    def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+      acc_steps = x_acc.shape[0]
+
+      # -----------------------------
+      # 0) Build perturbation epsilon
+      # -----------------------------
+      # If you haven't initialized state.g_bar yet, it should be zeros_like(params)
+      eps_tree = utl.make_perturbation_from_gbar(
+        precond_blocks=precond_blocks,
+        g_bar=state.gbar,
+        precond_apply_fn=precond_apply_fn,
+        rho=cfg.asam_rho,
+        mode=cfg.gbar_mode,  # "ema_grad" | "ema_precond_grad" | "ema_direction"
+        eps=cfg.gbar_eps,
+      )
+
+      params_pert = utl.tree_add(state.params, eps_tree)
+
+      # --------------------------------------------
+      # 1) Accumulate grads at the perturbed weights
+      # --------------------------------------------
+      key, subkey0 = jax.random.split(dropout_key)
+      (loss0, new_model_state0), grads0 = compute_updates(
+        params_pert, state.batch_stats, x_acc[0], y_acc[0], subkey0
+      )
+
+      def body(carry, inp):
+        sum_loss, sum_grads, batch_stats, key = carry
+        x, y = inp
+        key, subkey = jax.random.split(key)
+
+        # IMPORTANT: params_pert stays fixed during accumulation for this step
+        (loss, new_model_state), grads = compute_updates(
+          params_pert, batch_stats, x, y, subkey
+        )
+
+        sum_loss = sum_loss + loss
+        sum_grads = jax.tree_map(jnp.add, sum_grads, grads)
+        batch_stats = new_model_state["batch_stats"]
+        return (sum_loss, sum_grads, batch_stats, key), None
+
+      init = (loss0, grads0, new_model_state0["batch_stats"], key)
+      (sum_loss, sum_grads, final_batch_stats, key_out), _ = jax.lax.scan(
+        body, init, (x_acc[1:], y_acc[1:])
+      )
+
+      mean_loss = sum_loss / acc_steps
+      mean_grads = jax.tree_map(lambda v: v / acc_steps, sum_grads)  # these are grads at θ+ε
+
+      # --------------------------------
+      # 2) Apply (preconditioned) update
+      # --------------------------------
+      if cfg.precond_on_update:
+        new_state = state.apply_gradients_and_precond(
+          grads=mean_grads,
+          precond_apply=lambda g: precond_apply_fn(precond_blocks, g),
+          normalize_conv_params=cfg.normalize_conv_params,
+          batch_stats=final_batch_stats,
+        )
+      else:
+        precond_grads = precond_apply_fn(precond_blocks, mean_grads)
+        new_state = state.apply_gradients(
+          grads=precond_grads,
+          normalize_conv_params=cfg.normalize_conv_params,
+          batch_stats=final_batch_stats,
+        )
+
+      # --------------------------------------
+      # 3) Update EMA buffer g_bar (no extra bwd)
+      # --------------------------------------
+      new_gbar = utl.update_gbar(
+        g_bar=state.gbar,
+        mean_grads_pert=mean_grads,
+        precond_blocks=precond_blocks,
+        precond_apply_fn=precond_apply_fn,
+        beta=cfg.gbar_beta,  # e.g., 0.9–0.99
+        mode=cfg.gbar_mode,
+        eps=cfg.gbar_eps,
+      )
+
+      new_state = new_state.replace(gbar=new_gbar)
+
+      return new_state, mean_loss, key_out
 
   def train_step(state, precond_blocks, train_dataloader, dropout_key):
     x_acc, y_acc = utl.next_accumulated_batches(train_dataloader, cfg.grad_acc_steps)
