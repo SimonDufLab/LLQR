@@ -909,6 +909,21 @@ def tree_normalize(tree, eps=1e-12):
   n = tree_l2_norm(tree, eps)
   return tree_mul_scalar(tree, 1.0 / n)
 
+def tree_dot_subtree(x_sub, y_sub):
+  leaves = jax.tree_util.tree_leaves(
+    jax.tree_map(lambda x, y: jnp.sum(x * y), x_sub, y_sub)
+  )
+  return jnp.sum(jnp.stack(leaves)) if leaves else jnp.array(0.0, dtype=jnp.float32)
+
+def tree_dot_per_layer(a, b):
+  return jax.tree_map(tree_dot_subtree, a, b)
+
+def tree_l2_norm_per_layer(tree, eps=1e-12):
+  return jax.tree_map(lambda d: jnp.sqrt(d + eps), tree_dot_per_layer(tree, tree))
+
+def tree_normalize_per_layer(tree, eps=1e-12):
+  norms = tree_l2_norm_per_layer(tree, eps)
+  return jax.tree_map(lambda sub, n: jax.tree_map(lambda x: x / n, sub), tree, norms)
 
 # -----------------------------
 # New strategy: noise-aligned perturbation
@@ -921,6 +936,7 @@ def make_perturbation_from_noise(
     g_bar,
     precond_apply_fn,
     rho: float,
+    mode: str,
     eps: float = 1e-12,
 ):
   """
@@ -933,10 +949,20 @@ def make_perturbation_from_noise(
   """
   g_last = jax.lax.stop_gradient(g_last)
   g_bar  = jax.lax.stop_gradient(g_bar)
+  if mode == "ema_grad":
+    g_last = g_last
+
+  elif mode == "ema_precond_grad":
+    g_last = precond_apply_fn(precond_blocks, g_last)  # P g^{pert}
+
+  elif mode == "ema_direction":
+    g_last = precond_apply_fn(precond_blocks, g_last)
+    g_last = tree_normalize(g_last, eps)  # unit direction in P-space
 
   v = tree_sub(g_last, g_bar)                 # noise proxy
   Pv = precond_apply_fn(precond_blocks, v)        # P v
-  denom = jnp.sqrt(tree_dot(v, Pv) + eps)     # sqrt(v^T P v)
+  # denom = jnp.sqrt(tree_dot(v, Pv) + eps)  # sqrt(v^T P v)
+  denom = jnp.sqrt(tree_dot(Pv, Pv) + eps)     # sqrt(v^T P^T P v) Less principled, but seems more numerically stable
 
   direction = tree_mul_scalar(Pv, 1.0 / denom)
   eps_tree = tree_mul_scalar(direction, rho)

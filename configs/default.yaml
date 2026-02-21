@@ -47,8 +47,8 @@ preempt_handling: false
 jobid: null  # To manually restart a previous job
 
 # Asam training options
-asam_training: false
-asam_rho: 0.2
-gbar_mode: 'ema_direction' # "ema_grad" | "ema_precond_grad" | "ema_direction"
+fsam_mode: null # "base_fsam" | "past_fsam"
+asam_rho: 0.1
+gbar_mode: 'ema_grad' # "ema_grad" | "ema_precond_grad" | "ema_direction"
 gbar_beta: 0.9
 gbar_eps: 1e-12
