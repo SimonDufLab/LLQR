@@ -380,7 +380,7 @@ def main(cfg: DictConfig):
       # --------------------------------------
       new_gbar = utl.update_gbar(
         g_bar=state.gbar,
-        mean_grads_pert=mean_grads,
+        mean_grads_pert=state.g_last, #mean_grads
         precond_blocks=precond_blocks,
         precond_apply_fn=precond_apply_fn,
         beta=cfg.gbar_beta,
