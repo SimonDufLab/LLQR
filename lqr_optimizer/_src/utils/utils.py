@@ -403,6 +403,7 @@ def prepare_dataloader(
     augment_dataset=False,
     lt_config=None,  # e.g., {"imbalance_ratio": 100, "distribution": "exp", "seed": 0}
     dataset_dir: str = None,
+    batch_overlap_fraction: float = 0.0,   # NEW (0.0 means disabled)
 ):
   """
   Creates a generator that yields (x, y) from the specified dataset:
@@ -421,6 +422,19 @@ def prepare_dataloader(
       info["num_classes"], info["ds_size"],
       and if LT is used: info["class_counts"] (list length = num_classes).
   """
+  ########
+  # Overlap config
+  overlap_frac = float(batch_overlap_fraction or 0.0)
+  if not (0.0 <= overlap_frac < 1.0):
+    raise ValueError(f"batch_overlap_fraction must be in [0,1), got {overlap_frac}")
+
+  # replace_size = how many new examples per step (stride)
+  replace = int(round(batch_size * (1.0 - overlap_frac)))
+
+  # ensure valid
+  replace = max(1, min(batch_size, replace))
+  enable_overlap = train and (replace < batch_size)  # only meaningful for train
+  ########
   grokking_datasets = {
     'mod_sum': lambda: ModSumDataset(frac_train=0.6, p=97, k=5),
     'mod_subtract': lambda: ModSubtractDataset(frac_train=0.6, p=97, k=5),
@@ -501,7 +515,38 @@ def prepare_dataloader(
       ds = ds.map(process_test_imagenet_dataset, num_parallel_calls=tf.data.AUTOTUNE)
 
     # Batch → prefetch → repeat
-    ds = ds.batch(batch_size)
+    # Batch (overlapped or standard)
+    if enable_overlap:
+      if batch_size % replace != 0:
+        raise ValueError(
+          f"With overlap enabled, require batch_size % replace == 0. "
+          f"Got batch_size={batch_size}, replace={replace}."
+        )
+      num_chunks = batch_size // replace
+
+      # First, form microbatches of size `replace`
+      ds = ds.batch(replace, drop_remainder=True)
+
+      # Window over consecutive microbatches (overlap achieved by shift=1 microbatch)
+      ds = ds.window(num_chunks, shift=1, drop_remainder=True)
+
+      # IMPORTANT: window returns (x_window_ds, y_window_ds) => flat_map gets 2 args
+      def _pack_window(xw, yw):
+        # Collect `num_chunks` microbatches into tensors:
+        # x: [num_chunks, replace, ...], y: [num_chunks, replace]
+        xy = tf.data.Dataset.zip((xw, yw)).batch(num_chunks, drop_remainder=True)
+
+        # Now reshape to full batch [batch_size, ...]
+        def _merge(x, y):
+          x = tf.reshape(x, (batch_size,) + tuple(x.shape[2:]))
+          y = tf.reshape(y, (batch_size,))
+          return x, y
+
+        return xy.map(_merge, num_parallel_calls=tf.data.AUTOTUNE)
+
+      ds = ds.flat_map(_pack_window)
+    else:
+      ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     ds = ds.repeat()
 
@@ -583,8 +628,38 @@ def prepare_dataloader(
     ds = ds.cache()
     ds = ds.shuffle(info["ds_size"], seed=0, reshuffle_each_iteration=True)
 
-  # Batch and (optional) augment
-  ds = ds.batch(batch_size)
+  # Batch (overlapped or standard)
+  if enable_overlap:
+    if batch_size % replace != 0:
+      raise ValueError(
+        f"With overlap enabled, require batch_size % replace == 0. "
+        f"Got batch_size={batch_size}, replace={replace}."
+      )
+    num_chunks = batch_size // replace
+
+    # First, form microbatches of size `replace`
+    ds = ds.batch(replace, drop_remainder=True)
+
+    # Window over consecutive microbatches (overlap achieved by shift=1 microbatch)
+    ds = ds.window(num_chunks, shift=1, drop_remainder=True)
+
+    # IMPORTANT: window returns (x_window_ds, y_window_ds) => flat_map gets 2 args
+    def _pack_window(xw, yw):
+      # Collect `num_chunks` microbatches into tensors:
+      # x: [num_chunks, replace, ...], y: [num_chunks, replace]
+      xy = tf.data.Dataset.zip((xw, yw)).batch(num_chunks, drop_remainder=True)
+
+      # Now reshape to full batch [batch_size, ...]
+      def _merge(x, y):
+        x = tf.reshape(x, (batch_size,) + tuple(x.shape[2:]))
+        y = tf.reshape(y, (batch_size,))
+        return x, y
+
+      return xy.map(_merge, num_parallel_calls=tf.data.AUTOTUNE)
+
+    ds = ds.flat_map(_pack_window)
+  else:
+    ds = ds.batch(batch_size)
 
   if augment_dataset and train:
     if dataset in ('cifar-10', 'cifar-100'):
@@ -949,18 +1024,26 @@ def make_perturbation_from_noise(
   """
   g_last = jax.lax.stop_gradient(g_last)
   g_bar  = jax.lax.stop_gradient(g_bar)
-  if mode == "ema_grad":
-    g_last = g_last
-
-  elif mode == "ema_precond_grad":
-    g_last = precond_apply_fn(precond_blocks, g_last)  # P g^{pert}
-
-  elif mode == "ema_direction":
-    g_last = precond_apply_fn(precond_blocks, g_last)
-    g_last = tree_normalize(g_last, eps)  # unit direction in P-space
+  # if mode == "ema_grad":
+  #   g_last = g_last
+  #
+  # elif mode == "ema_precond_grad":
+  #   g_last = precond_apply_fn(precond_blocks, g_last)  # P g^{pert}
+  #
+  # elif mode == "ema_direction":
+  #   g_last = precond_apply_fn(precond_blocks, g_last)
+  #   g_last = tree_normalize(g_last, eps)  # unit direction in P-space
 
   v = tree_sub(g_last, g_bar)                 # noise proxy
-  Pv = precond_apply_fn(precond_blocks, v)        # P v
+  if mode == "ema_grad":
+    Pv = v
+  elif mode == "ema_precond_grad":
+    Pv = precond_apply_fn(precond_blocks, v)        # P v
+  elif mode == "ema_direction":
+    Pv = precond_apply_fn(precond_blocks, v)
+    Pv = tree_normalize(Pv, eps)  # unit direction in P-space
+  else:
+    raise ValueError(f"Unknown gbar_mode: {mode}")
   # denom = jnp.sqrt(tree_dot(v, Pv) + eps)  # sqrt(v^T P v)
   denom = jnp.sqrt(tree_dot(Pv, Pv) + eps)     # sqrt(v^T P^T P v) Less principled, but seems more numerically stable
 
@@ -984,18 +1067,20 @@ def update_gbar(
 
   mean_grads_pert = ∇L(θ + ε) averaged across accumulation steps.
   """
-  if mode == "ema_grad":
-    target = mean_grads_pert
+  # if mode == "ema_grad":
+  #   target = mean_grads_pert
+  #
+  # elif mode == "ema_precond_grad":
+  #   target = precond_apply_fn(precond_blocks, mean_grads_pert)  # P g^{pert}
+  #
+  # elif mode == "ema_direction":
+  #   Pg = precond_apply_fn(precond_blocks, mean_grads_pert)
+  #   target = tree_normalize(Pg, eps)  # unit direction in P-space
+  #
+  # else:
+  #   raise ValueError(f"Unknown gbar_mode: {mode}")
 
-  elif mode == "ema_precond_grad":
-    target = precond_apply_fn(precond_blocks, mean_grads_pert)  # P g^{pert}
-
-  elif mode == "ema_direction":
-    Pg = precond_apply_fn(precond_blocks, mean_grads_pert)
-    target = tree_normalize(Pg, eps)  # unit direction in P-space
-
-  else:
-    raise ValueError(f"Unknown gbar_mode: {mode}")
+  target = mean_grads_pert
 
   new_gbar = tree_add(
     tree_mul_scalar(g_bar, beta),

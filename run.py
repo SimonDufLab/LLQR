@@ -67,7 +67,15 @@ def main(cfg: DictConfig):
   if not cfg.eval_batch_size:
     cfg.eval_batch_size = cfg.batch_size
   if cfg.dataset.loader == "tfds":
-    dataloader, ds_info = prepare_dataloader(batch_size=cfg.batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
+    dataloader, ds_info = prepare_dataloader(
+      batch_size=cfg.batch_size,
+      train=True,
+      dataset=cfg.dataset.name,
+      augment_dataset=cfg.dataset.augment_dataset,
+      lt_config=cfg.dataset.lt_config,
+      dataset_dir=cfg.dataset.dataset_dir,
+      batch_overlap_fraction=cfg.batch_overlap_fraction,  # NEW
+    )
     # precond_dataloader, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
     test_dataloader, _ = prepare_dataloader(batch_size=cfg.eval_batch_size, train=False, dataset=cfg.dataset.name, dataset_dir=cfg.dataset.dataset_dir)
   elif cfg.dataset.loader == "hf":
