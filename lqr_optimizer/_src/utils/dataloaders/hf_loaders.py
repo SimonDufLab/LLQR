@@ -462,6 +462,7 @@ def wt103_loader(
       "class_freqs": class_freqs,
       "num_classes": int(num_classes),
       "ds_size": int(len(train_dataset)),
+      "test_ds_size": int(len(val_dataset)),
       "input_shape": np.array([num_classes]),
       "output_shape": np.array([num_classes]),
       "tokenizer_type": "gpt2" if not basic_english_tokenizer else "basic_english",

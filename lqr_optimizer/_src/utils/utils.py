@@ -11,6 +11,7 @@ from jax.flatten_util import ravel_pytree
 import optax
 import tensorflow as tf
 import tensorflow_datasets as tfds
+from aim import Distribution
 
 import flax.linen as nn
 from flax.linen import Sequential
@@ -401,6 +402,7 @@ def prepare_dataloader(
     train=True,
     dataset='mnist',
     augment_dataset=False,
+    shuffle: bool = True,
     lt_config=None,  # e.g., {"imbalance_ratio": 100, "distribution": "exp", "seed": 0}
     dataset_dir: str = None,
     batch_overlap_fraction: float = 0.0,   # NEW (0.0 means disabled)
@@ -496,7 +498,7 @@ def prepare_dataloader(
 
     # Cache & shuffle like the other branches
     # ds = ds.cache() Oh, no, not caching imagenet...
-    if train:
+    if train and shuffle:
       ds = ds.shuffle(4096, seed=0, reshuffle_each_iteration=True)
 
     # Pre-processing & augmentation
@@ -620,13 +622,15 @@ def prepare_dataloader(
 
     # Cache & shuffle the final LT dataset
     ds = ds.cache()
-    ds = ds.shuffle(info["ds_size"], seed=lt_seed, reshuffle_each_iteration=True)
+    if shuffle:
+      ds = ds.shuffle(info["ds_size"], seed=lt_seed, reshuffle_each_iteration=True)
   else:
     # Balanced/default path
     size = int(ds.cardinality()) if tf.data.experimental.cardinality(ds) != tf.data.experimental.UNKNOWN_CARDINALITY else int(_info.splits['train' if train else 'test'].num_examples)
     info["ds_size"] = size
     ds = ds.cache()
-    ds = ds.shuffle(info["ds_size"], seed=0, reshuffle_each_iteration=True)
+    if train and (shuffle):
+      ds = ds.shuffle(info["ds_size"], seed=0, reshuffle_each_iteration=True)
 
   # Batch (overlapped or standard)
   if enable_overlap:
@@ -715,48 +719,179 @@ def compute_batch_accuracy(state, x_batch, y_batch):
   accuracy = (correct_predictions / y_batch.shape[0]) * 100
   return accuracy, cross_entropy_loss(log_probs, y_batch)
 
-def compute_accuracy_and_loss(state, dataloader):
-  """
-  Computes accuracy for the given model parameters and dataloader.
+# def compute_accuracy_and_loss(state, dataloader):
+#   """
+#   Computes accuracy for the given model parameters and dataloader.
+#
+#   Args:
+#       params: Model parameters.
+#       model: Flax model.
+#       dataloader: DataLoader for the dataset.
+#
+#   Returns:
+#       Accuracy as a percentage (float).
+#       Averaged loss
+#   """
+#   # If this is a custom loader, reset it to ensure we get a fresh epoch
+#   if hasattr(dataloader, "reset"):
+#     dataloader.reset()
+#   init_batch = next(dataloader)
+#   batch_axis = infer_batch_layout(init_batch)["batch_axis"]
+#   x_batch, y_batch = init_batch
+#   batch_size = x_batch.shape[batch_axis]
+#   pred_size = y_batch.shape[0]
+#   acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
+#   correct_predictions = acc * pred_size
+#   running_loss = loss * pred_size
+#   final_pred_size = pred_size
+#   total_samples = batch_size
+#
+#   for x_batch, y_batch in dataloader:
+#     # Compute model predictions
+#     pred_size = y_batch.shape[0]
+#     acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
+#     correct_predictions += acc * pred_size
+#     running_loss += loss * pred_size
+#     total_samples += batch_size
+#     final_pred_size += pred_size
+#     if total_samples >= 10000:
+#       break
+#
+#   # Compute accuracy as a percentage
+#   accuracy = (correct_predictions / final_pred_size)
+#   return accuracy, running_loss / final_pred_size
 
-  Args:
-      params: Model parameters.
-      model: Flax model.
-      dataloader: DataLoader for the dataset.
-
-  Returns:
-      Accuracy as a percentage (float).
-      Averaged loss
+def compute_accuracy_and_loss(state, dataloader, num_samples: int):
   """
-  # If this is a custom loader, reset it to ensure we get a fresh epoch
+  Evaluate on ~num_samples examples from dataloader (works with infinite repeat()).
+  """
   if hasattr(dataloader, "reset"):
     dataloader.reset()
-  init_batch = next(dataloader)
-  batch_axis = infer_batch_layout(init_batch)["batch_axis"]
-  x_batch, y_batch = init_batch
-  batch_size = x_batch.shape[batch_axis]
-  pred_size = y_batch.shape[0]
-  acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
-  correct_predictions = acc * pred_size
-  running_loss = loss * pred_size
-  final_pred_size = pred_size
-  total_samples = batch_size
+
+  correct_predictions = 0.0
+  running_loss = 0.0
+  seen = 0
 
   for x_batch, y_batch in dataloader:
-    # Compute model predictions
-    pred_size = y_batch.shape[0]
+    pred_size = y_batch.shape[0]          # robust: counts labels actually present
     acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
+
     correct_predictions += acc * pred_size
     running_loss += loss * pred_size
-    total_samples += batch_size
-    final_pred_size += pred_size
-    if total_samples >= 10000:
+    seen += pred_size
+
+    if seen >= num_samples:
       break
 
-  # Compute accuracy as a percentage
-  accuracy = (correct_predictions / final_pred_size)
-  return accuracy, running_loss / final_pred_size
+  accuracy = correct_predictions / seen
+  avg_loss = running_loss / seen
+  return accuracy, avg_loss
 
+
+def compute_accuracy_and_loss_with_hists(
+    state,
+    dataloader,
+    num_samples: int,
+    run,                      # Aim Run
+    *,
+    step: int,
+    prefix: str = "eval",     # e.g. "train_eval" or "test"
+    context: dict | None = None,
+    bin_count: int = 50,
+    max_points: int | None = 200_000,   # optional subsample cap (recommended for ImageNet)
+    rng_seed: int = 0,
+):
+  """
+  Evaluate on ~num_samples examples from dataloader (works with repeat()) and track:
+    1) Distribution of p(correct class)
+    2) Distribution of per-sample NLL
+
+  Returns:
+    (accuracy_percent, avg_loss)
+  """
+  import numpy as np
+  import jax
+  import jax.numpy as jnp
+  from aim import Distribution
+
+  if hasattr(dataloader, "reset"):
+    dataloader.reset()
+
+  correct_sum = 0.0
+  loss_sum = 0.0
+  seen = 0
+
+  # Optional reservoir sampling so you don't log millions of points
+  rng = np.random.default_rng(rng_seed)
+
+  p_correct_samples = []
+  nll_samples = []
+  if max_points is not None:
+    cap = int(max_points)
+    stream_n = 0  # total points seen in stream for reservoir sampling
+
+    def _reservoir_add(arr_p: np.ndarray, arr_nll: np.ndarray):
+      nonlocal stream_n, p_correct_samples, nll_samples
+      for p, nll in zip(arr_p.tolist(), arr_nll.tolist()):
+        stream_n += 1
+        if len(p_correct_samples) < cap:
+          p_correct_samples.append(p)
+          nll_samples.append(nll)
+        else:
+          j = rng.integers(0, stream_n)
+          if j < cap:
+            p_correct_samples[j] = p
+            nll_samples[j] = nll
+  else:
+    def _reservoir_add(arr_p: np.ndarray, arr_nll: np.ndarray):
+      p_correct_samples.extend(arr_p.tolist())
+      nll_samples.extend(arr_nll.tolist())
+
+  for x_batch, y_batch in dataloader:
+    variables = {'params': state.params, 'batch_stats': state.batch_stats}
+    log_probs = state.apply_inf_fn(variables, x_batch, mutable=False)  # [B, C]
+
+    # Preds (your version used argmax(exp(log_probs)); argmax(log_probs) is equivalent)
+    preds = jnp.argmax(log_probs, axis=1)
+
+    # Per-sample correctness (0/1)
+    correct = (preds == y_batch).astype(jnp.float32)
+
+    # p(correct class) and per-sample NLL
+    idx = jnp.arange(y_batch.shape[0])
+    lp_true = log_probs[idx, y_batch]                 # log p(y|x)
+    p_true = jnp.exp(lp_true)                         # p(y|x) in [0,1]
+    nll = -lp_true                                    # NLL >= 0
+
+    bs = int(y_batch.shape[0])
+    correct_sum += float(jnp.sum(correct))
+    loss_sum += float(jnp.sum(nll))
+    seen += bs
+
+    # move to host for Aim histogram
+    _reservoir_add(np.asarray(p_true), np.asarray(nll))
+
+    if seen >= num_samples:
+      break
+
+  acc_percent = (correct_sum / seen) * 100.0
+  avg_loss = loss_sum / seen
+
+  # Track histograms
+  run.track(
+    Distribution(p_correct_samples, bin_count=bin_count),
+    name=f"{prefix}/p_correct_hist",
+    step=step,
+    context=context,
+  )
+  run.track(
+    Distribution(nll_samples, bin_count=bin_count),
+    name=f"{prefix}/nll_hist",
+    step=step,
+    context=context,
+  )
+
+  return acc_percent, avg_loss
 
  # Prepare the train state for the model parameters
   # (Using Flax's train_state for convenience)

@@ -22,7 +22,7 @@ from pathlib import Path
 
 from lqr_optimizer._src.configs.config import model_choice, divergence_choice, lr_schedule_choice
 from lqr_optimizer._src.preconditioner import BasePreconditioner
-from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, compute_accuracy_and_loss, compute_batch_accuracy
+from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, compute_accuracy_and_loss, compute_batch_accuracy, compute_accuracy_and_loss_with_hists
 from lqr_optimizer._src.utils.dataloaders.hf_loaders import prepare_hf_dataset
 import lqr_optimizer._src.utils.utils as utl
 
@@ -76,8 +76,20 @@ def main(cfg: DictConfig):
       dataset_dir=cfg.dataset.dataset_dir,
       batch_overlap_fraction=cfg.batch_overlap_fraction,  # NEW
     )
+    if cfg.add_train_eval:
+      train_eval_dataloader, _ = prepare_dataloader(
+        batch_size=cfg.eval_batch_size,
+        train=True,
+        dataset=cfg.dataset.name,
+        augment_dataset=False,
+        lt_config=cfg.dataset.lt_config,  # IMPORTANT: same LT subset if you train LT
+        dataset_dir=cfg.dataset.dataset_dir,
+        batch_overlap_fraction=0.0,
+        shuffle=False,
+      )
     # precond_dataloader, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
-    test_dataloader, _ = prepare_dataloader(batch_size=cfg.eval_batch_size, train=False, dataset=cfg.dataset.name, dataset_dir=cfg.dataset.dataset_dir)
+    test_dataloader, test_ds_info = prepare_dataloader(batch_size=cfg.eval_batch_size, train=False, dataset=cfg.dataset.name, dataset_dir=cfg.dataset.dataset_dir)
+    test_ds_size = test_ds_info['ds_size']
   elif cfg.dataset.loader == "hf":
     dataloader, test_dataloader, ds_info = prepare_hf_dataset(cfg.dataset.name)(
       save_path = Path(cfg.dataset.dataset_dir),
@@ -86,6 +98,7 @@ def main(cfg: DictConfig):
       bptt = cfg.dataset.target_len,
       eval_batch_size = cfg.eval_batch_size,
       )
+    test_ds_size = ds_info['test_ds_size']
   else:
     raise ValueError(f"Loader missing or not supported for {cfg.dataset.name}")
   num_classes, train_ds_size = ds_info['num_classes'], ds_info['ds_size']
@@ -636,12 +649,29 @@ def main(cfg: DictConfig):
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
     if step % cfg.test_eval_freq == 0:
       test_time_start = time.time()
-      test_accuracy, test_loss = compute_accuracy_and_loss(state, test_dataloader)
+      if cfg.record_histograms:
+        test_accuracy, test_loss = compute_accuracy_and_loss_with_hists(state, test_dataloader, test_ds_size, run,
+                                                                        step=step, prefix='test')
+        _, _ = compute_accuracy_and_loss_with_hists(state, dataloader, train_ds_size, run,
+                                                                        step=step, prefix='train')
+      else:
+        test_accuracy, test_loss = compute_accuracy_and_loss(state, test_dataloader, test_ds_size)
       elapsed_time = time.time() - start_time + prev_elapsed_time
       run.track(test_accuracy, name="test accuracy", step=step)
       run.track(test_loss, name="test loss", step=step)
       run.track(test_accuracy, name="test accuracy|t", step=elapsed_time*100)
       run.track(test_loss, name="test loss|t", step=elapsed_time*100)
+      if cfg.add_train_eval:
+        if cfg.record_histograms:
+          train_eval_accuracy, train_eval_loss = compute_accuracy_and_loss_with_hists(state, train_eval_dataloader,
+                                                                                      num_samples=train_ds_size,
+                                                                                      run=run,
+                                                                                      step=step, prefix='train_eval')
+        else:
+          train_eval_accuracy, train_eval_loss = compute_accuracy_and_loss(state, train_eval_dataloader,
+                                                                           num_samples=train_ds_size)
+        run.track(train_eval_accuracy, name="train_eval accuracy", step=step)
+        run.track(train_eval_loss, name="train_eval loss", step=step)
       print("============================")
       print(f"Step {step} | Test Loss: {test_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
       print(f"Step {step} | Test Accuracy: {test_accuracy:.2f}%")

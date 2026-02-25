@@ -9,6 +9,8 @@ wd_mask: null # list of parameters type to exclude from wd
 total_epochs: 250 # used to be total_steps: 97656
 label_smoothing: 0.0 # smoothing applied over cross-entropy labels
 test_eval_freq: 2000
+add_train_eval: false # Record additional metrics on raw train dataset (no augmentation) at the same freq as test_eval
+record_histograms: false # Record histogram over p(correct class) and per-sample NLL, for analysis purpose
 checkpoint_freq: 1000 # Snapshot of model and training for preemption handling
 logging_freq: 10 # Base logging freq for training losses etc. with aim
 report_freq: 200 # Frequency (in steps) at which current training progress is reported in CLI
