@@ -13,11 +13,36 @@ def diag_r(penalty):
   return lambda v: penalty * v  # Equivalent to having R_i as an identity matrix x constant
 
 
+def _build_joint_transition_operator(layer_params, layer_state, simpler_apply):
+  """Build a single linearized transition operator and its transpose for one layer."""
+  flat_params = jnp.ravel(layer_params)
+  flat_state = jnp.ravel(layer_state)
+  param_size = flat_params.size
+  joint_primal = jnp.concatenate((flat_params, jnp.float32(flat_state)))
+
+  def flat_apply(joint_inputs):
+    joint_inputs = jnp.ravel(joint_inputs)
+    params_i = joint_inputs[:param_size]
+    state_i = joint_inputs[param_size:]
+    return ravel_pytree(simpler_apply(params_i, state_i))[0]
+
+  _, joint_linear = jax.linearize(flat_apply, joint_primal)
+  joint_transpose = jax.linear_transpose(joint_linear, joint_primal)
+
+  def transition(control_tangent, state_tangent):
+    joint_tangent = jnp.concatenate((jnp.ravel(control_tangent), jnp.ravel(state_tangent)))
+    return joint_linear(joint_tangent)
+
+  def transition_transpose(cotangent):
+    joint_cotangent = joint_transpose(jnp.ravel(jnp.atleast_1d(cotangent)))[0]
+    return joint_cotangent[:param_size], joint_cotangent[param_size:]
+
+  return transition, transition_transpose
+
+
 def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, other_model_variables=FrozenDict({})):
-  """ Function calculating the A and B matrices (jvp + vjp) of the linear transition layers of the LQR.
-  Also store the state variables for each layer application, to use as primal
-  """
-  a, b, a_transpose, b_transpose = [], [], [], []
+  """Build joint first-order transition operators and store the layer states."""
+  transitions, transition_transposes = [], []
   states = [batch]
   for i, layer_name in enumerate(layer_names):
     # unravel the layers params so that the jacobians have the right dimension, same for state
@@ -32,26 +57,11 @@ def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, ot
 
     # Recover next state
     states.append(simpler_apply(layer_params, layer_state))
+    transition, transition_transpose = _build_joint_transition_operator(layer_params, layer_state, simpler_apply)
+    transitions.append(transition)
+    transition_transposes.append(transition_transpose)
 
-    # Retrieve the vjp and jvp expressions of the jacobians (w/r to state and to controls)
-    def partial_apply_inputs(state):
-      return ravel_pytree(simpler_apply(layer_params, state))[0]
-
-    def partial_apply_params(params):
-      return ravel_pytree(simpler_apply(params, layer_state))[0]
-
-    # JVPs
-    _, b_fn = jax.linearize(partial_apply_params, layer_params)
-    _, a_fn = jax.linearize(partial_apply_inputs, jnp.float32(layer_state))
-    a.append(a_fn)
-    b.append(b_fn)
-    # VJPs
-    a_transpose_fn = vjp_f(partial_apply_inputs, x=layer_state)
-    # B_T_fn = vjp_f(partial_apply_params, layer_params)
-    a_transpose.append(a_transpose_fn)
-    # B_T_list.append(B_T_fn)
-
-  return a, b, a_transpose, states
+  return transitions, transition_transposes, states
 
 def __lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, other_model_variables=FrozenDict({})):
   """ Function calculating the A and B matrices (jvp + vjp) of the linear transition layers of the LQR.
@@ -183,7 +193,7 @@ def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_
   return _lqr_final_costs_and_adjoints_generic(loss_f, final_states, targets, div_f=div_f, div_arg=div_arg)
 
 
-def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, a_transpose, layers_apply, layer_names, damping,
+def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, transition_transposes, layers_apply, layer_names, damping,
                                        other_model_variables=FrozenDict({})):
   """ Retrieve, in backward order, the Q_i R_i and M_i matrices needed for the resolution of the Riccati equation
   """
@@ -208,7 +218,12 @@ def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, a_transpos
     def hamiltonian(parameters, p_i, x_i):
       return jnp.dot(ravel_pytree(simpler_apply(parameters, x_i))[0], p_i)
 
-    p_backward.append(a_transpose[j](jnp.ravel(p_backward[-1])))
+    backward_action = transition_transposes[j](jnp.ravel(p_backward[-1]))
+    if isinstance(backward_action, tuple):
+      _, state_adjoint = backward_action
+    else:
+      state_adjoint = backward_action
+    p_backward.append(state_adjoint)
 
     # R and Q calculations can only be removed when using relu activations
     # Get Q matrices

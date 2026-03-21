@@ -10,6 +10,18 @@ from jax.tree_util import Partial
 from lqr_optimizer._src.utils.build_lqr import __lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints, lqr_backward_matrices_and_adjoints
 from lqr_optimizer._src.utils.utils import add_f, subtract_f
 
+
+def _flatten_terminal_terms_for_exact_path(final_q, final_p, final_lin_cost):
+  """Adapt shared terminal terms to the flat-vector contract used by exact LQR."""
+  flat_final_p, _ = ravel_pytree(final_p)
+  flat_final_lin_cost, _ = ravel_pytree(final_lin_cost)
+
+  def flat_final_q(v):
+    qv = final_q(jnp.ravel(jnp.atleast_1d(v)))
+    return ravel_pytree(qv)[0]
+
+  return flat_final_q, flat_final_p, flat_final_lin_cost
+
 def make_newton_step(loss_to_params, apply_fn, *, damping=1e-4, tol=1e-5, maxiter=None):
   """
   Returns a function newton_step(params, x, y) -> (step, info)
@@ -62,14 +74,15 @@ def make_lqr_step(divergence_function,
     final_q, final_p, final_lin_cost = lqr_final_costs_and_adjoints(loss_fn, states[-1], y,
                                                                     div_f=divergence_function,
                                                                     div_arg=div_arg)
-    final_lin_cost = jnp.atleast_1d(final_lin_cost)
+    final_q, final_p, final_lin_cost = _flatten_terminal_terms_for_exact_path(
+      final_q, final_p, final_lin_cost)
     q_backward, r_backward, m_backward, m_transpose_backward = lqr_backward_matrices_and_adjoints(params, states,
                                                                                                   final_p,
                                                                                                   a_transpose,
                                                                                                   model.apply_block_from_params,
                                                                                                   _layer_names,
                                                                                                   damping)
-    state_sizes = [state.size for state in states]
+    state_sizes = [ravel_pytree(state)[0].size for state in states]
     lamb_list_rev, BKAM_list_rev, RBKB_inv_list_rev = retrieve_k_lambda_etc(
       final_q, final_lin_cost, a, a_transpose, b, b_transpose, q_backward, r_backward,
       m_backward, m_transpose_backward, state_sizes, _layer_names)
@@ -180,7 +193,8 @@ def get_update(x_0_size, A_list, B_list, B_T_list, BKAM_list_rev, lamb_list_rev,
   return u_tilde_list
 
 def recast_updates(params, update_list, layers_name):
+  recast = {}
   for i, l_name in enumerate(layers_name):
     layer_params, unravel_params_fn = ravel_pytree(params[l_name])
-    params[l_name] = unravel_params_fn(-1 * update_list[i])
-  return params
+    recast[l_name] = unravel_params_fn(-1 * update_list[i])
+  return recast

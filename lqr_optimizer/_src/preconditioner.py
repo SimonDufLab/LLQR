@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
-from flax.core.frozen_dict import FrozenDict
+from flax.core.frozen_dict import FrozenDict, freeze
 
 from lqr_optimizer._src.utils.utils import (normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm,
                                             get_per_layer_norm, _deep_copy_pytree, infer_batch_layout, get_per_layer_skews)
@@ -41,6 +41,23 @@ BLOCK_STRUCTURE_DICT = {
   'sym_swm_e-kfac': block_structures.Sym_SWM_EKFAC,
   'sym_swm_sep-e-kfac': block_structures.Sym_SWM_SeparableEKFAC,
 }
+
+
+def _recover_loss_gradients_from_transition_transposes(params, layer_names, transition_transposes, final_lin_cost):
+  """Recover the exact loss gradient by a reverse sweep over the joint transition transposes."""
+  state_cotangent = ravel_pytree(final_lin_cost)[0]
+  recovered_by_layer = {}
+
+  for layer_index in range(len(layer_names) - 1, -1, -1):
+    layer_name = layer_names[layer_index]
+    _, unravel_params_fn = ravel_pytree(params[layer_name])
+    param_cotangent, state_cotangent = transition_transposes[layer_index](state_cotangent)
+    recovered_by_layer[layer_name] = unravel_params_fn(jnp.ravel(jnp.atleast_1d(param_cotangent)))
+
+  ordered_recovered = {layer_name: recovered_by_layer[layer_name] for layer_name in layer_names}
+  if isinstance(params, FrozenDict):
+    return freeze(ordered_recovered)
+  return ordered_recovered
 
 class BasePreconditioner(abc.ABC):
   def __init__(self,
@@ -127,8 +144,8 @@ class BasePreconditioner(abc.ABC):
     if batch_solve_precond:
       def get_operators_and_gradients(params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
-        a, b, a_transpose, states = lqr_forward_matrices_and_states(inputs, params, self._layer_apply,
-                                                                    self._layer_names, other_model_variables)
+        transitions, transition_transposes, states = lqr_forward_matrices_and_states(
+          inputs, params, self._layer_apply, self._layer_names, other_model_variables)
         if self._divergence_args_index is not None:
           div_arg = states[self._divergence_args_index]
         else:
@@ -139,22 +156,23 @@ class BasePreconditioner(abc.ABC):
         final_lin_cost = jnp.atleast_1d(final_lin_cost)
         q_backward, r_backward, m_backward, m_transpose_backward = lqr_backward_matrices_and_adjoints(params, states,
                                                                                                       final_p,
-                                                                                                      a_transpose,
+                                                                                                      transition_transposes,
                                                                                                       self._layer_apply,
                                                                                                       self._layer_names,
                                                                                                       self._damping,
                                                                                                       other_model_variables)
-        gradients = jax.grad(compute_loss, argnums=0)(params, other_model_variables, inputs, targets)
+        gradients = _recover_loss_gradients_from_transition_transposes(
+          params, self._layer_names, transition_transposes, final_lin_cost)
         if precond_on_update:
           gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state, params)
         gradients = self._normalize_grad_for_lqr_fn(gradients)
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
 
-        return gradients, (a, b, q_backward, r_backward, m_backward, final_q, final_lin_cost)
+        return gradients, (transitions, q_backward, r_backward, m_backward, final_q, final_lin_cost)
 
       # def lqr_cost(_preconditioner, input_size, gradients, kernel_shapes, operators):
       def lqr_cost(_preconditioner, input_size, gradients, operators):
-        a, b, q_backward, r_backward, m_backward, final_q, final_lin_cost = operators
+        transitions, q_backward, r_backward, m_backward, final_q, final_lin_cost = operators
         cost = 0
         x = jnp.zeros(input_size)
         # u_dict = self._block_structure.train_matrix_product_for_scan(_preconditioner, gradients, kernel_shapes)
@@ -162,7 +180,7 @@ class BasePreconditioner(abc.ABC):
         for i, layer_name in enumerate(self._layer_names):
           u, _ = ravel_pytree(u_dict[layer_name])
           cost += (x.T @ q_backward[-i - 1](x) + u.T @ r_backward[-i - 1](u)) / 2 + u.T @ m_backward[-i - 1](x)
-          x = a[i](x) + b[i](u)
+          x = transitions[i](u, x)
 
         # cost += x.T @ jnp.squeeze(final_lin_cost) + (x.T @ final_q(x)) / 2 # squeeze is causing problems
         x1 = jnp.ravel(x)  # () -> (1,), (n,1)/(1,n)/(n,) -> (n,)
@@ -224,8 +242,8 @@ class BasePreconditioner(abc.ABC):
       @jax.jit
       def evaluate_lqr_grad(preconditioner, params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
-        a, b, a_transpose, states = lqr_forward_matrices_and_states(inputs, params, self._layer_apply,
-                                                                    self._layer_names, other_model_variables)
+        transitions, transition_transposes, states = lqr_forward_matrices_and_states(
+          inputs, params, self._layer_apply, self._layer_names, other_model_variables)
         if self._divergence_args_index is not None:
           div_arg = states[self._divergence_args_index]
         else:
@@ -236,7 +254,7 @@ class BasePreconditioner(abc.ABC):
         final_lin_cost = jnp.atleast_1d(final_lin_cost)
         q_backward, r_backward, m_backward, m_transpose_backward = lqr_backward_matrices_and_adjoints(params, states,
                                                                                                       final_p,
-                                                                                                      a_transpose,
+                                                                                                      transition_transposes,
                                                                                                       self._layer_apply,
                                                                                                       self._layer_names,
                                                                                                       self._damping,
@@ -254,7 +272,7 @@ class BasePreconditioner(abc.ABC):
           for i, layer_name in enumerate(self._layer_names):
             u, _ = ravel_pytree(u_dict[layer_name])
             cost += (x.T @ q_backward[-i - 1](x) + u.T @ r_backward[-i - 1](u)) / 2 + u.T @ m_backward[-i - 1](x)
-            x = a[i](x) + b[i](u)
+            x = transitions[i](u, x)
 
           # cost += x.T @ jnp.squeeze(final_lin_cost) + (x.T @ final_q(x)) / 2 # squeeze is causing problems
           x1 = jnp.ravel(x)  # () -> (1,), (n,1)/(1,n)/(n,) -> (n,)
