@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - _default
+
+# Internal agent-side smoke test profile for local CPU validation.
+total_epochs: 22
+warm_start_precond: false
+block_structure: e-kfac
