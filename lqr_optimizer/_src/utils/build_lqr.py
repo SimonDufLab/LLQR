@@ -5,7 +5,8 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
-from lqr_optimizer._src.utils.utils import vjp_f, add_f
+from lqr_optimizer._src.utils.divergence import ngd_divergence_f
+from lqr_optimizer._src.utils.utils import vjp_f, add_f, cross_entropy_loss
 
 
 def diag_r(penalty):
@@ -92,15 +93,47 @@ def __lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, 
 
   return a, b, a_transpose, b_transpose, states
 
-def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_arg=None):
-  """Handle a divergence function, for steepest descent
-  """
+def _get_cross_entropy_label_smoothing(loss_f):
+  if loss_f is cross_entropy_loss:
+    return 0.0
+  if isinstance(loss_f, Partial) and loss_f.func is cross_entropy_loss:
+    if loss_f.args:
+      return None
+    return loss_f.keywords.get("label_smoothing", 0.0)
+  return None
+
+
+def _is_ngd_divergence(div_f):
+  if div_f is ngd_divergence_f:
+    return True
+  if isinstance(div_f, Partial) and div_f.func is ngd_divergence_f and not div_f.args and not div_f.keywords:
+    return True
+  return False
+
+
+def _zero_linear_operator(v):
+  return jnp.zeros_like(v)
+
+
+def _cross_entropy_log_prob_gradient(log_probs, targets, label_smoothing):
+  num_classes = log_probs.shape[-1]
+  flat_log_probs = log_probs.reshape((-1, num_classes))
+  flat_targets = jnp.ravel(targets)
+  one_hot = jax.nn.one_hot(flat_targets, num_classes)
+
+  if label_smoothing > 0.0:
+    smooth = label_smoothing / num_classes
+    one_hot = (1.0 - label_smoothing) * one_hot + smooth
+
+  grad = -one_hot / flat_log_probs.shape[0]
+  return grad.reshape(log_probs.shape)
+
+
+def _lqr_final_costs_and_adjoints_generic(loss_f, final_states, targets, div_f=None, div_arg=None):
+  """Generic AD-based terminal-term construction."""
   if div_f: assert div_arg is not None, "div_arg must not be None when a divergence function is specified"
-  # if targets is not None:
   def loss_fn(outputs):
     return loss_f(outputs, targets)
-  # else:
-  #   loss_fn = lambda v: loss_f(v)
 
   grad_fn = jax.grad(loss_fn)
   final_lin_cost = grad_fn(final_states)
@@ -123,6 +156,31 @@ def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_
     # Q_T = diag_Ri(1)  # Should be zero for true gradient descent
 
     return final_q, final_lin_cost, final_lin_cost
+
+
+def _lqr_final_costs_and_adjoints_analytic_ce_ngd(final_states, targets, div_arg, label_smoothing):
+  final_lin_cost = _cross_entropy_log_prob_gradient(final_states, targets, label_smoothing)
+  final_p = -jnp.exp(div_arg)
+  return _zero_linear_operator, final_p, final_lin_cost
+
+
+def _lqr_final_costs_and_adjoints_analytic_ce_newton(final_states, targets, label_smoothing):
+  final_lin_cost = _cross_entropy_log_prob_gradient(final_states, targets, label_smoothing)
+  return _zero_linear_operator, final_lin_cost, final_lin_cost
+
+
+def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_arg=None):
+  """Handle terminal linear and quadratic terms for the relaxed LQR objective."""
+  label_smoothing = _get_cross_entropy_label_smoothing(loss_f)
+
+  if label_smoothing is not None and div_f is None:
+    return _lqr_final_costs_and_adjoints_analytic_ce_newton(final_states, targets, label_smoothing)
+
+  if label_smoothing is not None and _is_ngd_divergence(div_f):
+    assert div_arg is not None, "div_arg must not be None when a divergence function is specified"
+    return _lqr_final_costs_and_adjoints_analytic_ce_ngd(final_states, targets, div_arg, label_smoothing)
+
+  return _lqr_final_costs_and_adjoints_generic(loss_f, final_states, targets, div_f=div_f, div_arg=div_arg)
 
 
 def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, a_transpose, layers_apply, layer_names, damping,
