@@ -5,6 +5,7 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
+from lqr_optimizer._src.models.mlp import DenseRelu, InitDenseRelu
 from lqr_optimizer._src.utils.divergence import ngd_divergence_f
 from lqr_optimizer._src.utils.utils import vjp_f, add_f, cross_entropy_loss
 
@@ -80,6 +81,17 @@ def _build_control_only_transition_operator(layer_params, simpler_apply):
     return jnp.ravel(jnp.atleast_1d(param_cotangent))
 
   return transition, transition_transpose
+
+
+def _supports_piecewise_linear_active_fast_path(layer_module):
+  """Return whether the active K-builder can use the exact piecewise-linear fast path."""
+  if layer_module is None:
+    return False
+
+  if isinstance(layer_module, (InitDenseRelu, DenseRelu)):
+    return True
+
+  return False
 
 
 def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, other_model_variables=FrozenDict({})):
@@ -378,10 +390,13 @@ def lqr_backward_hamiltonian_operators(params, states, final_adjoint, transition
 
 def lqr_active_controllable_backward_hamiltonian_operators(params, states, final_adjoint, transition_transposes,
                                                            layers_apply, layer_names, damping,
-                                                           other_model_variables=FrozenDict({})):
+                                                           other_model_variables=FrozenDict({}),
+                                                           layer_modules=None):
   """Build active-path second-order operators with a control-only first layer."""
   if not layer_names:
     raise ValueError("lqr_active_controllable_backward_hamiltonian_operators expects at least one layer")
+  if layer_modules is not None and len(layer_modules) != len(layer_names):
+    raise ValueError("layer_modules must align with layer_names in the active controllable K builder")
 
   p_i = final_adjoint
   later_k_backward_rev = []
@@ -398,12 +413,28 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
     def hamiltonian_joint(parameters, x):
       return tree_vdot(simpler_apply(parameters, x), p_i)
 
-    _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
+    layer_module = None if layer_modules is None else layer_modules[j]
+    if _supports_piecewise_linear_active_fast_path(layer_module):
+      def grad_params_from_state(x):
+        return jax.grad(hamiltonian_joint, argnums=0)(layer_params, x)
 
-    def k_i(control_tangent, state_tangent, joint_hessian=joint_hessian, damping=damping):
-      flat_control = jnp.ravel(control_tangent)
-      k_u, k_x = joint_hessian(flat_control, state_tangent)
-      return k_u + damping * flat_control, k_x
+      def grad_state_from_params(parameters):
+        return jax.grad(hamiltonian_joint, argnums=1)(parameters, layer_state_primal)
+
+      _, mixed_param_from_state = jax.linearize(grad_params_from_state, layer_state_primal)
+      _, mixed_state_from_params = jax.linearize(grad_state_from_params, layer_params)
+
+      def k_i(control_tangent, state_tangent, mixed_param_from_state=mixed_param_from_state,
+              mixed_state_from_params=mixed_state_from_params, damping=damping):
+        flat_control = jnp.ravel(control_tangent)
+        return mixed_param_from_state(state_tangent) + damping * flat_control, mixed_state_from_params(flat_control)
+    else:
+      _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
+
+      def k_i(control_tangent, state_tangent, joint_hessian=joint_hessian, damping=damping):
+        flat_control = jnp.ravel(control_tangent)
+        k_u, k_x = joint_hessian(flat_control, state_tangent)
+        return k_u + damping * flat_control, k_x
 
     later_k_backward_rev.append(k_i)
 
@@ -420,11 +451,17 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
   def first_hamiltonian(parameters):
     return tree_vdot(first_simpler_apply(parameters), p_i)
 
-  _, first_r = jax.linearize(jax.grad(first_hamiltonian), first_layer_params)
+  first_layer_module = None if layer_modules is None else layer_modules[0]
+  if _supports_piecewise_linear_active_fast_path(first_layer_module):
+    def first_k(control_tangent, damping=damping):
+      flat_control = jnp.ravel(control_tangent)
+      return damping * flat_control
+  else:
+    _, first_r = jax.linearize(jax.grad(first_hamiltonian), first_layer_params)
 
-  def first_k(control_tangent, first_r=first_r, damping=damping):
-    flat_control = jnp.ravel(control_tangent)
-    return first_r(flat_control) + damping * flat_control
+    def first_k(control_tangent, first_r=first_r, damping=damping):
+      flat_control = jnp.ravel(control_tangent)
+      return first_r(flat_control) + damping * flat_control
 
   return first_k, list(reversed(later_k_backward_rev))
 

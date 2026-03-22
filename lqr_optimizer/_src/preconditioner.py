@@ -247,6 +247,7 @@ class BasePreconditioner(abc.ABC):
                                                                   block_structure_init, rank=precond_rank,
                                                                   identity_scale=precond_identity_scaling)
     self._block_structure_name = block_structure
+    self._layer_modules = tuple(model.layers) if hasattr(model, "layers") else None
     # self._block_structure.make_blocks(network_params, model.layer_names)
     self._layer_apply = model.apply_block_from_params
     self._model_apply = model.apply
@@ -316,7 +317,7 @@ class BasePreconditioner(abc.ABC):
         final_lin_cost = jnp.atleast_1d(final_lin_cost)
         first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators(
           params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
-          self._damping, other_model_variables)
+          self._damping, other_model_variables, layer_modules=self._layer_modules)
         gradients = _recover_loss_gradients_from_transition_transposes(
           params, self._layer_names, transition_transposes, final_lin_cost,
           first_transition_transpose=first_transition_transpose)
