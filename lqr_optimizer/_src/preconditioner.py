@@ -111,6 +111,14 @@ def _active_lqr_control_cost(layer_names, flat_controls, first_transition, trans
   later_state_inputs, final_state = _rollout_active_control_states(
     layer_names, flat_controls, first_transition, transitions)
 
+  return _active_lqr_control_cost_from_rollout(
+    layer_names, flat_controls, later_state_inputs, final_state,
+    first_k_backward, k_backward, final_q, final_lin_cost)
+
+
+def _active_lqr_control_cost_from_rollout(layer_names, flat_controls, later_state_inputs, final_state,
+                                          first_k_backward, k_backward, final_q, final_lin_cost):
+  """Evaluate the fixed-control active LLQR cost from a precomputed rollout."""
   first_layer_name = layer_names[0]
   cost = jnp.dot(flat_controls[first_layer_name], first_k_backward(flat_controls[first_layer_name])) / 2
 
@@ -151,6 +159,61 @@ def _recover_control_gradients_from_active_lqr_adjoint(layer_names, flat_control
   )
 
   return {layer_name: recovered_by_layer[layer_name] for layer_name in layer_names}
+
+
+def _recover_preconditioner_gradients_from_active_control_adjoint(block_structure, blocks, layer_names,
+                                                                  prepared_gradients, operators):
+  """Recover exact preconditioner gradients from the active control adjoint."""
+  (first_transition, first_transition_transpose, transitions, transition_transposes,
+   first_k_backward, k_backward, final_q, final_lin_cost) = operators
+  flat_controls = _materialize_active_flat_controls(
+    block_structure, blocks, layer_names, prepared_gradients)
+  later_state_inputs, final_state = _rollout_active_control_states(
+    layer_names, flat_controls, first_transition, transitions)
+  control_gradients = _recover_control_gradients_from_active_lqr_adjoint(
+    layer_names, flat_controls, later_state_inputs, final_state,
+    first_transition_transpose, transition_transposes,
+    first_k_backward, k_backward, final_q, final_lin_cost)
+
+  recovered_by_layer = {
+    layer_name: block_structure.preconditioner_param_pullback_flat_layer(
+      blocks, layer_name, prepared_gradients[layer_name], control_gradients[layer_name]
+    )
+    for layer_name in layer_names
+  }
+
+  if isinstance(blocks, FrozenDict):
+    return freeze(recovered_by_layer)
+  return recovered_by_layer
+
+
+def _active_preconditioner_value_and_grad_from_control_adjoint(block_structure, blocks, layer_names,
+                                                               prepared_gradients, operators):
+  """Evaluate the active LLQR objective and exact preconditioner gradient without global reverse-mode AD."""
+  (first_transition, first_transition_transpose, transitions, transition_transposes,
+   first_k_backward, k_backward, final_q, final_lin_cost) = operators
+  flat_controls = _materialize_active_flat_controls(
+    block_structure, blocks, layer_names, prepared_gradients)
+  later_state_inputs, final_state = _rollout_active_control_states(
+    layer_names, flat_controls, first_transition, transitions)
+  value = _active_lqr_control_cost_from_rollout(
+    layer_names, flat_controls, later_state_inputs, final_state,
+    first_k_backward, k_backward, final_q, final_lin_cost)
+  control_gradients = _recover_control_gradients_from_active_lqr_adjoint(
+    layer_names, flat_controls, later_state_inputs, final_state,
+    first_transition_transpose, transition_transposes,
+    first_k_backward, k_backward, final_q, final_lin_cost)
+
+  recovered_by_layer = {
+    layer_name: block_structure.preconditioner_param_pullback_flat_layer(
+      blocks, layer_name, prepared_gradients[layer_name], control_gradients[layer_name]
+    )
+    for layer_name in layer_names
+  }
+
+  if isinstance(blocks, FrozenDict):
+    recovered_by_layer = freeze(recovered_by_layer)
+  return value, recovered_by_layer
 
 class BasePreconditioner(abc.ABC):
   def __init__(self,
@@ -263,11 +326,14 @@ class BasePreconditioner(abc.ABC):
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
         prepared_gradients = self._block_structure.prepare_train_vectors(gradients)
 
-        return prepared_gradients, (first_transition, transitions, first_k_backward, k_backward, final_q, final_lin_cost)
+        return prepared_gradients, (
+          first_transition, first_transition_transpose, transitions, transition_transposes,
+          first_k_backward, k_backward, final_q, final_lin_cost)
 
       # def lqr_cost(_preconditioner, input_size, gradients, kernel_shapes, operators):
       def lqr_cost(_preconditioner, prepared_gradients, operators):
-        first_transition, transitions, first_k_backward, k_backward, final_q, final_lin_cost = operators
+        (first_transition, _, transitions, _,
+         first_k_backward, k_backward, final_q, final_lin_cost) = operators
         cost = 0
 
         first_u = self._block_structure.train_matrix_product_flat_layer(
@@ -295,12 +361,13 @@ class BasePreconditioner(abc.ABC):
         return grads
 
       def lqr_grad_only_fn(_preconditioner, prepared_gradients, operators):
-        grads = jax.grad(lqr_cost, argnums=0)(_preconditioner, prepared_gradients, operators)
+        grads = _recover_preconditioner_gradients_from_active_control_adjoint(
+          self._block_structure, _preconditioner, self._layer_names, prepared_gradients, operators)
         return _sanitize_preconditioner_grads(grads)
 
       def lqr_value_and_grad_fn(_preconditioner, prepared_gradients, operators):
-        value, grads = jax.value_and_grad(lqr_cost, argnums=0)(
-          _preconditioner, prepared_gradients, operators)
+        value, grads = _active_preconditioner_value_and_grad_from_control_adjoint(
+          self._block_structure, _preconditioner, self._layer_names, prepared_gradients, operators)
         grads = _sanitize_preconditioner_grads(grads)
         return value, grads
 

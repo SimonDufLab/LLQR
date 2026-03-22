@@ -80,6 +80,19 @@ class BlockStructures(abc.ABC):
     layer_product = self.train_matrix_product(blocks, {layer_name: prepared_layer_vector})[layer_name]
     return ravel_pytree(layer_product)[0]
 
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    """Generic exact pullback from flat layer outputs back to block parameters."""
+    layer_blocks = blocks[layer_name]
+    output_cotangent_flat = jnp.ravel(jnp.atleast_1d(output_cotangent_flat))
+
+    def flat_layer_product(_layer_blocks):
+      return self.train_matrix_product_flat_layer(
+        {layer_name: _layer_blocks}, layer_name, prepared_layer_vector
+      )
+
+    _, vjp_fn = jax.vjp(flat_layer_product, layer_blocks)
+    return vjp_fn(output_cotangent_flat)[0]
+
   def matrix_product(self,
                      blocks,
                      vectors,
