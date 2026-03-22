@@ -12,8 +12,11 @@ from flax.core.frozen_dict import FrozenDict, freeze
 from lqr_optimizer._src.utils.utils import (normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm,
                                             get_per_layer_norm, _deep_copy_pytree, infer_batch_layout, get_per_layer_skews)
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
-from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states, lqr_final_costs_and_adjoints,
-                             lqr_backward_matrices_and_adjoints)
+from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
+                             lqr_active_controllable_forward_operators_and_states,
+                             lqr_final_costs_and_adjoints, lqr_backward_matrices_and_adjoints,
+                             lqr_backward_hamiltonian_operators,
+                             lqr_active_controllable_backward_hamiltonian_operators, tree_vdot)
 
 BLOCK_STRUCTURE_DICT = {
   'dense': block_structures.DenseBlock,
@@ -43,16 +46,26 @@ BLOCK_STRUCTURE_DICT = {
 }
 
 
-def _recover_loss_gradients_from_transition_transposes(params, layer_names, transition_transposes, final_lin_cost):
+def _recover_loss_gradients_from_transition_transposes(params, layer_names, transition_transposes, final_lin_cost,
+                                                       *, first_transition_transpose=None):
   """Recover the exact loss gradient by a reverse sweep over the joint transition transposes."""
-  state_cotangent = ravel_pytree(final_lin_cost)[0]
+  state_cotangent = final_lin_cost
   recovered_by_layer = {}
 
-  for layer_index in range(len(layer_names) - 1, -1, -1):
+  start_index = len(layer_names) - 1
+  stop_index = -1 if first_transition_transpose is None else 0
+  for layer_index in range(start_index, stop_index, -1):
     layer_name = layer_names[layer_index]
     _, unravel_params_fn = ravel_pytree(params[layer_name])
-    param_cotangent, state_cotangent = transition_transposes[layer_index](state_cotangent)
+    transpose_index = layer_index if first_transition_transpose is None else layer_index - 1
+    param_cotangent, state_cotangent = transition_transposes[transpose_index](state_cotangent)
     recovered_by_layer[layer_name] = unravel_params_fn(jnp.ravel(jnp.atleast_1d(param_cotangent)))
+
+  if first_transition_transpose is not None:
+    first_layer_name = layer_names[0]
+    _, unravel_params_fn = ravel_pytree(params[first_layer_name])
+    param_cotangent = first_transition_transpose(state_cotangent)
+    recovered_by_layer[first_layer_name] = unravel_params_fn(jnp.ravel(jnp.atleast_1d(param_cotangent)))
 
   ordered_recovered = {layer_name: recovered_by_layer[layer_name] for layer_name in layer_names}
   if isinstance(params, FrozenDict):
@@ -144,8 +157,10 @@ class BasePreconditioner(abc.ABC):
     if batch_solve_precond:
       def get_operators_and_gradients(params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
-        transitions, transition_transposes, states = lqr_forward_matrices_and_states(
+        first_transition, first_transition_transpose, transitions, transition_transposes, states = (
+          lqr_active_controllable_forward_operators_and_states(
           inputs, params, self._layer_apply, self._layer_names, other_model_variables)
+        )
         if self._divergence_args_index is not None:
           div_arg = states[self._divergence_args_index]
         else:
@@ -154,48 +169,48 @@ class BasePreconditioner(abc.ABC):
                                                                         div_f=self._divergence_function,
                                                                         div_arg=div_arg)
         final_lin_cost = jnp.atleast_1d(final_lin_cost)
-        q_backward, r_backward, m_backward, m_transpose_backward = lqr_backward_matrices_and_adjoints(params, states,
-                                                                                                      final_p,
-                                                                                                      transition_transposes,
-                                                                                                      self._layer_apply,
-                                                                                                      self._layer_names,
-                                                                                                      self._damping,
-                                                                                                      other_model_variables)
+        first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators(
+          params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
+          self._damping, other_model_variables)
         gradients = _recover_loss_gradients_from_transition_transposes(
-          params, self._layer_names, transition_transposes, final_lin_cost)
+          params, self._layer_names, transition_transposes, final_lin_cost,
+          first_transition_transpose=first_transition_transpose)
         if precond_on_update:
           gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state, params)
         gradients = self._normalize_grad_for_lqr_fn(gradients)
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
 
-        return gradients, (transitions, q_backward, r_backward, m_backward, final_q, final_lin_cost)
+        return gradients, (first_transition, transitions, first_k_backward, k_backward, final_q, final_lin_cost)
 
       # def lqr_cost(_preconditioner, input_size, gradients, kernel_shapes, operators):
-      def lqr_cost(_preconditioner, input_size, gradients, operators):
-        transitions, q_backward, r_backward, m_backward, final_q, final_lin_cost = operators
+      def lqr_cost(_preconditioner, gradients, operators):
+        first_transition, transitions, first_k_backward, k_backward, final_q, final_lin_cost = operators
         cost = 0
-        x = jnp.zeros(input_size)
         # u_dict = self._block_structure.train_matrix_product_for_scan(_preconditioner, gradients, kernel_shapes)
         u_dict = self._block_structure.train_matrix_product(_preconditioner, gradients)
-        for i, layer_name in enumerate(self._layer_names):
+
+        first_u, _ = ravel_pytree(u_dict[self._layer_names[0]])
+        cost += jnp.dot(first_u, first_k_backward(first_u)) / 2
+        x = first_transition(first_u)
+
+        for i, layer_name in enumerate(self._layer_names[1:]):
           u, _ = ravel_pytree(u_dict[layer_name])
-          cost += (x.T @ q_backward[-i - 1](x) + u.T @ r_backward[-i - 1](u)) / 2 + u.T @ m_backward[-i - 1](x)
+          k_u, k_x = k_backward[i](u, x)
+          cost += (jnp.dot(u, k_u) + tree_vdot(x, k_x)) / 2
           x = transitions[i](u, x)
 
-        # cost += x.T @ jnp.squeeze(final_lin_cost) + (x.T @ final_q(x)) / 2 # squeeze is causing problems
-        x1 = jnp.ravel(x)  # () -> (1,), (n,1)/(1,n)/(n,) -> (n,)
+        x1 = ravel_pytree(x)[0]
         c1 = jnp.ravel(final_lin_cost)
-        qx1 = jnp.ravel(final_q(x))  # final_q(x) = Qx
+        qx1 = ravel_pytree(final_q(x1))[0]
 
         cost += jnp.dot(x1, c1) + 0.5 * jnp.dot(x1, qx1)
 
         return cost
 
       # def lqr_grad_fn(_preconditioner, input_size, gradients, kernel_shapes, operators):
-      def lqr_grad_fn(_preconditioner, input_size, gradients, operators):
+      def lqr_grad_fn(_preconditioner, gradients, operators):
         v, grads = jax.value_and_grad(lqr_cost, argnums=0)(
-          # _preconditioner, input_size, gradients, kernel_shapes, operators)
-          _preconditioner, input_size, gradients, operators)
+          _preconditioner, gradients, operators)
         grads = jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=1.0, neginf=-1.0), grads)
         # grads = jax.tree_map(zero_if_bad, grads)
         # print(jax.tree_map(lambda g: g.shape, grads))
@@ -205,15 +220,12 @@ class BasePreconditioner(abc.ABC):
       def _get_update(preconditioner, opt_state, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
         gradients, operators = get_operators_and_gradients(
           params, other_model_variables, datapoint, trainstate_opt_state)
-        # gradients, kernel_shapes = self._block_structure.prepare_vectors(gradients)
-        input_size = datapoint[0].size
 
         # Define a single update step to be run in the compiled loop.
         def update_step(carry, _):
           precond, opt_state = carry
-          # precond_grad = lqr_grad_fn(precond, input_size, gradients, kernel_shapes, operators)
-          _, precond_grad = lqr_grad_fn(precond, input_size, gradients, operators)
-          extra_args = {'value_and_grad_fn': Partial(lqr_grad_fn, input_size=input_size, gradients=gradients, operators=operators)}
+          _, precond_grad = lqr_grad_fn(precond, gradients, operators)
+          extra_args = {'value_and_grad_fn': Partial(lqr_grad_fn, gradients=gradients, operators=operators)}
           updates, opt_state = optax_solver.update(precond_grad, opt_state, precond, **extra_args)
           updates = jax.tree_map(lambda g: g * precond_lr, updates)
           new_precond = optax.apply_updates(precond, updates)

@@ -56,10 +56,9 @@ class GPTSelfAttention(nn.Module):
     deterministic: bool = True
 
     @nn.compact
-    def __call__(self, x, mask: jnp.ndarray):
+    def __call__(self, x):
         """
         x:    [B, L, D]
-        mask: [B, L, L] boolean, True => masked
         returns: [B, L, D]
         """
         B, L, D = x.shape
@@ -67,6 +66,7 @@ class GPTSelfAttention(nn.Module):
         d = self.attn_dim
         inner = h * d
         scale = d ** -0.5
+        mask = causal_attn_mask(L, B)
 
         qkv = nn.Dense(3 * inner, use_bias=False, name="qkv")(x)  # [B, L, 3*H*d]
         qkv = qkv.reshape(B, L, 3, h, d)
@@ -126,12 +126,8 @@ class GPTBlock(nn.Module):
     deterministic: bool = True
 
     @nn.compact
-    def __call__(self, inputs):
-        """
-        inputs: (x, mask) or (x, mask, deterministic)
-        returns: same tuple shape
-        """
-        x, mask = inputs
+    def __call__(self, x):
+        """Input and output are both the differentiable hidden state `x`."""
 
         # Self-attention sublayer
         y = x
@@ -143,7 +139,7 @@ class GPTBlock(nn.Module):
             attn_dim=self.attn_dim,
             attn_dropout=self.attn_dropout,
             deterministic=self.deterministic,
-        )(y, mask)
+        )(y)
         y = nn.Dropout(rate=self.resid_dropout)(y, deterministic=self.deterministic)
         x = x + y
         if not self.norm_first and self.layer_norm:
@@ -162,7 +158,7 @@ class GPTBlock(nn.Module):
             if not self.norm_first and self.layer_norm:
                 x = nn.LayerNorm(epsilon=self.layer_norm_eps)(x)
 
-        return (x, mask)
+        return x
 
 
 # -----------------------
@@ -182,11 +178,7 @@ class GPTInitLayer(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        """
-        x_in: tokens [B, L] (int32)
-        returns: (x, mask, deterministic)
-        If caller passes a tuple (x, deterministic), we keep their flag.
-        """
+        """x_in: tokens [B, L] (int32), returns hidden state [B, L, D]."""
 
         x = x.astype(jnp.int32)
         B, L = x.shape
@@ -204,8 +196,7 @@ class GPTInitLayer(nn.Module):
         else:
             x = nn.Dropout(rate=self.embd_dropout)(x, deterministic=self.deterministic)
 
-        mask = causal_attn_mask(L, B)  # [B, L, L]
-        return (x, mask)
+        return x
 
 
 class GPTFinalLayer(nn.Module):
@@ -215,12 +206,8 @@ class GPTFinalLayer(nn.Module):
     deterministic: bool = True
 
     @nn.compact
-    def __call__(self, inputs):
-        """
-        inputs: (x, mask) or (x, mask, deterministic)
-        returns: logits flattened as [B*L, V]
-        """
-        x, mask = inputs
+    def __call__(self, x):
+        """Returns logits flattened as [B*L, V]."""
 
         if self.use_final_ln:
             x = nn.LayerNorm(epsilon=self.layer_norm_eps, name="final_ln")(x)

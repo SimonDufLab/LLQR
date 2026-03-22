@@ -23,11 +23,12 @@ class MaskedAttention(nn.Module):
     attn_dim: int = 64
 
     @nn.compact
-    def __call__(self, x, mask):
+    def __call__(self, x):
         B, N, _ = x.shape
         dim_head = self.attn_dim
         inner_dim = dim_head * self.heads
         scale = dim_head ** -0.5
+        mask = causal_attn_mask(N, B)
 
         qkv = nn.Dense(inner_dim * 3, use_bias=False)(x)
         qkv = qkv.reshape(B, N, 3, self.heads, dim_head)
@@ -63,15 +64,14 @@ class TransfLayer(nn.Module):
     mlp_dim: int
 
     @nn.compact
-    def __call__(self, inputs):
-        x, mask = inputs
+    def __call__(self, x):
         x_norm1 = LayerNorm()(x)
-        attn_out = MaskedAttention(self.dim, self.heads, self.attn_dim)(x_norm1, mask)
+        attn_out = MaskedAttention(self.dim, self.heads, self.attn_dim)(x_norm1)
         x = x + attn_out
         x_norm2 = LayerNorm()(x)
         ff_out = FeedForward(self.dim, self.mlp_dim)(x_norm2)
         x = x + ff_out
-        return (x, mask)
+        return x
 
 class InitLayer(nn.Module):
     vocab_size: int
@@ -91,17 +91,14 @@ class InitLayer(nn.Module):
         pos_emb = self.param("pos_embedding", nn.initializers.normal(stddev=1.0), (self.max_length, self.hidden_dim))
         pos = pos_emb[pos_idx]
         x = emb * jnp.sqrt(self.hidden_dim) + pos[None, :, :]
-        mask = causal_attn_mask(L, B)
-        inputs = (x, mask)
-        x, mask = TransfLayer(self.hidden_dim, self.heads, self.attn_dim, self.mlp_dim)(inputs)
-        return (x, mask)
+        x = TransfLayer(self.hidden_dim, self.heads, self.attn_dim, self.mlp_dim)(x)
+        return x
 
 class LastLayer(nn.Module):
     num_classes: int
 
     @nn.compact
-    def __call__(self, inputs):
-        x, mask = inputs
+    def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
         x = LayerNorm()(x)
         x = nn.Dense(self.num_classes)(x)

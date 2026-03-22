@@ -13,29 +13,71 @@ def diag_r(penalty):
   return lambda v: penalty * v  # Equivalent to having R_i as an identity matrix x constant
 
 
+def tree_vdot(lhs, rhs):
+  lhs_leaves = jax.tree_util.tree_leaves(lhs)
+  rhs_leaves = jax.tree_util.tree_leaves(rhs)
+  if len(lhs_leaves) != len(rhs_leaves):
+    raise ValueError("tree_vdot expects matching pytree structures")
+  return sum(jnp.vdot(lhs_leaf, rhs_leaf) for lhs_leaf, rhs_leaf in zip(lhs_leaves, rhs_leaves))
+
+
+def zero_tangent_tree_like(state):
+  def zeros_like_tangent(leaf):
+    dtype = leaf.dtype if jnp.issubdtype(leaf.dtype, jnp.inexact) else jnp.float32
+    return jnp.zeros(leaf.shape, dtype=dtype)
+
+  return jax.tree_util.tree_map(zeros_like_tangent, state)
+
+
+def _state_primal_for_linearization(state):
+  def promote_leaf(leaf):
+    return leaf if jnp.issubdtype(leaf.dtype, jnp.inexact) else leaf.astype(jnp.float32)
+
+  return jax.tree_util.tree_map(promote_leaf, state)
+
+
+def _cast_state_like(reference_state, state):
+  def cast_leaf(reference_leaf, state_leaf):
+    if reference_leaf.dtype == state_leaf.dtype:
+      return state_leaf
+    return state_leaf.astype(reference_leaf.dtype)
+
+  return jax.tree_util.tree_map(cast_leaf, reference_state, state)
+
+
 def _build_joint_transition_operator(layer_params, layer_state, simpler_apply):
   """Build a single linearized transition operator and its transpose for one layer."""
-  flat_params = jnp.ravel(layer_params)
-  flat_state = jnp.ravel(layer_state)
-  param_size = flat_params.size
-  joint_primal = jnp.concatenate((flat_params, jnp.float32(flat_state)))
+  layer_state_primal = _state_primal_for_linearization(layer_state)
 
-  def flat_apply(joint_inputs):
-    joint_inputs = jnp.ravel(joint_inputs)
-    params_i = joint_inputs[:param_size]
-    state_i = joint_inputs[param_size:]
-    return ravel_pytree(simpler_apply(params_i, state_i))[0]
+  def apply_from_linear_state(parameters, state):
+    return simpler_apply(parameters, _cast_state_like(layer_state, state))
 
-  _, joint_linear = jax.linearize(flat_apply, joint_primal)
-  joint_transpose = jax.linear_transpose(joint_linear, joint_primal)
+  _, joint_linear = jax.linearize(apply_from_linear_state, layer_params, layer_state_primal)
+  joint_transpose = jax.linear_transpose(joint_linear, layer_params, layer_state_primal)
 
   def transition(control_tangent, state_tangent):
-    joint_tangent = jnp.concatenate((jnp.ravel(control_tangent), jnp.ravel(state_tangent)))
-    return joint_linear(joint_tangent)
+    return joint_linear(jnp.ravel(control_tangent), state_tangent)
 
   def transition_transpose(cotangent):
-    joint_cotangent = joint_transpose(jnp.ravel(jnp.atleast_1d(cotangent)))[0]
-    return joint_cotangent[:param_size], joint_cotangent[param_size:]
+    param_cotangent, state_cotangent = joint_transpose(cotangent)
+    return jnp.ravel(jnp.atleast_1d(param_cotangent)), state_cotangent
+
+  return transition, transition_transpose
+
+
+def _build_control_only_transition_operator(layer_params, simpler_apply):
+  """Build a control-only transition operator with a fixed input state."""
+  _, control_linear = jax.linearize(simpler_apply, layer_params)
+  control_transpose = jax.linear_transpose(control_linear, layer_params)
+
+  def transition(control_tangent):
+    return control_linear(jnp.ravel(control_tangent))
+
+  def transition_transpose(cotangent):
+    param_cotangent = control_transpose(cotangent)
+    if isinstance(param_cotangent, tuple):
+      param_cotangent = param_cotangent[0]
+    return jnp.ravel(jnp.atleast_1d(param_cotangent))
 
   return transition, transition_transpose
 
@@ -47,13 +89,12 @@ def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, ot
   for i, layer_name in enumerate(layer_names):
     # unravel the layers params so that the jacobians have the right dimension, same for state
     layer_params, unravel_params_fn = ravel_pytree(params[layer_name])
-    layer_state, unravel_state = ravel_pytree(states[i])
+    layer_state = states[i]
     layer_other_vars = {k: v.get(layer_name, {}) for k, v in other_model_variables.items()}
 
     # Define a simpler state transition function (layer propagation) for jacobians retrieval
     def simpler_apply(parameters, x):
-      # return trans_fn.apply({'params': unravel_params_fn(parameters)}, unravel_state(x))
-      return layers_apply({'params': unravel_params_fn(parameters)}|layer_other_vars, unravel_state(x), i)
+      return layers_apply({'params': unravel_params_fn(parameters)}|layer_other_vars, x, i)
 
     # Recover next state
     states.append(simpler_apply(layer_params, layer_state))
@@ -62,6 +103,44 @@ def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, ot
     transition_transposes.append(transition_transpose)
 
   return transitions, transition_transposes, states
+
+
+def lqr_active_controllable_forward_operators_and_states(batch, params, layers_apply, layer_names,
+                                                         other_model_variables=FrozenDict({})):
+  """Build active-path operators with a control-only first layer and PyTree-native later state."""
+  if not layer_names:
+    raise ValueError("lqr_active_controllable_forward_operators_and_states expects at least one layer")
+
+  states = [batch]
+
+  first_layer_name = layer_names[0]
+  first_layer_params, unravel_first_params_fn = ravel_pytree(params[first_layer_name])
+  first_layer_other_vars = {k: v.get(first_layer_name, {}) for k, v in other_model_variables.items()}
+  fixed_input_state = states[0]
+
+  def first_simpler_apply(parameters):
+    return layers_apply({'params': unravel_first_params_fn(parameters)} | first_layer_other_vars, fixed_input_state, 0)
+
+  states.append(first_simpler_apply(first_layer_params))
+  first_transition, first_transition_transpose = _build_control_only_transition_operator(
+    first_layer_params, first_simpler_apply)
+
+  transitions, transition_transposes = [], []
+  for i, layer_name in enumerate(layer_names[1:], start=1):
+    layer_params, unravel_params_fn = ravel_pytree(params[layer_name])
+    layer_state = states[i]
+    layer_other_vars = {k: v.get(layer_name, {}) for k, v in other_model_variables.items()}
+
+    def simpler_apply(parameters, x):
+      return layers_apply({'params': unravel_params_fn(parameters)} | layer_other_vars, x, i)
+
+    states.append(simpler_apply(layer_params, layer_state))
+    transition, transition_transpose = _build_joint_transition_operator(layer_params, layer_state, simpler_apply)
+    transitions.append(transition)
+    transition_transposes.append(transition_transpose)
+
+  return first_transition, first_transition_transpose, transitions, transition_transposes, states
+
 
 def __lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, other_model_variables=FrozenDict({})):
   """ Function calculating the A and B matrices (jvp + vjp) of the linear transition layers of the LQR.
@@ -255,6 +334,99 @@ def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, transition
     m_transpose_backward.append(m_i_transpose)
 
   return q_backward, r_backward, m_backward, m_transpose_backward
+
+
+def lqr_backward_hamiltonian_operators(params, states, final_adjoint, transition_transposes, layers_apply, layer_names,
+                                       damping, other_model_variables=FrozenDict({})):
+  """Build one joint second-order Hamiltonian operator per layer for the active path."""
+  p_backward = [final_adjoint]
+  k_backward = []
+  for i, layer_name in enumerate(layer_names[::-1]):
+    j = len(layer_names) - i - 1
+
+    layer_params, unravel_params_fn = ravel_pytree(params[layer_name])
+    layer_state = states[j]
+    layer_other_vars = {k: v.get(layer_name, {}) for k, v in other_model_variables.items()}
+    layer_state_primal = _state_primal_for_linearization(layer_state)
+
+    def simpler_apply(parameters, x):
+      return layers_apply({'params': unravel_params_fn(parameters)} | layer_other_vars, _cast_state_like(layer_state, x), j)
+
+    backward_action = transition_transposes[j](p_backward[-1])
+    if isinstance(backward_action, tuple):
+      _, state_adjoint = backward_action
+    else:
+      state_adjoint = backward_action
+    p_backward.append(state_adjoint)
+
+    p_i = p_backward[i]
+
+    def hamiltonian_joint(parameters, x):
+      return tree_vdot(simpler_apply(parameters, x), p_i)
+
+    _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
+
+    def k_i(control_tangent, state_tangent, joint_hessian=joint_hessian, damping=damping):
+      flat_control = jnp.ravel(control_tangent)
+      k_u, k_x = joint_hessian(flat_control, state_tangent)
+      return k_u + damping * flat_control, k_x
+
+    k_backward.append(k_i)
+
+  return k_backward
+
+
+def lqr_active_controllable_backward_hamiltonian_operators(params, states, final_adjoint, transition_transposes,
+                                                           layers_apply, layer_names, damping,
+                                                           other_model_variables=FrozenDict({})):
+  """Build active-path second-order operators with a control-only first layer."""
+  if not layer_names:
+    raise ValueError("lqr_active_controllable_backward_hamiltonian_operators expects at least one layer")
+
+  p_i = final_adjoint
+  later_k_backward_rev = []
+  for reverse_index, layer_name in enumerate(layer_names[:0:-1]):
+    j = len(layer_names) - reverse_index - 1
+    layer_params, unravel_params_fn = ravel_pytree(params[layer_name])
+    layer_state = states[j]
+    layer_other_vars = {k: v.get(layer_name, {}) for k, v in other_model_variables.items()}
+    layer_state_primal = _state_primal_for_linearization(layer_state)
+
+    def simpler_apply(parameters, x):
+      return layers_apply({'params': unravel_params_fn(parameters)} | layer_other_vars, _cast_state_like(layer_state, x), j)
+
+    def hamiltonian_joint(parameters, x):
+      return tree_vdot(simpler_apply(parameters, x), p_i)
+
+    _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
+
+    def k_i(control_tangent, state_tangent, joint_hessian=joint_hessian, damping=damping):
+      flat_control = jnp.ravel(control_tangent)
+      k_u, k_x = joint_hessian(flat_control, state_tangent)
+      return k_u + damping * flat_control, k_x
+
+    later_k_backward_rev.append(k_i)
+
+    _, p_i = transition_transposes[j - 1](p_i)
+
+  first_layer_name = layer_names[0]
+  first_layer_params, unravel_first_params_fn = ravel_pytree(params[first_layer_name])
+  first_layer_other_vars = {k: v.get(first_layer_name, {}) for k, v in other_model_variables.items()}
+  fixed_input_state = states[0]
+
+  def first_simpler_apply(parameters):
+    return layers_apply({'params': unravel_first_params_fn(parameters)} | first_layer_other_vars, fixed_input_state, 0)
+
+  def first_hamiltonian(parameters):
+    return tree_vdot(first_simpler_apply(parameters), p_i)
+
+  _, first_r = jax.linearize(jax.grad(first_hamiltonian), first_layer_params)
+
+  def first_k(control_tangent, first_r=first_r, damping=damping):
+    flat_control = jnp.ravel(control_tangent)
+    return first_r(flat_control) + damping * flat_control
+
+  return first_k, list(reversed(later_k_backward_rev))
 
 
 ##################################################
