@@ -125,6 +125,14 @@ def _supports_piecewise_linear_active_fast_path(layer_module):
   return False
 
 
+def _stage_uses_linear_controlled_fast_path(stage_spec):
+  return getattr(stage_spec, "fast_path_kind", None) == "linear_controlled"
+
+
+def _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
+  return getattr(stage_spec, "fast_path_kind", None) == "piecewise_linear_passive"
+
+
 def _stage_other_variables(other_model_variables, param_name):
   if param_name is None:
     return {}
@@ -574,18 +582,22 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
     stage_other_vars = _stage_other_variables(other_model_variables, stage_spec.param_name)
 
     if stage_operator.kind == "passive":
-      layer_state_primal = _state_primal_for_linearization(stage_state)
+      if _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
+        def k_i(state_tangent):
+          return zero_tangent_tree_like(state_tangent)
+      else:
+        layer_state_primal = _state_primal_for_linearization(stage_state)
 
-      def simpler_apply(x):
-        return stages_apply(stage_other_vars, _cast_state_like(stage_state, x), execution_index)
+        def simpler_apply(x):
+          return stages_apply(stage_other_vars, _cast_state_like(stage_state, x), execution_index)
 
-      def hamiltonian_x(x):
-        return tree_vdot(simpler_apply(x), p_i)
+        def hamiltonian_x(x):
+          return tree_vdot(simpler_apply(x), p_i)
 
-      _, state_hessian = jax.linearize(jax.grad(hamiltonian_x), layer_state_primal)
+        _, state_hessian = jax.linearize(jax.grad(hamiltonian_x), layer_state_primal)
 
-      def k_i(state_tangent, state_hessian=state_hessian):
-        return state_hessian(state_tangent)
+        def k_i(state_tangent, state_hessian=state_hessian):
+          return state_hessian(state_tangent)
 
       k_rev.append(k_i)
       p_i = stage_operator.transpose(p_i)
@@ -597,34 +609,44 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
     if stage_operator.kind == "control_only":
       fixed_input_state = stage_state
 
-      def simpler_apply(parameters):
-        return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars, fixed_input_state, execution_index)
+      if _stage_uses_linear_controlled_fast_path(stage_spec):
+        def k_i(control_tangent, damping=damping):
+          flat_control = jnp.ravel(control_tangent)
+          return damping * flat_control
+      else:
+        def simpler_apply(parameters):
+          return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars, fixed_input_state, execution_index)
 
-      def hamiltonian(parameters):
-        return tree_vdot(simpler_apply(parameters), p_i)
+        def hamiltonian(parameters):
+          return tree_vdot(simpler_apply(parameters), p_i)
 
-      _, first_r = jax.linearize(jax.grad(hamiltonian), layer_params)
+        _, first_r = jax.linearize(jax.grad(hamiltonian), layer_params)
 
-      def k_i(control_tangent, first_r=first_r, damping=damping):
-        flat_control = jnp.ravel(control_tangent)
-        return first_r(flat_control) + damping * flat_control
+        def k_i(control_tangent, first_r=first_r, damping=damping):
+          flat_control = jnp.ravel(control_tangent)
+          return first_r(flat_control) + damping * flat_control
 
       k_rev.append(k_i)
       continue
 
-    def simpler_apply(parameters, x):
-      return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
-                          _cast_state_like(stage_state, x), execution_index)
+    if _stage_uses_linear_controlled_fast_path(stage_spec):
+      def k_i(control_tangent, state_tangent, damping=damping):
+        flat_control = jnp.ravel(control_tangent)
+        return damping * flat_control, zero_tangent_tree_like(state_tangent)
+    else:
+      def simpler_apply(parameters, x):
+        return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
+                            _cast_state_like(stage_state, x), execution_index)
 
-    def hamiltonian_joint(parameters, x):
-      return tree_vdot(simpler_apply(parameters, x), p_i)
+      def hamiltonian_joint(parameters, x):
+        return tree_vdot(simpler_apply(parameters, x), p_i)
 
-    _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
+      _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
 
-    def k_i(control_tangent, state_tangent, joint_hessian=joint_hessian, damping=damping):
-      flat_control = jnp.ravel(control_tangent)
-      k_u, k_x = joint_hessian(flat_control, state_tangent)
-      return k_u + damping * flat_control, k_x
+      def k_i(control_tangent, state_tangent, joint_hessian=joint_hessian, damping=damping):
+        flat_control = jnp.ravel(control_tangent)
+        k_u, k_x = joint_hessian(flat_control, state_tangent)
+        return k_u + damping * flat_control, k_x
 
     k_rev.append(k_i)
     _, p_i = stage_operator.transpose(p_i)

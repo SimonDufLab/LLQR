@@ -141,6 +141,7 @@ class StageDescriptor(NamedTuple):
   name: str
   kind: str
   param_name: Optional[str] = None
+  fast_path_kind: Optional[str] = None
 
 
 class EnhancedSequential(nn.Module):
@@ -158,7 +159,7 @@ class EnhancedSequential(nn.Module):
   def execution_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:
     if self.stage_descriptors is None:
       return tuple(
-        StageDescriptor(name=f"layers_{i}", kind="controlled", param_name=f"layers_{i}")
+        StageDescriptor(name=f"layers_{i}", kind="controlled", param_name=f"layers_{i}", fast_path_kind=None)
         for i, _ in enumerate(self.layers)
       )
     return self.stage_descriptors

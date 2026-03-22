@@ -409,16 +409,16 @@ def create_gpt_model(
         stage_descriptors = []
         legacy_mapping = []
 
-        def add_controlled(stage_name, module):
+        def add_controlled(stage_name, module, fast_path_kind=None):
             stage_index = len(layers)
             layers.append(module)
             param_name = f"layers_{stage_index}"
-            stage_descriptors.append(StageDescriptor(stage_name, "controlled", param_name))
+            stage_descriptors.append(StageDescriptor(stage_name, "controlled", param_name, fast_path_kind))
             return param_name
 
-        def add_passive(stage_name, module):
+        def add_passive(stage_name, module, fast_path_kind=None):
             layers.append(module)
-            stage_descriptors.append(StageDescriptor(stage_name, "passive", None))
+            stage_descriptors.append(StageDescriptor(stage_name, "passive", None, fast_path_kind))
 
         legacy_mapping.append(((add_controlled(
             "gpt_init",
@@ -455,9 +455,11 @@ def create_gpt_model(
                     deterministic=deterministic,
                 ),
             ), {"GPTSelfAttention_0": "GPTSelfAttention_0"}))
-            add_passive(f"block_{block_index}_attn_residual", ResidualAddDropoutStage(
-                rate=resid_dropout, deterministic=deterministic
-            ))
+            add_passive(
+                f"block_{block_index}_attn_residual",
+                ResidualAddDropoutStage(rate=resid_dropout, deterministic=deterministic),
+                fast_path_kind="piecewise_linear_passive" if deterministic else None,
+            )
 
             if linear:
                 block_mapping.append((add_controlled(
@@ -467,11 +469,13 @@ def create_gpt_model(
                 block_mapping.append((add_controlled(
                     f"block_{block_index}_fc1",
                     FC1FromCarryStage(mlp_dim=width_mlp),
+                    fast_path_kind="linear_controlled",
                 ), {"FeedForward_0": {"fc1": "fc1"}}))
                 add_passive(f"block_{block_index}_gelu", GELUFromCarryStage())
                 block_mapping.append((add_controlled(
                     f"block_{block_index}_fc2_residual",
                     FC2ResidualStage(dim=emb_dim, resid_dropout=resid_dropout, deterministic=deterministic),
+                    fast_path_kind="linear_controlled" if deterministic else None,
                 ), {"FeedForward_0": {"fc2": "fc2"}}))
 
             legacy_mapping.append(tuple(block_mapping))
