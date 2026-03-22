@@ -71,6 +71,15 @@ class BlockStructures(abc.ABC):
 
     pass
 
+  def prepare_train_vectors(self, vectors):
+    """Prepare vectors once outside the inner solve. Default keeps the original structure."""
+    return vectors
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    """Fallback streamed layerwise product returning a flat vector."""
+    layer_product = self.train_matrix_product(blocks, {layer_name: prepared_layer_vector})[layer_name]
+    return ravel_pytree(layer_product)[0]
+
   def matrix_product(self,
                      blocks,
                      vectors,
@@ -117,6 +126,12 @@ class DenseBlock(BlockStructures):
     return product_dict
     # return jax.tree_map(jnp.dot, blocks, vectors)
 
+  def prepare_train_vectors(self, vectors):
+    return {layer_name: ravel_pytree(block_vector)[0] for layer_name, block_vector in vectors.items()}
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return blocks[layer_name].dot(prepared_layer_vector)
+
 
 class DiagonalBlock(BlockStructures):
   """A diagonal block structure."""
@@ -150,6 +165,12 @@ class DiagonalBlock(BlockStructures):
 
     return product_dict
 
+  def prepare_train_vectors(self, vectors):
+    return {layer_name: ravel_pytree(block_vector)[0] for layer_name, block_vector in vectors.items()}
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return blocks[layer_name] * prepared_layer_vector
+
 class ScalarBlock(BlockStructures):
   """A scalar per layer, to reduce memory usage"""
   def __init__(self,
@@ -181,6 +202,12 @@ class ScalarBlock(BlockStructures):
       product_dict[layer_name] = unravel_fn(flat_product)
 
     return product_dict
+
+  def prepare_train_vectors(self, vectors):
+    return {layer_name: ravel_pytree(block_vector)[0] for layer_name, block_vector in vectors.items()}
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return blocks[layer_name] * prepared_layer_vector
 
 KERNEL_KEYS = ("kernel", "embedding", "pos_embedding")
 BIAS_KEYS = ("bias", "scale")
@@ -286,6 +313,53 @@ class KroneckerBlock(BlockStructures):
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
       product_dict[layer_name] = unflatten_dict(layer_product)
     return product_dict
+
+  def prepare_train_vectors(self, vectors):
+    prepared_vectors = {}
+    for layer_name, layer_vectors in vectors.items():
+      prepared_layer_vectors = {}
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          vector_matrix, _ = _reshape_kernel_to_2d(vec_component)
+          prepared_layer_vectors[component] = vector_matrix
+        elif any(k in component for k in BIAS_KEYS):
+          prepared_layer_vectors[component] = jnp.ravel(vec_component)
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+      prepared_vectors[layer_name] = prepared_layer_vectors
+    return prepared_vectors
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    layer_blocks = blocks[layer_name]
+    layer_outputs = []
+
+    for component, vec_component in prepared_layer_vector.items():
+      if any(k in component for k in KERNEL_KEYS):
+        factor_A, factor_B = layer_blocks[component]
+        if factor_A.ndim == 2 and factor_B.ndim == 2:
+          product_matrix = jnp.einsum('mk,kn,rn->mr', factor_A, vec_component, factor_B)
+        elif factor_A.ndim == 1 and factor_B.ndim == 1:
+          product_matrix = jnp.einsum('i,ij,j->ij', factor_A, vec_component, factor_B)
+        else:
+          raise ValueError(
+            f"Unsupported Kronecker factor shapes {factor_A.shape}, {factor_B.shape} "
+            f"for {component} in layer {layer_name}"
+          )
+        layer_outputs.append(jnp.ravel(product_matrix))
+      elif any(k in component for k in BIAS_KEYS):
+        diag = layer_blocks[component]
+        if diag.ndim != 1:
+          raise ValueError(
+            f"Unsupported bias block shape {diag.shape} for streamed KroneckerBlock "
+            f"component {component} in layer {layer_name}"
+          )
+        layer_outputs.append(jnp.ravel(diag * vec_component))
+      else:
+        raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+    if not layer_outputs:
+      return jnp.zeros((0,), dtype=jnp.float32)
+    return jnp.concatenate(layer_outputs)
 
   # @staticmethod
   # def prepare_vectors(vectors):
@@ -627,6 +701,12 @@ class MirrorSymKroneckerBlock(KroneckerBlock):
     _new_blocks = jax.tree_map(upd, self.blocks, new_blocks)
     self.blocks.update(_new_blocks)
 
+  def prepare_train_vectors(self, vectors):
+    return BlockStructures.prepare_train_vectors(self, vectors)
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
+
   def train_matrix_product(self, blocks, vectors):
     product_dict = {}
     for layer_name, layer_vectors in vectors.items():
@@ -680,6 +760,12 @@ class PSDSymKroneckerBlock(KroneckerBlock):
       return out
     _new_blocks = jax.tree_map(upd, self.blocks, new_blocks)
     self.blocks.update(_new_blocks)
+
+  def prepare_train_vectors(self, vectors):
+    return BlockStructures.prepare_train_vectors(self, vectors)
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
 
   def train_matrix_product(self, blocks, vectors):
     product_dict = {}
@@ -791,6 +877,12 @@ class SDSSymKroneckerBlock(KroneckerBlock):
 
     _new_blocks = jax.tree_map(upd, self.blocks, new_blocks)
     self.blocks.update(_new_blocks)
+
+  def prepare_train_vectors(self, vectors):
+    return BlockStructures.prepare_train_vectors(self, vectors)
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
 
   def train_matrix_product(self, blocks, vectors):
     product_dict = {}
@@ -1011,6 +1103,46 @@ class EKFACBlock(KroneckerBlock):
 
       product_dict[layer_name] = unflatten_dict(layer_product)
     return product_dict
+
+  def prepare_train_vectors(self, vectors):
+    prepared_vectors = {}
+    for layer_name, layer_vectors in vectors.items():
+      prepared_layer = {}
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          prepared_layer[component] = _reshape_kernel_to_2d(vec_component)[0]
+        elif any(k in component for k in BIAS_KEYS):
+          prepared_layer[component] = jnp.ravel(vec_component)
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+      prepared_vectors[layer_name] = prepared_layer
+    return prepared_vectors
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    layer_blocks = blocks[layer_name]
+    flat_parts = []
+    for component, vec_component in prepared_layer_vector.items():
+      if any(k in component for k in KERNEL_KEYS):
+        blk = layer_blocks[component]
+        if len(blk) == 3:
+          Q_A, Q_G, inv_diag = blk
+          d_eff = inv_diag.astype(vec_component.dtype)
+        elif len(blk) == 4:
+          Q_A, Q_G, inv_diag, alpha = blk
+          d_eff = alpha.astype(vec_component.dtype) * inv_diag.astype(vec_component.dtype)
+        else:
+          raise ValueError(f"Unsupported EKFAC block layout for {component} in layer {layer_name}")
+        out2d = self._ekfac_apply(Q_A, Q_G, d_eff, vec_component)
+        flat_parts.append(jnp.ravel(out2d))
+      elif any(k in component for k in BIAS_KEYS):
+        diag = layer_blocks[component]
+        flat_parts.append(jnp.ravel(diag * vec_component))
+      else:
+        raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+    if len(flat_parts) == 1:
+      return flat_parts[0]
+    return jnp.concatenate(flat_parts)
 
 
 # --------------------------
@@ -1305,6 +1437,12 @@ class SeparableEKFACBlock(EKFACBlock):
 
     return product_dict
 
+  def prepare_train_vectors(self, vectors):
+    return BlockStructures.prepare_train_vectors(self, vectors)
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
+
 
 # -----------------------------
 # 3) Symmetry enforce variants
@@ -1420,6 +1558,12 @@ class PSDEKFACBlock(EKFACBlock):
 
     return product_dict
 
+  def prepare_train_vectors(self, vectors):
+    return BlockStructures.prepare_train_vectors(self, vectors)
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
+
 
 class PSDSeparableEKFACBlock(EKFACBlock):
   """
@@ -1509,6 +1653,12 @@ class PSDSeparableEKFACBlock(EKFACBlock):
       product_dict[layer_name] = unflatten_dict(layer_product)
 
     return product_dict
+
+  def prepare_train_vectors(self, vectors):
+    return BlockStructures.prepare_train_vectors(self, vectors)
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
 
 
 # -----------------------------
@@ -1688,6 +1838,12 @@ class HouseholderDiagKroneckerBlock(KroneckerBlock):
       product_dict[layer_name] = unflatten_dict(layer_product)
 
     return product_dict
+
+  def prepare_train_vectors(self, vectors):
+    return BlockStructures.prepare_train_vectors(self, vectors)
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
 
 
 ##################################################################
@@ -2019,6 +2175,12 @@ class Sym_SWM_KFAC(KroneckerBlock):
     self._memory = self._shermann_morisson_update(new_blocks)
     self.blocks = self.reinit_blocks()
 
+  def prepare_train_vectors(self, vectors):
+    return BlockStructures.prepare_train_vectors(self, vectors)
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
+
 
 class Asym_SWM_KFAC(Sym_SWM_KFAC):
   """Shermann-Woodbury-Morisson KFAC structure - -asymmetric version
@@ -2310,6 +2472,12 @@ class Sym_SWM_EKFAC(EKFACBlock):
     # Refresh train-time blocks (new u_A/u_G draws + reset inv_diag init)
     self.blocks = self.reinit_blocks()
 
+  def prepare_train_vectors(self, vectors):
+    return BlockStructures.prepare_train_vectors(self, vectors)
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
+
 
 class Sym_SWM_SeparableEKFAC(SeparableEKFACBlock):
   """
@@ -2352,6 +2520,12 @@ class Sym_SWM_SeparableEKFAC(SeparableEKFACBlock):
 
     # Persistent memory initialized as identity separable EKFAC
     self._memory = super()._make_blocks(network_params, layer_names, initialization=True)
+
+  def prepare_train_vectors(self, vectors):
+    return BlockStructures.prepare_train_vectors(self, vectors)
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
 
   def get_memory(self):
     return self._memory

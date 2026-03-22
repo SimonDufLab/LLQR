@@ -179,22 +179,23 @@ class BasePreconditioner(abc.ABC):
           gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state, params)
         gradients = self._normalize_grad_for_lqr_fn(gradients)
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
+        prepared_gradients = self._block_structure.prepare_train_vectors(gradients)
 
-        return gradients, (first_transition, transitions, first_k_backward, k_backward, final_q, final_lin_cost)
+        return prepared_gradients, (first_transition, transitions, first_k_backward, k_backward, final_q, final_lin_cost)
 
       # def lqr_cost(_preconditioner, input_size, gradients, kernel_shapes, operators):
-      def lqr_cost(_preconditioner, gradients, operators):
+      def lqr_cost(_preconditioner, prepared_gradients, operators):
         first_transition, transitions, first_k_backward, k_backward, final_q, final_lin_cost = operators
         cost = 0
-        # u_dict = self._block_structure.train_matrix_product_for_scan(_preconditioner, gradients, kernel_shapes)
-        u_dict = self._block_structure.train_matrix_product(_preconditioner, gradients)
 
-        first_u, _ = ravel_pytree(u_dict[self._layer_names[0]])
+        first_u = self._block_structure.train_matrix_product_flat_layer(
+          _preconditioner, self._layer_names[0], prepared_gradients[self._layer_names[0]])
         cost += jnp.dot(first_u, first_k_backward(first_u)) / 2
         x = first_transition(first_u)
 
         for i, layer_name in enumerate(self._layer_names[1:]):
-          u, _ = ravel_pytree(u_dict[layer_name])
+          u = self._block_structure.train_matrix_product_flat_layer(
+            _preconditioner, layer_name, prepared_gradients[layer_name])
           k_u, k_x = k_backward[i](u, x)
           cost += (jnp.dot(u, k_u) + tree_vdot(x, k_x)) / 2
           x = transitions[i](u, x)
@@ -208,9 +209,9 @@ class BasePreconditioner(abc.ABC):
         return cost
 
       # def lqr_grad_fn(_preconditioner, input_size, gradients, kernel_shapes, operators):
-      def lqr_grad_fn(_preconditioner, gradients, operators):
+      def lqr_grad_fn(_preconditioner, prepared_gradients, operators):
         v, grads = jax.value_and_grad(lqr_cost, argnums=0)(
-          _preconditioner, gradients, operators)
+          _preconditioner, prepared_gradients, operators)
         grads = jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=1.0, neginf=-1.0), grads)
         # grads = jax.tree_map(zero_if_bad, grads)
         # print(jax.tree_map(lambda g: g.shape, grads))
@@ -218,14 +219,14 @@ class BasePreconditioner(abc.ABC):
 
       @Partial(jax.jit, donate_argnames=("preconditioner",))
       def _get_update(preconditioner, opt_state, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
-        gradients, operators = get_operators_and_gradients(
+        prepared_gradients, operators = get_operators_and_gradients(
           params, other_model_variables, datapoint, trainstate_opt_state)
 
         # Define a single update step to be run in the compiled loop.
         def update_step(carry, _):
           precond, opt_state = carry
-          _, precond_grad = lqr_grad_fn(precond, gradients, operators)
-          extra_args = {'value_and_grad_fn': Partial(lqr_grad_fn, gradients=gradients, operators=operators)}
+          _, precond_grad = lqr_grad_fn(precond, prepared_gradients, operators)
+          extra_args = {'value_and_grad_fn': Partial(lqr_grad_fn, prepared_gradients=prepared_gradients, operators=operators)}
           updates, opt_state = optax_solver.update(precond_grad, opt_state, precond, **extra_args)
           updates = jax.tree_map(lambda g: g * precond_lr, updates)
           new_precond = optax.apply_updates(precond, updates)
