@@ -92,7 +92,8 @@ class BasePreconditioner(abc.ABC):
                warm_start_precond = True,
                damping: float = 0.0,
                allow_grad_inversion: bool = False,
-               divergence_args_index = -1):
+               divergence_args_index = -1,
+               optax_solver_requires_value_and_grad: bool = False):
     self._divergence_function = divergence_function
     self._damping =damping
     self._loss_fn = loss_fn
@@ -111,6 +112,7 @@ class BasePreconditioner(abc.ABC):
     self._batch_solve_precond = batch_solve_precond
     self._multibatch = multibatch
     self._warm_start_precond = warm_start_precond
+    self._optax_solver_requires_value_and_grad = optax_solver_requires_value_and_grad
     self._precond_on_update = precond_on_update
     self._allow_grad_inversion = allow_grad_inversion
     if normalize_grad_for_lqr:
@@ -208,39 +210,58 @@ class BasePreconditioner(abc.ABC):
 
         return cost
 
-      # def lqr_grad_fn(_preconditioner, input_size, gradients, kernel_shapes, operators):
-      def lqr_grad_fn(_preconditioner, prepared_gradients, operators):
-        v, grads = jax.value_and_grad(lqr_cost, argnums=0)(
-          _preconditioner, prepared_gradients, operators)
+      def _sanitize_preconditioner_grads(grads):
         grads = jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=1.0, neginf=-1.0), grads)
-        # grads = jax.tree_map(zero_if_bad, grads)
-        # print(jax.tree_map(lambda g: g.shape, grads))
-        return v, grads
+        return grads
 
-      @Partial(jax.jit, donate_argnames=("preconditioner",))
-      def _get_update(preconditioner, opt_state, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
-        prepared_gradients, operators = get_operators_and_gradients(
-          params, other_model_variables, datapoint, trainstate_opt_state)
+      def lqr_grad_only_fn(_preconditioner, prepared_gradients, operators):
+        grads = jax.grad(lqr_cost, argnums=0)(_preconditioner, prepared_gradients, operators)
+        return _sanitize_preconditioner_grads(grads)
 
-        # Define a single update step to be run in the compiled loop.
-        def update_step(carry, _):
-          precond, opt_state = carry
-          _, precond_grad = lqr_grad_fn(precond, prepared_gradients, operators)
-          extra_args = {'value_and_grad_fn': Partial(lqr_grad_fn, prepared_gradients=prepared_gradients, operators=operators)}
-          updates, opt_state = optax_solver.update(precond_grad, opt_state, precond, **extra_args)
-          updates = jax.tree_map(lambda g: g * precond_lr, updates)
-          new_precond = optax.apply_updates(precond, updates)
-          return (new_precond, opt_state), None
+      def lqr_value_and_grad_fn(_preconditioner, prepared_gradients, operators):
+        value, grads = jax.value_and_grad(lqr_cost, argnums=0)(
+          _preconditioner, prepared_gradients, operators)
+        grads = _sanitize_preconditioner_grads(grads)
+        return value, grads
 
-        # # Use a compiled loop to perform “steps” iterations.
-        # init_state = (preconditioner, opt_state)
-        # final_precond, _ = jax.lax.fori_loop(0, steps, update_step, init_state)
+      if self._optax_solver_requires_value_and_grad:
+        @Partial(jax.jit, donate_argnames=("preconditioner",))
+        def _get_update(preconditioner, opt_state, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
+          prepared_gradients, operators = get_operators_and_gradients(
+            params, other_model_variables, datapoint, trainstate_opt_state)
 
-        (final_precond, _), _ = jax.lax.scan(update_step,
-                                             (preconditioner, opt_state),
-                                             xs=None, length=steps, unroll=1)
-        return jax.tree_map(jnp.nan_to_num, final_precond)
+          def update_step(carry, _):
+            precond, opt_state = carry
+            _, precond_grad = lqr_value_and_grad_fn(precond, prepared_gradients, operators)
+            extra_args = {'value_and_grad_fn': Partial(
+              lqr_value_and_grad_fn, prepared_gradients=prepared_gradients, operators=operators)}
+            updates, opt_state = optax_solver.update(precond_grad, opt_state, precond, **extra_args)
+            updates = jax.tree_map(lambda g: g * precond_lr, updates)
+            new_precond = optax.apply_updates(precond, updates)
+            return (new_precond, opt_state), None
 
+          (final_precond, _), _ = jax.lax.scan(update_step,
+                                               (preconditioner, opt_state),
+                                               xs=None, length=steps, unroll=1)
+          return jax.tree_map(jnp.nan_to_num, final_precond)
+      else:
+        @Partial(jax.jit, donate_argnames=("preconditioner",))
+        def _get_update(preconditioner, opt_state, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
+          prepared_gradients, operators = get_operators_and_gradients(
+            params, other_model_variables, datapoint, trainstate_opt_state)
+
+          def update_step(carry, _):
+            precond, opt_state = carry
+            precond_grad = lqr_grad_only_fn(precond, prepared_gradients, operators)
+            updates, opt_state = optax_solver.update(precond_grad, opt_state, precond)
+            updates = jax.tree_map(lambda g: g * precond_lr, updates)
+            new_precond = optax.apply_updates(precond, updates)
+            return (new_precond, opt_state), None
+
+          (final_precond, _), _ = jax.lax.scan(update_step,
+                                               (preconditioner, opt_state),
+                                               xs=None, length=steps, unroll=1)
+          return jax.tree_map(jnp.nan_to_num, final_precond)
 
       def get_update(preconditioner, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
         # Snapshot of preconditioner to donate arg during jitted fn, but need original for EMA later

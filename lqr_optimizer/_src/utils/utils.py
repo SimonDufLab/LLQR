@@ -266,6 +266,15 @@ def load_precond_optimizer(cfg, lr):
   return optax.chain(*optax_solver_for_precond)
 
 
+def precond_solver_requires_value_and_grad(precond_solver_name):
+  """Return whether the preconditioner optimizer needs objective values."""
+  if precond_solver_name in ("adam", "momentum", "sgd"):
+    return False
+  if precond_solver_name in ("cg_zoom_hz", "cg_back_pr+"):
+    return True
+  raise ValueError("Unknown precond optimizer")
+
+
 def clip_by_group_norm(max_norm: float) -> optax.GradientTransformation:
   """
   Clip each gradient leaf independently by its L2 norm.
