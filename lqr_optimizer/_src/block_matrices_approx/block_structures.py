@@ -80,7 +80,8 @@ class BlockStructures(abc.ABC):
     layer_product = self.train_matrix_product(blocks, {layer_name: prepared_layer_vector})[layer_name]
     return ravel_pytree(layer_product)[0]
 
-  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+  def _preconditioner_param_pullback_flat_layer_generic(self, blocks, layer_name, prepared_layer_vector,
+                                                        output_cotangent_flat):
     """Generic exact pullback from flat layer outputs back to block parameters."""
     layer_blocks = blocks[layer_name]
     output_cotangent_flat = jnp.ravel(jnp.atleast_1d(output_cotangent_flat))
@@ -92,6 +93,11 @@ class BlockStructures(abc.ABC):
 
     _, vjp_fn = jax.vjp(flat_layer_product, layer_blocks)
     return vjp_fn(output_cotangent_flat)[0]
+
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    return self._preconditioner_param_pullback_flat_layer_generic(
+      blocks, layer_name, prepared_layer_vector, output_cotangent_flat
+    )
 
   def matrix_product(self,
                      blocks,
@@ -145,6 +151,10 @@ class DenseBlock(BlockStructures):
   def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
     return blocks[layer_name].dot(prepared_layer_vector)
 
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    output_cotangent_flat = jnp.ravel(jnp.atleast_1d(output_cotangent_flat))
+    return output_cotangent_flat[:, None] * prepared_layer_vector[None, :]
+
 
 class DiagonalBlock(BlockStructures):
   """A diagonal block structure."""
@@ -184,6 +194,10 @@ class DiagonalBlock(BlockStructures):
   def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
     return blocks[layer_name] * prepared_layer_vector
 
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    output_cotangent_flat = jnp.ravel(jnp.atleast_1d(output_cotangent_flat))
+    return output_cotangent_flat * prepared_layer_vector
+
 class ScalarBlock(BlockStructures):
   """A scalar per layer, to reduce memory usage"""
   def __init__(self,
@@ -221,6 +235,10 @@ class ScalarBlock(BlockStructures):
 
   def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
     return blocks[layer_name] * prepared_layer_vector
+
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    output_cotangent_flat = jnp.ravel(jnp.atleast_1d(output_cotangent_flat))
+    return jnp.array([jnp.vdot(output_cotangent_flat, prepared_layer_vector)], dtype=output_cotangent_flat.dtype)
 
 KERNEL_KEYS = ("kernel", "embedding", "pos_embedding")
 BIAS_KEYS = ("bias", "scale")
@@ -373,6 +391,69 @@ class KroneckerBlock(BlockStructures):
     if not layer_outputs:
       return jnp.zeros((0,), dtype=jnp.float32)
     return jnp.concatenate(layer_outputs)
+
+  def _kronecker_component_pullback(self, component_name, block_component, prepared_component,
+                                    output_cotangent_component):
+    if any(k in component_name for k in KERNEL_KEYS):
+      factor_A, factor_B = block_component
+      x_matrix = prepared_component
+      g_matrix = output_cotangent_component.reshape(x_matrix.shape)
+
+      if factor_A.ndim == 2 and factor_B.ndim == 2:
+        grad_A = g_matrix @ factor_B @ x_matrix.T
+        grad_B = g_matrix.T @ factor_A @ x_matrix
+      elif factor_A.ndim == 1 and factor_B.ndim == 2:
+        xb_t = x_matrix @ factor_B.T
+        grad_A = jnp.sum(g_matrix * xb_t, axis=1)
+        grad_B = g_matrix.T @ (factor_A[:, None] * x_matrix)
+      elif factor_A.ndim == 2 and factor_B.ndim == 1:
+        ax = factor_A @ x_matrix
+        grad_A = g_matrix @ (x_matrix * factor_B[None, :]).T
+        grad_B = jnp.sum(g_matrix * ax, axis=0)
+      elif factor_A.ndim == 1 and factor_B.ndim == 1:
+        grad_A = jnp.sum(g_matrix * (x_matrix * factor_B[None, :]), axis=1)
+        grad_B = jnp.sum(g_matrix * (factor_A[:, None] * x_matrix), axis=0)
+      else:
+        raise ValueError(
+          f"Unsupported Kronecker factor shapes {factor_A.shape}, {factor_B.shape} "
+          f"for component {component_name}"
+        )
+      return grad_A, grad_B
+
+    if any(k in component_name for k in BIAS_KEYS):
+      return output_cotangent_component * prepared_component
+
+    raise ValueError(f"Unknown block type for component {component_name}")
+
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    layer_blocks = blocks[layer_name]
+    output_cotangent_flat = jnp.ravel(jnp.atleast_1d(output_cotangent_flat))
+    offset = 0
+    layer_grads = {}
+
+    for component, vec_component in prepared_layer_vector.items():
+      if any(k in component for k in KERNEL_KEYS):
+        component_size = vec_component.size
+        component_cotangent = output_cotangent_flat[offset:offset + component_size]
+        layer_grads[component] = self._kronecker_component_pullback(
+          component, layer_blocks[component], vec_component, component_cotangent
+        )
+      elif any(k in component for k in BIAS_KEYS):
+        component_size = vec_component.size
+        component_cotangent = output_cotangent_flat[offset:offset + component_size]
+        layer_grads[component] = self._kronecker_component_pullback(
+          component, layer_blocks[component], vec_component, component_cotangent
+        )
+      else:
+        raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+      offset += component_size
+
+    if offset != output_cotangent_flat.size:
+      raise ValueError(
+        f"Output cotangent size mismatch for layer {layer_name}: consumed {offset}, "
+        f"received {output_cotangent_flat.size}"
+      )
+    return layer_grads
 
   # @staticmethod
   # def prepare_vectors(vectors):
@@ -1157,6 +1238,70 @@ class EKFACBlock(KroneckerBlock):
       return flat_parts[0]
     return jnp.concatenate(flat_parts)
 
+  def _ekfac_component_pullback(self, component_name, block_component, prepared_component,
+                                output_cotangent_component):
+    if any(k in component_name for k in KERNEL_KEYS):
+      blk = block_component
+      x_matrix = prepared_component
+      g_matrix = output_cotangent_component.reshape(x_matrix.shape)
+
+      if len(blk) == 3:
+        q_a, q_g, inv_diag = blk
+        alpha = None
+      elif len(blk) == 4:
+        q_a, q_g, inv_diag, alpha = blk
+      else:
+        raise ValueError(f"Unsupported EKFAC block layout with {len(blk)} entries")
+
+      d_eff = inv_diag.astype(x_matrix.dtype)
+      if alpha is not None:
+        d_eff = alpha.astype(x_matrix.dtype) * d_eff
+
+      x_hat = (q_a.T @ x_matrix) @ q_g
+      grad_z = (q_a.T @ g_matrix) @ q_g
+      grad_x_hat = (d_eff.reshape(x_matrix.shape) * grad_z)
+      z_matrix = (d_eff * x_hat.reshape(-1)).reshape(x_matrix.shape)
+
+      grad_q_a = g_matrix @ q_g @ z_matrix.T + (x_matrix @ q_g) @ grad_x_hat.T
+      grad_q_g = g_matrix.T @ q_a @ z_matrix + (x_matrix.T @ q_a) @ grad_x_hat
+      grad_d_eff = grad_z * x_hat
+
+      if alpha is None:
+        return grad_q_a, grad_q_g, grad_d_eff.reshape(inv_diag.shape)
+
+      grad_inv_diag = alpha.astype(inv_diag.dtype) * grad_d_eff.reshape(inv_diag.shape)
+      grad_alpha = jnp.asarray(
+        jnp.vdot(inv_diag.astype(grad_d_eff.dtype), grad_d_eff.reshape(inv_diag.shape)),
+        dtype=alpha.dtype,
+      )
+      return grad_q_a, grad_q_g, grad_inv_diag, grad_alpha
+
+    if any(k in component_name for k in BIAS_KEYS):
+      return output_cotangent_component * prepared_component
+
+    raise ValueError(f"Unknown EKFAC component type {component_name}")
+
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    layer_blocks = blocks[layer_name]
+    output_cotangent_flat = jnp.ravel(jnp.atleast_1d(output_cotangent_flat))
+    offset = 0
+    layer_grads = {}
+
+    for component, vec_component in prepared_layer_vector.items():
+      component_size = vec_component.size
+      component_cotangent = output_cotangent_flat[offset:offset + component_size]
+      layer_grads[component] = self._ekfac_component_pullback(
+        component, layer_blocks[component], vec_component, component_cotangent
+      )
+      offset += component_size
+
+    if offset != output_cotangent_flat.size:
+      raise ValueError(
+        f"Output cotangent size mismatch for layer {layer_name}: consumed {offset}, "
+        f"received {output_cotangent_flat.size}"
+      )
+    return layer_grads
+
 
 # --------------------------
 # Normalization utilities
@@ -1361,6 +1506,19 @@ class EKFACBlockNormalized(EKFACBlock):
 
     # 3) Commit
     self.blocks.update(projected)
+
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    layer_blocks = blocks[layer_name]
+    if any(
+      any(k in component for k in KERNEL_KEYS) and len(block_component) == 4
+      for component, block_component in layer_blocks.items()
+    ):
+      return self._preconditioner_param_pullback_flat_layer_generic(
+        blocks, layer_name, prepared_layer_vector, output_cotangent_flat
+      )
+    return super().preconditioner_param_pullback_flat_layer(
+      blocks, layer_name, prepared_layer_vector, output_cotangent_flat
+    )
 
 
 # -----------------------------
