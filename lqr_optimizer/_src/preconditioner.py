@@ -72,6 +72,86 @@ def _recover_loss_gradients_from_transition_transposes(params, layer_names, tran
     return freeze(ordered_recovered)
   return ordered_recovered
 
+
+def _materialize_active_flat_controls(block_structure, blocks, layer_names, prepared_gradients):
+  """Materialize the active-path flat controls once for a fixed preconditioner tree."""
+  return {
+    layer_name: block_structure.train_matrix_product_flat_layer(
+      blocks, layer_name, prepared_gradients[layer_name]
+    )
+    for layer_name in layer_names
+  }
+
+
+def _rollout_active_control_states(layer_names, flat_controls, first_transition, transitions):
+  """Roll out the active control problem and save the state entering each later layer."""
+  if not layer_names:
+    raise ValueError("_rollout_active_control_states expects at least one layer")
+
+  later_state_inputs = {}
+  x = first_transition(flat_controls[layer_names[0]])
+  for i, layer_name in enumerate(layer_names[1:]):
+    later_state_inputs[layer_name] = x
+    x = transitions[i](flat_controls[layer_name], x)
+
+  return later_state_inputs, x
+
+
+def _active_terminal_state_cotangent(final_state, final_q, final_lin_cost):
+  """Adapt the shared flat terminal operator contract back to the active state tree."""
+  flat_final_state, unravel_final_state = ravel_pytree(final_state)
+  flat_final_lin_cost = ravel_pytree(final_lin_cost)[0]
+  flat_terminal_cotangent = flat_final_lin_cost + jnp.ravel(final_q(flat_final_state))
+  return unravel_final_state(flat_terminal_cotangent)
+
+
+def _active_lqr_control_cost(layer_names, flat_controls, first_transition, transitions,
+                             first_k_backward, k_backward, final_q, final_lin_cost):
+  """Evaluate the fixed-control active LLQR cost."""
+  later_state_inputs, final_state = _rollout_active_control_states(
+    layer_names, flat_controls, first_transition, transitions)
+
+  first_layer_name = layer_names[0]
+  cost = jnp.dot(flat_controls[first_layer_name], first_k_backward(flat_controls[first_layer_name])) / 2
+
+  for i, layer_name in enumerate(layer_names[1:]):
+    u = flat_controls[layer_name]
+    x = later_state_inputs[layer_name]
+    k_u, k_x = k_backward[i](u, x)
+    cost += (jnp.dot(u, k_u) + tree_vdot(x, k_x)) / 2
+
+  flat_final_state = ravel_pytree(final_state)[0]
+  flat_final_lin_cost = ravel_pytree(final_lin_cost)[0]
+  flat_q_final = ravel_pytree(final_q(flat_final_state))[0]
+  return cost + jnp.dot(flat_final_state, flat_final_lin_cost) + 0.5 * jnp.dot(flat_final_state, flat_q_final)
+
+
+def _recover_control_gradients_from_active_lqr_adjoint(layer_names, flat_controls, later_state_inputs, final_state,
+                                                       first_transition_transpose, transition_transposes,
+                                                       first_k_backward, k_backward, final_q, final_lin_cost):
+  """Recover exact flat control gradients by a backward sweep over the active control rollout."""
+  if not layer_names:
+    raise ValueError("_recover_control_gradients_from_active_lqr_adjoint expects at least one layer")
+
+  state_cotangent = _active_terminal_state_cotangent(final_state, final_q, final_lin_cost)
+  recovered_by_layer = {}
+
+  for reverse_index in range(len(layer_names) - 2, -1, -1):
+    layer_name = layer_names[reverse_index + 1]
+    u = flat_controls[layer_name]
+    x = later_state_inputs[layer_name]
+    stage_u_grad, stage_x_grad = k_backward[reverse_index](u, x)
+    control_cotangent, prev_state_cotangent = transition_transposes[reverse_index](state_cotangent)
+    recovered_by_layer[layer_name] = stage_u_grad + control_cotangent
+    state_cotangent = jax.tree_map(jnp.add, stage_x_grad, prev_state_cotangent)
+
+  first_layer_name = layer_names[0]
+  recovered_by_layer[first_layer_name] = (
+    first_k_backward(flat_controls[first_layer_name]) + first_transition_transpose(state_cotangent)
+  )
+
+  return {layer_name: recovered_by_layer[layer_name] for layer_name in layer_names}
+
 class BasePreconditioner(abc.ABC):
   def __init__(self,
                divergence_function,
