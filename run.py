@@ -145,18 +145,36 @@ def main(cfg: DictConfig):
   opt_chain.append(utl.load_main_optimizer(cfg, lr_or_sched))
   model_optimizer = optax.chain(*opt_chain)
 
+  migrated_checkpoint_layout = False
   if load_from_preexisting_model_state:
-    state, precond_blocks = utl.restore_trainstate_and_precond(run_state["model_dir"])
-    state = utl.TrainState.create(
-      apply_fn=model.apply,
-      apply_inf_fn=inf_model.apply,
-      params=state["params"],
-      gbar=state["gbar"],
-      g_last=state["g_last"],
-      tx=model_optimizer,
-      opt_state=state["opt_state"],
-      batch_stats=state["batch_stats"],
+    restored_state, precond_blocks = utl.restore_trainstate_and_precond(run_state["model_dir"])
+    restored_params, restored_batch_stats, migrated_checkpoint_layout = model.maybe_migrate_legacy_checkpoint(
+      restored_state["params"], restored_state["batch_stats"], params, init_batch_stats
     )
+    if migrated_checkpoint_layout:
+      print("Migrated a legacy coarse-stage checkpoint to the split-stage model layout.")
+      print("Reinitializing main optimizer state, gbar/g_last, and preconditioner blocks for this resume.")
+      state = utl.TrainState.create(
+        apply_fn=model.apply,
+        apply_inf_fn=inf_model.apply,
+        params=restored_params,
+        gbar=utl.tree_zeros_like(restored_params),
+        g_last=utl.tree_zeros_like(restored_params),
+        tx=model_optimizer,
+        batch_stats=restored_batch_stats,
+      )
+      precond_blocks = None
+    else:
+      state = utl.TrainState.create(
+        apply_fn=model.apply,
+        apply_inf_fn=inf_model.apply,
+        params=restored_state["params"],
+        gbar=restored_state["gbar"],
+        g_last=restored_state["g_last"],
+        tx=model_optimizer,
+        opt_state=restored_state["opt_state"],
+        batch_stats=restored_state["batch_stats"],
+      )
   else:
     state = utl.TrainState.create(
       apply_fn=model.apply,
@@ -223,7 +241,7 @@ def main(cfg: DictConfig):
     divergence_args_index=-1,
     optax_solver_requires_value_and_grad=utl.precond_solver_requires_value_and_grad(cfg.precond_solver),
   )
-  if load_from_preexisting_model_state:
+  if load_from_preexisting_model_state and precond_blocks is not None:
     preconditioner.load_blocks(precond_blocks)
     del precond_blocks
 

@@ -1,4 +1,6 @@
 """Helper functions for building the LQR problem associated with the desired divergence measure"""
+from typing import NamedTuple, Optional
+
 import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
@@ -7,7 +9,7 @@ from flax.core.frozen_dict import FrozenDict
 
 from lqr_optimizer._src.models.mlp import DenseRelu, InitDenseRelu
 from lqr_optimizer._src.utils.divergence import ngd_divergence_f
-from lqr_optimizer._src.utils.utils import vjp_f, add_f, cross_entropy_loss
+from lqr_optimizer._src.utils.utils import vjp_f, add_f, cross_entropy_loss, StageDescriptor
 
 
 def diag_r(penalty):
@@ -83,6 +85,35 @@ def _build_control_only_transition_operator(layer_params, simpler_apply):
   return transition, transition_transpose
 
 
+def _build_state_only_transition_operator(layer_state, simpler_apply):
+  layer_state_primal = _state_primal_for_linearization(layer_state)
+
+  def apply_from_linear_state(state):
+    return simpler_apply(_cast_state_like(layer_state, state))
+
+  _, state_linear = jax.linearize(apply_from_linear_state, layer_state_primal)
+  state_transpose = jax.linear_transpose(state_linear, layer_state_primal)
+
+  def transition(state_tangent):
+    return state_linear(state_tangent)
+
+  def transition_transpose(cotangent):
+    state_cotangent = state_transpose(cotangent)
+    if isinstance(state_cotangent, tuple):
+      state_cotangent = state_cotangent[0]
+    return state_cotangent
+
+  return transition, transition_transpose
+
+
+class ActiveExecutionStageOperator(NamedTuple):
+  kind: str
+  stage_name: str
+  param_name: Optional[str]
+  forward: callable
+  transpose: callable
+
+
 def _supports_piecewise_linear_active_fast_path(layer_module):
   """Return whether the active K-builder can use the exact piecewise-linear fast path."""
   if layer_module is None:
@@ -92,6 +123,12 @@ def _supports_piecewise_linear_active_fast_path(layer_module):
     return True
 
   return False
+
+
+def _stage_other_variables(other_model_variables, param_name):
+  if param_name is None:
+    return {}
+  return {key: value.get(param_name, {}) for key, value in other_model_variables.items()}
 
 
 def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, other_model_variables=FrozenDict({})):
@@ -152,6 +189,58 @@ def lqr_active_controllable_forward_operators_and_states(batch, params, layers_a
     transition_transposes.append(transition_transpose)
 
   return first_transition, first_transition_transpose, transitions, transition_transposes, states
+
+
+def lqr_active_execution_forward_operators_and_states(batch, params, stages_apply, execution_stage_specs,
+                                                      other_model_variables=FrozenDict({})):
+  """Build active-path operators over explicit execution stages, including passive state-only stages."""
+  if not execution_stage_specs:
+    raise ValueError("lqr_active_execution_forward_operators_and_states expects at least one stage")
+
+  states = [batch]
+  stage_operators = []
+  seen_control = False
+
+  for execution_index, stage_spec in enumerate(execution_stage_specs):
+    stage_state = states[-1]
+    stage_other_vars = _stage_other_variables(other_model_variables, stage_spec.param_name)
+
+    if stage_spec.kind == "controlled":
+      stage_params, unravel_params_fn = ravel_pytree(params[stage_spec.param_name])
+
+      if not seen_control:
+        fixed_input_state = stage_state
+
+        def simpler_apply(parameters):
+          return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars, fixed_input_state, execution_index)
+
+        states.append(simpler_apply(stage_params))
+        forward_op, transpose_op = _build_control_only_transition_operator(stage_params, simpler_apply)
+        stage_operators.append(
+          ActiveExecutionStageOperator("control_only", stage_spec.name, stage_spec.param_name, forward_op, transpose_op)
+        )
+        seen_control = True
+      else:
+        def simpler_apply(parameters, x):
+          return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
+                              _cast_state_like(stage_state, x), execution_index)
+
+        states.append(simpler_apply(stage_params, stage_state))
+        forward_op, transpose_op = _build_joint_transition_operator(stage_params, stage_state, simpler_apply)
+        stage_operators.append(
+          ActiveExecutionStageOperator("controlled", stage_spec.name, stage_spec.param_name, forward_op, transpose_op)
+        )
+    else:
+      def simpler_apply(x):
+        return stages_apply(stage_other_vars, _cast_state_like(stage_state, x), execution_index)
+
+      states.append(simpler_apply(stage_state))
+      forward_op, transpose_op = _build_state_only_transition_operator(stage_state, simpler_apply)
+      stage_operators.append(
+        ActiveExecutionStageOperator("passive", stage_spec.name, None, forward_op, transpose_op)
+      )
+
+  return stage_operators, states
 
 
 def __lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, other_model_variables=FrozenDict({})):
@@ -464,6 +553,83 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
       return first_r(flat_control) + damping * flat_control
 
   return first_k, list(reversed(later_k_backward_rev))
+
+
+def lqr_active_execution_backward_hamiltonian_operators(params, states, final_adjoint, execution_stage_operators,
+                                                        stages_apply, execution_stage_specs, damping,
+                                                        other_model_variables=FrozenDict({}),
+                                                        layer_modules=None):
+  """Build active-path second-order operators over explicit execution stages."""
+  if not execution_stage_specs:
+    raise ValueError("lqr_active_execution_backward_hamiltonian_operators expects at least one stage")
+  if layer_modules is not None and len(layer_modules) != len(execution_stage_specs):
+    raise ValueError("layer_modules must align with execution_stage_specs in the active execution-stage K builder")
+
+  p_i = final_adjoint
+  k_rev = []
+  for reverse_index, stage_spec in enumerate(reversed(execution_stage_specs)):
+    execution_index = len(execution_stage_specs) - reverse_index - 1
+    stage_operator = execution_stage_operators[execution_index]
+    stage_state = states[execution_index]
+    stage_other_vars = _stage_other_variables(other_model_variables, stage_spec.param_name)
+
+    if stage_operator.kind == "passive":
+      layer_state_primal = _state_primal_for_linearization(stage_state)
+
+      def simpler_apply(x):
+        return stages_apply(stage_other_vars, _cast_state_like(stage_state, x), execution_index)
+
+      def hamiltonian_x(x):
+        return tree_vdot(simpler_apply(x), p_i)
+
+      _, state_hessian = jax.linearize(jax.grad(hamiltonian_x), layer_state_primal)
+
+      def k_i(state_tangent, state_hessian=state_hessian):
+        return state_hessian(state_tangent)
+
+      k_rev.append(k_i)
+      p_i = stage_operator.transpose(p_i)
+      continue
+
+    layer_params, unravel_params_fn = ravel_pytree(params[stage_spec.param_name])
+    layer_state_primal = _state_primal_for_linearization(stage_state)
+
+    if stage_operator.kind == "control_only":
+      fixed_input_state = stage_state
+
+      def simpler_apply(parameters):
+        return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars, fixed_input_state, execution_index)
+
+      def hamiltonian(parameters):
+        return tree_vdot(simpler_apply(parameters), p_i)
+
+      _, first_r = jax.linearize(jax.grad(hamiltonian), layer_params)
+
+      def k_i(control_tangent, first_r=first_r, damping=damping):
+        flat_control = jnp.ravel(control_tangent)
+        return first_r(flat_control) + damping * flat_control
+
+      k_rev.append(k_i)
+      continue
+
+    def simpler_apply(parameters, x):
+      return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
+                          _cast_state_like(stage_state, x), execution_index)
+
+    def hamiltonian_joint(parameters, x):
+      return tree_vdot(simpler_apply(parameters, x), p_i)
+
+    _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
+
+    def k_i(control_tangent, state_tangent, joint_hessian=joint_hessian, damping=damping):
+      flat_control = jnp.ravel(control_tangent)
+      k_u, k_x = joint_hessian(flat_control, state_tangent)
+      return k_u + damping * flat_control, k_x
+
+    k_rev.append(k_i)
+    _, p_i = stage_operator.transpose(p_i)
+
+  return list(reversed(k_rev))
 
 
 ##################################################

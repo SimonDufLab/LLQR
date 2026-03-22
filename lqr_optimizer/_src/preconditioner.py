@@ -14,9 +14,11 @@ from lqr_optimizer._src.utils.utils import (normalize_gradient, timed_jit, pytre
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
                              lqr_active_controllable_forward_operators_and_states,
+                             lqr_active_execution_forward_operators_and_states,
                              lqr_final_costs_and_adjoints, lqr_backward_matrices_and_adjoints,
                              lqr_backward_hamiltonian_operators,
-                             lqr_active_controllable_backward_hamiltonian_operators, tree_vdot)
+                             lqr_active_controllable_backward_hamiltonian_operators,
+                             lqr_active_execution_backward_hamiltonian_operators, tree_vdot)
 
 BLOCK_STRUCTURE_DICT = {
   'dense': block_structures.DenseBlock,
@@ -215,6 +217,162 @@ def _active_preconditioner_value_and_grad_from_control_adjoint(block_structure, 
     recovered_by_layer = freeze(recovered_by_layer)
   return value, recovered_by_layer
 
+
+def _recover_loss_gradients_from_execution_stage_transposes(params, controlled_stage_names,
+                                                            execution_stage_specs, execution_stage_operators,
+                                                            final_lin_cost):
+  state_cotangent = final_lin_cost
+  recovered_by_layer = {}
+
+  for stage_spec, stage_operator in zip(reversed(execution_stage_specs), reversed(execution_stage_operators)):
+    if stage_operator.kind == "passive":
+      state_cotangent = stage_operator.transpose(state_cotangent)
+      continue
+
+    _, unravel_params_fn = ravel_pytree(params[stage_spec.param_name])
+    if stage_operator.kind == "control_only":
+      param_cotangent = stage_operator.transpose(state_cotangent)
+      recovered_by_layer[stage_spec.param_name] = unravel_params_fn(jnp.ravel(jnp.atleast_1d(param_cotangent)))
+      break
+
+    param_cotangent, state_cotangent = stage_operator.transpose(state_cotangent)
+    recovered_by_layer[stage_spec.param_name] = unravel_params_fn(jnp.ravel(jnp.atleast_1d(param_cotangent)))
+
+  ordered_recovered = {layer_name: recovered_by_layer[layer_name] for layer_name in controlled_stage_names}
+  if isinstance(params, FrozenDict):
+    return freeze(ordered_recovered)
+  return ordered_recovered
+
+
+def _rollout_active_execution_stages(execution_stage_specs, execution_stage_operators, flat_controls):
+  stage_inputs = {}
+  x = None
+  for stage_spec, stage_operator in zip(execution_stage_specs, execution_stage_operators):
+    if stage_operator.kind == "control_only":
+      stage_inputs[stage_spec.name] = None
+      x = stage_operator.forward(flat_controls[stage_spec.param_name])
+    elif stage_operator.kind == "controlled":
+      if x is None:
+        raise ValueError("Encountered a controlled execution stage before the first control-only stage.")
+      stage_inputs[stage_spec.name] = x
+      x = stage_operator.forward(flat_controls[stage_spec.param_name], x)
+    else:
+      if x is None:
+        raise ValueError("Passive execution stages before the first controlled stage are not supported.")
+      stage_inputs[stage_spec.name] = x
+      x = stage_operator.forward(x)
+  return stage_inputs, x
+
+
+def _active_execution_lqr_control_cost_from_rollout(execution_stage_specs, execution_stage_operators, stage_k_operators,
+                                                    flat_controls, stage_inputs, final_state, final_q, final_lin_cost):
+  cost = 0.0
+  for stage_spec, stage_operator, stage_k in zip(execution_stage_specs, execution_stage_operators, stage_k_operators):
+    if stage_operator.kind == "control_only":
+      u = flat_controls[stage_spec.param_name]
+      cost += jnp.dot(u, stage_k(u)) / 2
+    elif stage_operator.kind == "controlled":
+      u = flat_controls[stage_spec.param_name]
+      x = stage_inputs[stage_spec.name]
+      k_u, k_x = stage_k(u, x)
+      cost += (jnp.dot(u, k_u) + tree_vdot(x, k_x)) / 2
+    else:
+      x = stage_inputs[stage_spec.name]
+      k_x = stage_k(x)
+      cost += tree_vdot(x, k_x) / 2
+
+  flat_final_state = ravel_pytree(final_state)[0]
+  flat_final_lin_cost = ravel_pytree(final_lin_cost)[0]
+  flat_q_final = ravel_pytree(final_q(flat_final_state))[0]
+  return cost + jnp.dot(flat_final_state, flat_final_lin_cost) + 0.5 * jnp.dot(flat_final_state, flat_q_final)
+
+
+def _recover_control_gradients_from_active_execution_adjoint(controlled_stage_names, execution_stage_specs,
+                                                             execution_stage_operators, stage_k_operators,
+                                                             flat_controls, stage_inputs, final_state,
+                                                             final_q, final_lin_cost):
+  state_cotangent = _active_terminal_state_cotangent(final_state, final_q, final_lin_cost)
+  recovered_by_layer = {}
+
+  for stage_spec, stage_operator, stage_k in zip(reversed(execution_stage_specs),
+                                                 reversed(execution_stage_operators),
+                                                 reversed(stage_k_operators)):
+    if stage_operator.kind == "passive":
+      x = stage_inputs[stage_spec.name]
+      stage_x_grad = stage_k(x)
+      prev_state_cotangent = stage_operator.transpose(state_cotangent)
+      state_cotangent = jax.tree_map(jnp.add, stage_x_grad, prev_state_cotangent)
+      continue
+
+    if stage_operator.kind == "control_only":
+      recovered_by_layer[stage_spec.param_name] = stage_k(flat_controls[stage_spec.param_name]) + stage_operator.transpose(state_cotangent)
+      break
+
+    u = flat_controls[stage_spec.param_name]
+    x = stage_inputs[stage_spec.name]
+    stage_u_grad, stage_x_grad = stage_k(u, x)
+    control_cotangent, prev_state_cotangent = stage_operator.transpose(state_cotangent)
+    recovered_by_layer[stage_spec.param_name] = stage_u_grad + control_cotangent
+    state_cotangent = jax.tree_map(jnp.add, stage_x_grad, prev_state_cotangent)
+
+  return {layer_name: recovered_by_layer[layer_name] for layer_name in controlled_stage_names}
+
+
+def _recover_preconditioner_gradients_from_active_execution_control_adjoint(block_structure, blocks, controlled_stage_names,
+                                                                            execution_stage_specs, prepared_gradients, operators):
+  execution_stage_operators, stage_k_operators, final_q, final_lin_cost = operators
+  flat_controls = _materialize_active_flat_controls(
+    block_structure, blocks, controlled_stage_names, prepared_gradients
+  )
+  stage_inputs, final_state = _rollout_active_execution_stages(
+    execution_stage_specs, execution_stage_operators, flat_controls
+  )
+  control_gradients = _recover_control_gradients_from_active_execution_adjoint(
+    controlled_stage_names, execution_stage_specs, execution_stage_operators, stage_k_operators,
+    flat_controls, stage_inputs, final_state, final_q, final_lin_cost
+  )
+
+  recovered_by_layer = {
+    layer_name: block_structure.preconditioner_param_pullback_flat_layer(
+      blocks, layer_name, prepared_gradients[layer_name], control_gradients[layer_name]
+    )
+    for layer_name in controlled_stage_names
+  }
+
+  if isinstance(blocks, FrozenDict):
+    return freeze(recovered_by_layer)
+  return recovered_by_layer
+
+
+def _active_execution_preconditioner_value_and_grad_from_control_adjoint(block_structure, blocks, controlled_stage_names,
+                                                                         execution_stage_specs, prepared_gradients, operators):
+  execution_stage_operators, stage_k_operators, final_q, final_lin_cost = operators
+  flat_controls = _materialize_active_flat_controls(
+    block_structure, blocks, controlled_stage_names, prepared_gradients
+  )
+  stage_inputs, final_state = _rollout_active_execution_stages(
+    execution_stage_specs, execution_stage_operators, flat_controls
+  )
+  value = _active_execution_lqr_control_cost_from_rollout(
+    execution_stage_specs, execution_stage_operators, stage_k_operators,
+    flat_controls, stage_inputs, final_state, final_q, final_lin_cost
+  )
+  control_gradients = _recover_control_gradients_from_active_execution_adjoint(
+    controlled_stage_names, execution_stage_specs, execution_stage_operators, stage_k_operators,
+    flat_controls, stage_inputs, final_state, final_q, final_lin_cost
+  )
+
+  recovered_by_layer = {
+    layer_name: block_structure.preconditioner_param_pullback_flat_layer(
+      blocks, layer_name, prepared_gradients[layer_name], control_gradients[layer_name]
+    )
+    for layer_name in controlled_stage_names
+  }
+
+  if isinstance(blocks, FrozenDict):
+    recovered_by_layer = freeze(recovered_by_layer)
+  return value, recovered_by_layer
+
 class BasePreconditioner(abc.ABC):
   def __init__(self,
                divergence_function,
@@ -243,6 +401,9 @@ class BasePreconditioner(abc.ABC):
     self._optax_solver = optax_solver
     self._trainstate_solver = trainstate_solver
     self._layer_names = list(network_params.keys())
+    self._execution_stage_specs = tuple(getattr(model, "execution_stage_descriptors", ()))
+    self._controlled_stage_specs = tuple(getattr(model, "controlled_stage_descriptors", ()))
+    self._use_execution_stage_active_path = bool(getattr(model, "has_passive_stages", False))
     self._block_structure = BLOCK_STRUCTURE_DICT[block_structure](network_params, self._layer_names,
                                                                   block_structure_init, rank=precond_rank,
                                                                   identity_scale=precond_identity_scaling)
@@ -250,6 +411,7 @@ class BasePreconditioner(abc.ABC):
     self._layer_modules = tuple(model.layers) if hasattr(model, "layers") else None
     # self._block_structure.make_blocks(network_params, model.layer_names)
     self._layer_apply = model.apply_block_from_params
+    self._execution_stage_apply = getattr(model, "apply_block_from_params")
     self._model_apply = model.apply
     self._divergence_args_index = divergence_args_index
     self._preconditioner_update_steps = preconditioner_update_steps
@@ -303,10 +465,15 @@ class BasePreconditioner(abc.ABC):
     if batch_solve_precond:
       def get_operators_and_gradients(params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
-        first_transition, first_transition_transpose, transitions, transition_transposes, states = (
-          lqr_active_controllable_forward_operators_and_states(
-          inputs, params, self._layer_apply, self._layer_names, other_model_variables)
-        )
+        if self._use_execution_stage_active_path:
+          execution_stage_operators, states = lqr_active_execution_forward_operators_and_states(
+            inputs, params, self._execution_stage_apply, self._execution_stage_specs, other_model_variables
+          )
+        else:
+          first_transition, first_transition_transpose, transitions, transition_transposes, states = (
+            lqr_active_controllable_forward_operators_and_states(
+            inputs, params, self._layer_apply, self._layer_names, other_model_variables)
+          )
         if self._divergence_args_index is not None:
           div_arg = states[self._divergence_args_index]
         else:
@@ -315,17 +482,29 @@ class BasePreconditioner(abc.ABC):
                                                                         div_f=self._divergence_function,
                                                                         div_arg=div_arg)
         final_lin_cost = jnp.atleast_1d(final_lin_cost)
-        first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators(
-          params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
-          self._damping, other_model_variables, layer_modules=self._layer_modules)
-        gradients = _recover_loss_gradients_from_transition_transposes(
-          params, self._layer_names, transition_transposes, final_lin_cost,
-          first_transition_transpose=first_transition_transpose)
+        if self._use_execution_stage_active_path:
+          stage_k_operators = lqr_active_execution_backward_hamiltonian_operators(
+            params, states, final_p, execution_stage_operators, self._execution_stage_apply,
+            self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules
+          )
+          gradients = _recover_loss_gradients_from_execution_stage_transposes(
+            params, self._layer_names, self._execution_stage_specs, execution_stage_operators, final_lin_cost
+          )
+        else:
+          first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators(
+            params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
+            self._damping, other_model_variables, layer_modules=self._layer_modules)
+          gradients = _recover_loss_gradients_from_transition_transposes(
+            params, self._layer_names, transition_transposes, final_lin_cost,
+            first_transition_transpose=first_transition_transpose)
         if precond_on_update:
           gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state, params)
         gradients = self._normalize_grad_for_lqr_fn(gradients)
         gradients = jax.tree_map(lambda v: -1 * v, gradients)  # Starting update is negative gradient
         prepared_gradients = self._block_structure.prepare_train_vectors(gradients)
+
+        if self._use_execution_stage_active_path:
+          return prepared_gradients, (execution_stage_operators, stage_k_operators, final_q, final_lin_cost)
 
         return prepared_gradients, (
           first_transition, first_transition_transpose, transitions, transition_transposes,
@@ -333,6 +512,19 @@ class BasePreconditioner(abc.ABC):
 
       # def lqr_cost(_preconditioner, input_size, gradients, kernel_shapes, operators):
       def lqr_cost(_preconditioner, prepared_gradients, operators):
+        if self._use_execution_stage_active_path:
+          execution_stage_operators, stage_k_operators, final_q, final_lin_cost = operators
+          flat_controls = _materialize_active_flat_controls(
+            self._block_structure, _preconditioner, self._layer_names, prepared_gradients
+          )
+          stage_inputs, final_state = _rollout_active_execution_stages(
+            self._execution_stage_specs, execution_stage_operators, flat_controls
+          )
+          return _active_execution_lqr_control_cost_from_rollout(
+            self._execution_stage_specs, execution_stage_operators, stage_k_operators,
+            flat_controls, stage_inputs, final_state, final_q, final_lin_cost
+          )
+
         (first_transition, _, transitions, _,
          first_k_backward, k_backward, final_q, final_lin_cost) = operators
         cost = 0
@@ -362,13 +554,25 @@ class BasePreconditioner(abc.ABC):
         return grads
 
       def lqr_grad_only_fn(_preconditioner, prepared_gradients, operators):
-        grads = _recover_preconditioner_gradients_from_active_control_adjoint(
-          self._block_structure, _preconditioner, self._layer_names, prepared_gradients, operators)
+        if self._use_execution_stage_active_path:
+          grads = _recover_preconditioner_gradients_from_active_execution_control_adjoint(
+            self._block_structure, _preconditioner, self._layer_names, self._execution_stage_specs,
+            prepared_gradients, operators
+          )
+        else:
+          grads = _recover_preconditioner_gradients_from_active_control_adjoint(
+            self._block_structure, _preconditioner, self._layer_names, prepared_gradients, operators)
         return _sanitize_preconditioner_grads(grads)
 
       def lqr_value_and_grad_fn(_preconditioner, prepared_gradients, operators):
-        value, grads = _active_preconditioner_value_and_grad_from_control_adjoint(
-          self._block_structure, _preconditioner, self._layer_names, prepared_gradients, operators)
+        if self._use_execution_stage_active_path:
+          value, grads = _active_execution_preconditioner_value_and_grad_from_control_adjoint(
+            self._block_structure, _preconditioner, self._layer_names, self._execution_stage_specs,
+            prepared_gradients, operators
+          )
+        else:
+          value, grads = _active_preconditioner_value_and_grad_from_control_adjoint(
+            self._block_structure, _preconditioner, self._layer_names, prepared_gradients, operators)
         grads = _sanitize_preconditioner_grads(grads)
         return value, grads
 

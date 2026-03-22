@@ -6,8 +6,9 @@ from typing import Optional, Tuple
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from flax.core import freeze
 
-from lqr_optimizer._src.utils.utils import EnhancedSequential
+from lqr_optimizer._src.utils.utils import EnhancedSequential, StageDescriptor
 
 
 # -----------------------
@@ -161,6 +162,152 @@ class GPTBlock(nn.Module):
         return x
 
 
+class LayerNormCarryStage(nn.Module):
+    layer_norm_eps: float = 1e-5
+    norm_name: str = "LayerNorm_0"
+
+    @nn.compact
+    def __call__(self, x):
+        normalized = nn.LayerNorm(epsilon=self.layer_norm_eps, name=self.norm_name)(x)
+        return normalized, x
+
+
+class GPTSelfAttentionNamed(nn.Module):
+    hidden_dim: int
+    heads: int
+    attn_dim: int
+    attn_dropout: float = 0.0
+    deterministic: bool = True
+
+    @nn.compact
+    def __call__(self, x):
+        return GPTSelfAttention(
+            hidden_dim=self.hidden_dim,
+            heads=self.heads,
+            attn_dim=self.attn_dim,
+            attn_dropout=self.attn_dropout,
+            deterministic=self.deterministic,
+            name="GPTSelfAttention_0",
+        )(x)
+
+
+class AttentionCoreFromCarryStage(nn.Module):
+    hidden_dim: int
+    heads: int
+    attn_dim: int
+    attn_dropout: float = 0.0
+    deterministic: bool = True
+
+    @nn.compact
+    def __call__(self, inputs):
+        x, residual = inputs
+        attended = GPTSelfAttention(
+            hidden_dim=self.hidden_dim,
+            heads=self.heads,
+            attn_dim=self.attn_dim,
+            attn_dropout=self.attn_dropout,
+            deterministic=self.deterministic,
+            name="GPTSelfAttention_0",
+        )(x)
+        return attended, residual
+
+
+class ResidualAddDropoutStage(nn.Module):
+    rate: float = 0.0
+    deterministic: bool = True
+
+    @nn.compact
+    def __call__(self, inputs):
+        x, residual = inputs
+        x = nn.Dropout(rate=self.rate)(x, deterministic=self.deterministic)
+        return residual + x
+
+
+class FeedForwardFC1Only(nn.Module):
+    mlp_dim: int
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(self.mlp_dim, name="fc1")(x)
+
+
+class FeedForwardFC2Only(nn.Module):
+    dim: int
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(self.dim, name="fc2")(x)
+
+
+class FC1FromCarryStage(nn.Module):
+    mlp_dim: int
+
+    @nn.compact
+    def __call__(self, inputs):
+        x, residual = inputs
+        projected = FeedForwardFC1Only(self.mlp_dim, name="FeedForward_0")(x)
+        return projected, residual
+
+
+class GELUFromCarryStage(nn.Module):
+    approx_gelu: bool = True
+
+    def __call__(self, inputs):
+        x, residual = inputs
+        if self.approx_gelu:
+            x = jax.nn.gelu(x, approximate=True)
+        else:
+            x = nn.gelu(x)
+        return x, residual
+
+
+class FC2ResidualStage(nn.Module):
+    dim: int
+    resid_dropout: float = 0.0
+    deterministic: bool = True
+
+    @nn.compact
+    def __call__(self, inputs):
+        x, residual = inputs
+        projected = FeedForwardFC2Only(self.dim, name="FeedForward_0")(x)
+        projected = nn.Dropout(rate=self.resid_dropout)(projected, deterministic=self.deterministic)
+        return residual + projected
+
+
+def _extract_gpt_subtree(source_layer, mapping):
+    extracted = {}
+    for target_key, source_spec in mapping.items():
+        if isinstance(source_spec, dict):
+            child_source = source_layer.get(target_key, {})
+            extracted[target_key] = _extract_gpt_subtree(child_source, source_spec)
+        elif source_spec in source_layer:
+            extracted[target_key] = source_layer[source_spec]
+    return extracted
+
+
+def _migrate_gpt_split_tree(loaded_tree, init_tree, legacy_mapping):
+    if not init_tree and not loaded_tree:
+        return loaded_tree
+    if tuple(loaded_tree.keys()) == tuple(init_tree.keys()):
+        return loaded_tree
+
+    loaded_keys = list(loaded_tree.keys())
+    if len(loaded_keys) != len(legacy_mapping):
+        raise ValueError("Legacy GPT checkpoint layer count does not match the expected coarse-stage mapping.")
+
+    migrated = {}
+    for old_key, split_targets in zip(loaded_keys, legacy_mapping):
+        source_layer = loaded_tree[old_key]
+        for new_key, mapping in split_targets:
+            if mapping is None:
+                migrated[new_key] = source_layer
+            else:
+                migrated[new_key] = _extract_gpt_subtree(source_layer, mapping)
+
+    ordered = {key: migrated.get(key, init_tree[key]) for key in init_tree.keys()}
+    return freeze(ordered)
+
+
 # -----------------------
 # Stack wiring (Init / Final)
 # -----------------------
@@ -259,7 +406,22 @@ def create_gpt_model(
 
     def inference_mode(deterministic: bool):
         layers = []
-        layers.append(
+        stage_descriptors = []
+        legacy_mapping = []
+
+        def add_controlled(stage_name, module):
+            stage_index = len(layers)
+            layers.append(module)
+            param_name = f"layers_{stage_index}"
+            stage_descriptors.append(StageDescriptor(stage_name, "controlled", param_name))
+            return param_name
+
+        def add_passive(stage_name, module):
+            layers.append(module)
+            stage_descriptors.append(StageDescriptor(stage_name, "passive", None))
+
+        legacy_mapping.append(((add_controlled(
+            "gpt_init",
             GPTInitLayer(
                 vocab_size=vocab_size,
                 max_length=max_length,
@@ -269,35 +431,71 @@ def create_gpt_model(
                 mlp_dim=width_mlp,
                 embd_dropout=embd_dropout,
                 pos_encoding=pos_encoding,
-              deterministic=deterministic
-            )
-        )
+                deterministic=deterministic,
+            ),
+        ), None),))
 
-        for _ in range(depth):
-            layers.append(
-                GPTBlock(
-                    dim=emb_dim,
+        for block_index in range(depth):
+            block_mapping = []
+            if layer_norm:
+                block_mapping.append((add_controlled(
+                    f"block_{block_index}_attn_pre_ln",
+                    LayerNormCarryStage(layer_norm_eps=layer_norm_eps, norm_name="LayerNorm_0"),
+                ), {"LayerNorm_0": "LayerNorm_0"}))
+            else:
+                raise ValueError("Wave-5.a GPT stage splitting currently requires layer_norm=True.")
+
+            block_mapping.append((add_controlled(
+                f"block_{block_index}_attn_core",
+                AttentionCoreFromCarryStage(
+                    hidden_dim=emb_dim,
                     heads=num_heads,
                     attn_dim=attn_dim,
-                    mlp_dim=width_mlp,
-                    layer_norm=layer_norm,
-                    resid_dropout=resid_dropout,
                     attn_dropout=attn_dropout,
-                    linear=linear,
-                    layer_norm_eps=layer_norm_eps,
-                    norm_first=True,  # GPT2-style pre-norm
-                    deterministic=deterministic
-                )
-            )
+                    deterministic=deterministic,
+                ),
+            ), {"GPTSelfAttention_0": "GPTSelfAttention_0"}))
+            add_passive(f"block_{block_index}_attn_residual", ResidualAddDropoutStage(
+                rate=resid_dropout, deterministic=deterministic
+            ))
 
-        layers.append(
+            if linear:
+                block_mapping.append((add_controlled(
+                    f"block_{block_index}_mlp_pre_ln",
+                    LayerNormCarryStage(layer_norm_eps=layer_norm_eps, norm_name="LayerNorm_1"),
+                ), {"LayerNorm_1": "LayerNorm_1"}))
+                block_mapping.append((add_controlled(
+                    f"block_{block_index}_fc1",
+                    FC1FromCarryStage(mlp_dim=width_mlp),
+                ), {"FeedForward_0": {"fc1": "fc1"}}))
+                add_passive(f"block_{block_index}_gelu", GELUFromCarryStage())
+                block_mapping.append((add_controlled(
+                    f"block_{block_index}_fc2_residual",
+                    FC2ResidualStage(dim=emb_dim, resid_dropout=resid_dropout, deterministic=deterministic),
+                ), {"FeedForward_0": {"fc2": "fc2"}}))
+
+            legacy_mapping.append(tuple(block_mapping))
+
+        legacy_mapping.append(((add_controlled(
+            "gpt_final",
             GPTFinalLayer(
                 vocab_size=vocab_size,
-                use_final_ln=layer_norm,       # Torch variant attaches final LN on the encoder stack
+                use_final_ln=layer_norm,
                 layer_norm_eps=layer_norm_eps,
-                deterministic=deterministic
+                deterministic=deterministic,
+            ),
+        ), None),))
+
+        def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):
+            return (
+                _migrate_gpt_split_tree(loaded_params, init_params, legacy_mapping),
+                _migrate_gpt_split_tree(loaded_batch_stats, init_batch_stats, legacy_mapping),
             )
+
+        return EnhancedSequential(
+            layers,
+            stage_descriptors=tuple(stage_descriptors),
+            legacy_checkpoint_migrator=migrate_legacy_checkpoint,
         )
-        return EnhancedSequential(layers)
 
     return inference_mode(False), inference_mode(True)

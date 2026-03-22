@@ -20,7 +20,7 @@ from flax import struct
 from flax.training import train_state
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
 from flax.traverse_util import flatten_dict, unflatten_dict
-from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable
+from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable, NamedTuple
 from types import FrameType
 from pathlib import Path
 from collections.abc import Sequence
@@ -137,14 +137,55 @@ def get_per_layer_norm(precond):
 #
 #     return params
 
+class StageDescriptor(NamedTuple):
+  name: str
+  kind: str
+  param_name: Optional[str] = None
+
+
 class EnhancedSequential(nn.Module):
   layers: List[nn.Module]
+  stage_descriptors: Optional[Tuple[StageDescriptor, ...]] = None
+  legacy_checkpoint_migrator: Optional[Callable[[Any, Any, Any, Any], Tuple[Any, Any]]] = None
 
   def __call__(self, x: Any) -> Any:
     """Applies the blocks sequentially to the input."""
     for block in self.layers:
       x = block(x)
     return x
+
+  @property
+  def execution_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:
+    if self.stage_descriptors is None:
+      return tuple(
+        StageDescriptor(name=f"layers_{i}", kind="controlled", param_name=f"layers_{i}")
+        for i, _ in enumerate(self.layers)
+      )
+    return self.stage_descriptors
+
+  @property
+  def controlled_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:
+    return tuple(stage for stage in self.execution_stage_descriptors if stage.kind == "controlled")
+
+  @property
+  def controlled_stage_names(self) -> Tuple[str, ...]:
+    return tuple(stage.param_name for stage in self.controlled_stage_descriptors)
+
+  @property
+  def has_passive_stages(self) -> bool:
+    return any(stage.kind == "passive" for stage in self.execution_stage_descriptors)
+
+  def get_execution_stage_index(self, stage_name: str) -> int:
+    for index, stage in enumerate(self.execution_stage_descriptors):
+      if stage.name == stage_name:
+        return index
+    raise ValueError(f"Execution stage '{stage_name}' not found.")
+
+  def get_controlled_stage_execution_index(self, param_name: str) -> int:
+    for index, stage in enumerate(self.execution_stage_descriptors):
+      if stage.param_name == param_name:
+        return index
+    raise ValueError(f"Controlled stage '{param_name}' not found.")
 
   def init(self, rng: jax.random.PRNGKey, *args, **kwargs) -> FrozenDict:
     """
@@ -174,26 +215,32 @@ class EnhancedSequential(nn.Module):
   #   raise ValueError(f"Block name '{block_name}' not found.")
 
   def apply_block_from_name(self, block_name: str, x: Any, params: FrozenDict) -> Any:
-    """Applies a specific block using its parameters."""
-    # Get the list of parameter names
-    layer_names = list(params.keys())
-
-    # Find the index of the block_name
-    try:
-      index = layer_names.index(block_name)
-    except ValueError:
-      raise ValueError(f"Block name '{block_name}' not found.")
-
-    # Retrieve the corresponding block and its parameters
-    block = self.layers[index]
+    """Applies a controlled stage using its explicit stage-to-execution mapping."""
+    block = self.layers[self.get_controlled_stage_execution_index(block_name)]
     block_params = params.get(block_name, {})
-
-    # Apply the block using the provided parameters
     return block.apply({"params": block_params}, x)
+
+  def apply_execution_stage_from_name(self, stage_name: str, x: Any, variables: FrozenDict) -> Any:
+    """Applies one execution stage identified by its explicit stage name."""
+    block = self.layers[self.get_execution_stage_index(stage_name)]
+    return block.apply(variables, x)
 
   def apply_block_from_params(self, block_params: FrozenDict, x: Any, index) -> Any:
     block = self.layers[index]
     return block.apply(block_params, x)
+
+  def maybe_migrate_legacy_checkpoint(self, loaded_params, loaded_batch_stats,
+                                      init_params, init_batch_stats):
+    params_match = tuple(loaded_params.keys()) == tuple(init_params.keys())
+    batch_stats_match = tuple(loaded_batch_stats.keys()) == tuple(init_batch_stats.keys())
+    if params_match and batch_stats_match:
+      return loaded_params, loaded_batch_stats, False
+    if self.legacy_checkpoint_migrator is None:
+      return loaded_params, loaded_batch_stats, False
+    migrated_params, migrated_batch_stats = self.legacy_checkpoint_migrator(
+      loaded_params, loaded_batch_stats, init_params, init_batch_stats
+    )
+    return migrated_params, migrated_batch_stats, True
 
   ##################################
   # XLA debugging util
