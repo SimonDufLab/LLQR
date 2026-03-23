@@ -19,7 +19,9 @@ from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
                              lqr_backward_matrices_and_adjoints,
                              lqr_backward_hamiltonian_operators,
                              lqr_active_controllable_backward_hamiltonian_operators,
-                             lqr_active_execution_backward_hamiltonian_operators, tree_vdot)
+                             lqr_active_execution_backward_hamiltonian_operators,
+                             prepare_active_execution_stage_metadata,
+                             tree_vdot)
 
 BLOCK_STRUCTURE_DICT = {
   'dense': block_structures.DenseBlock,
@@ -49,9 +51,30 @@ BLOCK_STRUCTURE_DICT = {
 }
 
 
-def _recover_loss_gradients_from_transition_transposes(params, layer_names, transition_transposes, final_lin_cost,
-                                                       *, first_transition_transpose=None):
+def _recover_loss_gradients_from_transition_transposes(params_or_layer_names, layer_names_or_transition_transposes,
+                                                       transition_transposes_or_final_lin_cost,
+                                                       final_lin_cost_or_unravel_params_fns=None,
+                                                       unravel_params_fns=None, *,
+                                                       first_transition_transpose=None,
+                                                       freeze_result=False):
   """Recover the exact loss gradient by a reverse sweep over the joint transition transposes."""
+  if isinstance(params_or_layer_names, (dict, FrozenDict)):
+    params = params_or_layer_names
+    layer_names = layer_names_or_transition_transposes
+    transition_transposes = transition_transposes_or_final_lin_cost
+    final_lin_cost = final_lin_cost_or_unravel_params_fns
+    if unravel_params_fns is None:
+      unravel_params_fns = {
+        layer_name: ravel_pytree(params[layer_name])[1]
+        for layer_name in layer_names
+      }
+    freeze_result = isinstance(params, FrozenDict)
+  else:
+    layer_names = params_or_layer_names
+    transition_transposes = layer_names_or_transition_transposes
+    final_lin_cost = transition_transposes_or_final_lin_cost
+    unravel_params_fns = final_lin_cost_or_unravel_params_fns
+
   state_cotangent = final_lin_cost
   recovered_by_layer = {}
 
@@ -59,19 +82,19 @@ def _recover_loss_gradients_from_transition_transposes(params, layer_names, tran
   stop_index = -1 if first_transition_transpose is None else 0
   for layer_index in range(start_index, stop_index, -1):
     layer_name = layer_names[layer_index]
-    _, unravel_params_fn = ravel_pytree(params[layer_name])
+    unravel_params_fn = unravel_params_fns[layer_name]
     transpose_index = layer_index if first_transition_transpose is None else layer_index - 1
     param_cotangent, state_cotangent = transition_transposes[transpose_index](state_cotangent)
     recovered_by_layer[layer_name] = unravel_params_fn(jnp.ravel(jnp.atleast_1d(param_cotangent)))
 
   if first_transition_transpose is not None:
     first_layer_name = layer_names[0]
-    _, unravel_params_fn = ravel_pytree(params[first_layer_name])
+    unravel_params_fn = unravel_params_fns[first_layer_name]
     param_cotangent = first_transition_transpose(state_cotangent)
     recovered_by_layer[first_layer_name] = unravel_params_fn(jnp.ravel(jnp.atleast_1d(param_cotangent)))
 
   ordered_recovered = {layer_name: recovered_by_layer[layer_name] for layer_name in layer_names}
-  if isinstance(params, FrozenDict):
+  if freeze_result:
     return freeze(ordered_recovered)
   return ordered_recovered
 
@@ -218,9 +241,32 @@ def _active_preconditioner_value_and_grad_from_control_adjoint(block_structure, 
   return value, recovered_by_layer
 
 
-def _recover_loss_gradients_from_execution_stage_transposes(params, controlled_stage_names,
-                                                            execution_stage_specs, execution_stage_operators,
-                                                            final_lin_cost):
+def _recover_loss_gradients_from_execution_stage_transposes(params_or_controlled_stage_names,
+                                                            controlled_stage_names_or_execution_stage_specs,
+                                                            execution_stage_specs_or_execution_stage_operators,
+                                                            execution_stage_operators_or_final_lin_cost,
+                                                            final_lin_cost_or_unravel_params_fns,
+                                                            unravel_params_fns=None,
+                                                            freeze_result=False):
+  if isinstance(params_or_controlled_stage_names, (dict, FrozenDict)):
+    params = params_or_controlled_stage_names
+    controlled_stage_names = controlled_stage_names_or_execution_stage_specs
+    execution_stage_specs = execution_stage_specs_or_execution_stage_operators
+    execution_stage_operators = execution_stage_operators_or_final_lin_cost
+    final_lin_cost = final_lin_cost_or_unravel_params_fns
+    if unravel_params_fns is None:
+      unravel_params_fns = {
+        layer_name: ravel_pytree(params[layer_name])[1]
+        for layer_name in controlled_stage_names
+      }
+    freeze_result = isinstance(params, FrozenDict)
+  else:
+    controlled_stage_names = params_or_controlled_stage_names
+    execution_stage_specs = controlled_stage_names_or_execution_stage_specs
+    execution_stage_operators = execution_stage_specs_or_execution_stage_operators
+    final_lin_cost = execution_stage_operators_or_final_lin_cost
+    unravel_params_fns = final_lin_cost_or_unravel_params_fns
+
   state_cotangent = final_lin_cost
   recovered_by_layer = {}
 
@@ -229,7 +275,7 @@ def _recover_loss_gradients_from_execution_stage_transposes(params, controlled_s
       state_cotangent = stage_operator.transpose(state_cotangent)
       continue
 
-    _, unravel_params_fn = ravel_pytree(params[stage_spec.param_name])
+    unravel_params_fn = unravel_params_fns[stage_spec.param_name]
     if stage_operator.kind == "control_only":
       param_cotangent = stage_operator.transpose(state_cotangent)
       recovered_by_layer[stage_spec.param_name] = unravel_params_fn(jnp.ravel(jnp.atleast_1d(param_cotangent)))
@@ -239,7 +285,7 @@ def _recover_loss_gradients_from_execution_stage_transposes(params, controlled_s
     recovered_by_layer[stage_spec.param_name] = unravel_params_fn(jnp.ravel(jnp.atleast_1d(param_cotangent)))
 
   ordered_recovered = {layer_name: recovered_by_layer[layer_name] for layer_name in controlled_stage_names}
-  if isinstance(params, FrozenDict):
+  if freeze_result:
     return freeze(ordered_recovered)
   return ordered_recovered
 
@@ -401,6 +447,12 @@ class BasePreconditioner(abc.ABC):
     self._execution_stage_specs = tuple(getattr(model, "execution_stage_descriptors", ()))
     self._controlled_stage_specs = tuple(getattr(model, "controlled_stage_descriptors", ()))
     self._use_execution_stage_active_path = bool(getattr(model, "has_passive_stages", False))
+    self._controlled_stage_unravel_fns = {}
+    self._controlled_stage_flat_param_sizes = {}
+    for layer_name in self._layer_names:
+      flat_params, unravel_params_fn = ravel_pytree(network_params[layer_name])
+      self._controlled_stage_unravel_fns[layer_name] = unravel_params_fn
+      self._controlled_stage_flat_param_sizes[layer_name] = flat_params.size
     self._block_structure = BLOCK_STRUCTURE_DICT[block_structure](network_params, self._layer_names,
                                                                   block_structure_init, rank=precond_rank,
                                                                   identity_scale=precond_identity_scaling)
@@ -434,6 +486,13 @@ class BasePreconditioner(abc.ABC):
     # return self._jit_apply_fn(self._block_structure.blocks, update)
     return self._block_structure.matrix_product(blocks, update)
 
+  def _should_snapshot_preconditioner_for_update(self, ema_decay):
+    if ema_decay != 0:
+      return True
+    if hasattr(self._block_structure, "_memory"):
+      return True
+    return False
+
   def get_stats(self):
     if hasattr(self._block_structure, "_memory"):
       precond_max, precond_min = pytree_max_min(self._block_structure.get_memory())
@@ -463,8 +522,16 @@ class BasePreconditioner(abc.ABC):
       def get_operators_and_gradients(params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
         if self._use_execution_stage_active_path:
+          prepared_stage_metadata = prepare_active_execution_stage_metadata(
+            params,
+            self._execution_stage_specs,
+            other_model_variables,
+            param_unravel_fns=self._controlled_stage_unravel_fns,
+            flat_param_sizes=self._controlled_stage_flat_param_sizes,
+          )
           execution_stage_operators, states = lqr_active_execution_forward_operators_and_states(
-            inputs, params, self._execution_stage_apply, self._execution_stage_specs, other_model_variables
+            inputs, params, self._execution_stage_apply, self._execution_stage_specs, other_model_variables,
+            prepared_stage_metadata=prepared_stage_metadata,
           )
         else:
           first_transition, first_transition_transpose, transitions, transition_transposes, states = (
@@ -481,18 +548,22 @@ class BasePreconditioner(abc.ABC):
         if self._use_execution_stage_active_path:
           stage_k_operators = lqr_active_execution_backward_hamiltonian_operators(
             params, states, final_p, execution_stage_operators, self._execution_stage_apply,
-            self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules
+            self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules,
+            prepared_stage_metadata=prepared_stage_metadata,
           )
           gradients = _recover_loss_gradients_from_execution_stage_transposes(
-            params, self._layer_names, self._execution_stage_specs, execution_stage_operators, final_lin_cost
+            self._layer_names, self._execution_stage_specs, execution_stage_operators, final_lin_cost,
+            self._controlled_stage_unravel_fns, freeze_result=isinstance(params, FrozenDict)
           )
         else:
           first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators(
             params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
             self._damping, other_model_variables, layer_modules=self._layer_modules)
           gradients = _recover_loss_gradients_from_transition_transposes(
-            params, self._layer_names, transition_transposes, final_lin_cost,
-            first_transition_transpose=first_transition_transpose)
+            self._layer_names, transition_transposes, final_lin_cost,
+            self._controlled_stage_unravel_fns,
+            first_transition_transpose=first_transition_transpose,
+            freeze_result=isinstance(params, FrozenDict))
         if precond_on_update:
           gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state, params)
         gradients = self._normalize_grad_for_lqr_fn(gradients)
@@ -607,13 +678,15 @@ class BasePreconditioner(abc.ABC):
                                                xs=None, length=steps, unroll=1)
           return jax.tree_map(jnp.nan_to_num, final_precond)
 
-      def get_update(preconditioner, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state):
-        # Snapshot of preconditioner to donate arg during jitted fn, but need original for EMA later
-        precond_snapshot = _deep_copy_pytree(preconditioner)
-        # Initialize the optimizer state for the preconditioner.
-        opt_state = optax_solver.init(precond_snapshot)
+      def get_update(preconditioner, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state,
+                     snapshot_preconditioner=True):
+        if snapshot_preconditioner:
+          precond_input = _deep_copy_pytree(preconditioner)
+        else:
+          precond_input = preconditioner
+        opt_state = optax_solver.init(precond_input)
 
-        return _get_update(precond_snapshot, opt_state, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state)
+        return _get_update(precond_input, opt_state, params, precond_lr, other_model_variables, datapoint, trainstate_opt_state)
 
       return get_update
     else:
@@ -819,17 +892,20 @@ class BasePreconditioner(abc.ABC):
         _blocks = self._block_structure.blocks
       else:
         _blocks = self._block_structure.reinit_blocks()
-      self._block_structure.update_blocks(
-        self._update_preconditioner_fn(
-          _blocks,
-          params,
-          precond_lr,
-          other_model_variables,
-          acc_batches,
-          opt_state,
-        ),
-        ema_decay,
+      should_snapshot = self._should_snapshot_preconditioner_for_update(ema_decay)
+      updated_blocks = self._update_preconditioner_fn(
+        _blocks,
+        params,
+        precond_lr,
+        other_model_variables,
+        acc_batches,
+        opt_state,
+        snapshot_preconditioner=should_snapshot,
       )
+      if should_snapshot:
+        self._block_structure.update_blocks(updated_blocks, ema_decay)
+      else:
+        self._block_structure.blocks.update(updated_blocks)
 
     if not self._allow_grad_inversion and self._block_structure_name in ('scalar', "diagonal"):
       # We clip to (almost) 0 those 2 structures to avoid gradient inversion

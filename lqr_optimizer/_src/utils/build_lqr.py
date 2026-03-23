@@ -1,5 +1,5 @@
 """Helper functions for building the LQR problem associated with the desired divergence measure"""
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -114,6 +114,20 @@ class ActiveExecutionStageOperator(NamedTuple):
   transpose: callable
 
 
+class ActiveControlledLayerMetadata(NamedTuple):
+  layer_name: str
+  flat_params: jnp.ndarray
+  unravel_params_fn: callable
+  other_vars: dict
+
+
+class ActiveExecutionStageMetadata(NamedTuple):
+  stage_spec: StageDescriptor
+  flat_params: Optional[jnp.ndarray]
+  unravel_params_fn: Optional[callable]
+  other_vars: dict
+
+
 def _supports_piecewise_linear_active_fast_path(layer_module):
   """Return whether the active K-builder can use the exact piecewise-linear fast path."""
   if layer_module is None:
@@ -137,6 +151,70 @@ def _stage_other_variables(other_model_variables, param_name):
   if param_name is None:
     return {}
   return {key: value.get(param_name, {}) for key, value in other_model_variables.items()}
+
+
+def _resolve_unravel_params_fn(param_name, current_unravel_fn, param_unravel_fns):
+  if param_unravel_fns is None:
+    return current_unravel_fn
+  return param_unravel_fns[param_name]
+
+
+def _validate_flat_param_size(param_name, flat_params, flat_param_sizes):
+  if flat_param_sizes is None:
+    return
+  expected_size = flat_param_sizes[param_name]
+  if flat_params.size != expected_size:
+    raise ValueError(
+      f"Flat parameter size mismatch for '{param_name}': expected {expected_size}, got {flat_params.size}"
+    )
+
+
+def prepare_active_controllable_layer_metadata(params, layer_names, other_model_variables=FrozenDict({}),
+                                               param_unravel_fns: Optional[Mapping[str, callable]] = None,
+                                               flat_param_sizes: Optional[Mapping[str, int]] = None):
+  metadata = []
+  for layer_name in layer_names:
+    flat_params, current_unravel_fn = ravel_pytree(params[layer_name])
+    _validate_flat_param_size(layer_name, flat_params, flat_param_sizes)
+    metadata.append(
+      ActiveControlledLayerMetadata(
+        layer_name=layer_name,
+        flat_params=flat_params,
+        unravel_params_fn=_resolve_unravel_params_fn(layer_name, current_unravel_fn, param_unravel_fns),
+        other_vars=_stage_other_variables(other_model_variables, layer_name),
+      )
+    )
+  return tuple(metadata)
+
+
+def prepare_active_execution_stage_metadata(params, execution_stage_specs, other_model_variables=FrozenDict({}),
+                                            param_unravel_fns: Optional[Mapping[str, callable]] = None,
+                                            flat_param_sizes: Optional[Mapping[str, int]] = None):
+  metadata = []
+  for stage_spec in execution_stage_specs:
+    if stage_spec.kind == "controlled":
+      flat_params, current_unravel_fn = ravel_pytree(params[stage_spec.param_name])
+      _validate_flat_param_size(stage_spec.param_name, flat_params, flat_param_sizes)
+      metadata.append(
+        ActiveExecutionStageMetadata(
+          stage_spec=stage_spec,
+          flat_params=flat_params,
+          unravel_params_fn=_resolve_unravel_params_fn(
+            stage_spec.param_name, current_unravel_fn, param_unravel_fns),
+          other_vars=_stage_other_variables(other_model_variables, stage_spec.param_name),
+        )
+      )
+      continue
+
+    metadata.append(
+      ActiveExecutionStageMetadata(
+        stage_spec=stage_spec,
+        flat_params=None,
+        unravel_params_fn=None,
+        other_vars=_stage_other_variables(other_model_variables, None),
+      )
+    )
+  return tuple(metadata)
 
 
 def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, other_model_variables=FrozenDict({})):
@@ -163,16 +241,23 @@ def lqr_forward_matrices_and_states(batch, params, layers_apply, layer_names, ot
 
 
 def lqr_active_controllable_forward_operators_and_states(batch, params, layers_apply, layer_names,
-                                                         other_model_variables=FrozenDict({})):
+                                                         other_model_variables=FrozenDict({}),
+                                                         prepared_layer_metadata=None):
   """Build active-path operators with a control-only first layer and PyTree-native later state."""
   if not layer_names:
     raise ValueError("lqr_active_controllable_forward_operators_and_states expects at least one layer")
+  if prepared_layer_metadata is None:
+    prepared_layer_metadata = prepare_active_controllable_layer_metadata(
+      params, layer_names, other_model_variables
+    )
 
   states = [batch]
 
   first_layer_name = layer_names[0]
-  first_layer_params, unravel_first_params_fn = ravel_pytree(params[first_layer_name])
-  first_layer_other_vars = {k: v.get(first_layer_name, {}) for k, v in other_model_variables.items()}
+  first_layer_metadata = prepared_layer_metadata[0]
+  first_layer_params = first_layer_metadata.flat_params
+  unravel_first_params_fn = first_layer_metadata.unravel_params_fn
+  first_layer_other_vars = first_layer_metadata.other_vars
   fixed_input_state = states[0]
 
   def first_simpler_apply(parameters):
@@ -183,10 +268,12 @@ def lqr_active_controllable_forward_operators_and_states(batch, params, layers_a
     first_layer_params, first_simpler_apply)
 
   transitions, transition_transposes = [], []
-  for i, layer_name in enumerate(layer_names[1:], start=1):
-    layer_params, unravel_params_fn = ravel_pytree(params[layer_name])
+  for i, layer_metadata in enumerate(prepared_layer_metadata[1:], start=1):
+    layer_name = layer_metadata.layer_name
+    layer_params = layer_metadata.flat_params
+    unravel_params_fn = layer_metadata.unravel_params_fn
     layer_state = states[i]
-    layer_other_vars = {k: v.get(layer_name, {}) for k, v in other_model_variables.items()}
+    layer_other_vars = layer_metadata.other_vars
 
     def simpler_apply(parameters, x):
       return layers_apply({'params': unravel_params_fn(parameters)} | layer_other_vars, x, i)
@@ -200,21 +287,28 @@ def lqr_active_controllable_forward_operators_and_states(batch, params, layers_a
 
 
 def lqr_active_execution_forward_operators_and_states(batch, params, stages_apply, execution_stage_specs,
-                                                      other_model_variables=FrozenDict({})):
+                                                      other_model_variables=FrozenDict({}),
+                                                      prepared_stage_metadata=None):
   """Build active-path operators over explicit execution stages, including passive state-only stages."""
   if not execution_stage_specs:
     raise ValueError("lqr_active_execution_forward_operators_and_states expects at least one stage")
+  if prepared_stage_metadata is None:
+    prepared_stage_metadata = prepare_active_execution_stage_metadata(
+      params, execution_stage_specs, other_model_variables
+    )
 
   states = [batch]
   stage_operators = []
   seen_control = False
 
-  for execution_index, stage_spec in enumerate(execution_stage_specs):
+  for execution_index, stage_metadata in enumerate(prepared_stage_metadata):
+    stage_spec = stage_metadata.stage_spec
     stage_state = states[-1]
-    stage_other_vars = _stage_other_variables(other_model_variables, stage_spec.param_name)
+    stage_other_vars = stage_metadata.other_vars
 
     if stage_spec.kind == "controlled":
-      stage_params, unravel_params_fn = ravel_pytree(params[stage_spec.param_name])
+      stage_params = stage_metadata.flat_params
+      unravel_params_fn = stage_metadata.unravel_params_fn
 
       if not seen_control:
         fixed_input_state = stage_state
@@ -526,20 +620,27 @@ def lqr_backward_hamiltonian_operators(params, states, final_adjoint, transition
 def lqr_active_controllable_backward_hamiltonian_operators(params, states, final_adjoint, transition_transposes,
                                                            layers_apply, layer_names, damping,
                                                            other_model_variables=FrozenDict({}),
-                                                           layer_modules=None):
+                                                           layer_modules=None,
+                                                           prepared_layer_metadata=None):
   """Build active-path second-order operators with a control-only first layer."""
   if not layer_names:
     raise ValueError("lqr_active_controllable_backward_hamiltonian_operators expects at least one layer")
   if layer_modules is not None and len(layer_modules) != len(layer_names):
     raise ValueError("layer_modules must align with layer_names in the active controllable K builder")
+  if prepared_layer_metadata is None:
+    prepared_layer_metadata = prepare_active_controllable_layer_metadata(
+      params, layer_names, other_model_variables
+    )
 
   p_i = final_adjoint
   later_k_backward_rev = []
-  for reverse_index, layer_name in enumerate(layer_names[:0:-1]):
+  for reverse_index, layer_metadata in enumerate(reversed(prepared_layer_metadata[1:])):
+    layer_name = layer_metadata.layer_name
     j = len(layer_names) - reverse_index - 1
-    layer_params, unravel_params_fn = ravel_pytree(params[layer_name])
+    layer_params = layer_metadata.flat_params
+    unravel_params_fn = layer_metadata.unravel_params_fn
     layer_state = states[j]
-    layer_other_vars = {k: v.get(layer_name, {}) for k, v in other_model_variables.items()}
+    layer_other_vars = layer_metadata.other_vars
     layer_state_primal = _state_primal_for_linearization(layer_state)
 
     def simpler_apply(parameters, x):
@@ -576,8 +677,10 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
     _, p_i = transition_transposes[j - 1](p_i)
 
   first_layer_name = layer_names[0]
-  first_layer_params, unravel_first_params_fn = ravel_pytree(params[first_layer_name])
-  first_layer_other_vars = {k: v.get(first_layer_name, {}) for k, v in other_model_variables.items()}
+  first_layer_metadata = prepared_layer_metadata[0]
+  first_layer_params = first_layer_metadata.flat_params
+  unravel_first_params_fn = first_layer_metadata.unravel_params_fn
+  first_layer_other_vars = first_layer_metadata.other_vars
   fixed_input_state = states[0]
 
   def first_simpler_apply(parameters):
@@ -604,20 +707,26 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
 def lqr_active_execution_backward_hamiltonian_operators(params, states, final_adjoint, execution_stage_operators,
                                                         stages_apply, execution_stage_specs, damping,
                                                         other_model_variables=FrozenDict({}),
-                                                        layer_modules=None):
+                                                        layer_modules=None,
+                                                        prepared_stage_metadata=None):
   """Build active-path second-order operators over explicit execution stages."""
   if not execution_stage_specs:
     raise ValueError("lqr_active_execution_backward_hamiltonian_operators expects at least one stage")
   if layer_modules is not None and len(layer_modules) != len(execution_stage_specs):
     raise ValueError("layer_modules must align with execution_stage_specs in the active execution-stage K builder")
+  if prepared_stage_metadata is None:
+    prepared_stage_metadata = prepare_active_execution_stage_metadata(
+      params, execution_stage_specs, other_model_variables
+    )
 
   p_i = final_adjoint
   k_rev = []
-  for reverse_index, stage_spec in enumerate(reversed(execution_stage_specs)):
+  for reverse_index, stage_metadata in enumerate(reversed(prepared_stage_metadata)):
+    stage_spec = stage_metadata.stage_spec
     execution_index = len(execution_stage_specs) - reverse_index - 1
     stage_operator = execution_stage_operators[execution_index]
     stage_state = states[execution_index]
-    stage_other_vars = _stage_other_variables(other_model_variables, stage_spec.param_name)
+    stage_other_vars = stage_metadata.other_vars
 
     if stage_operator.kind == "passive":
       if _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
@@ -641,7 +750,8 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
       p_i = stage_operator.transpose(p_i)
       continue
 
-    layer_params, unravel_params_fn = ravel_pytree(params[stage_spec.param_name])
+    layer_params = stage_metadata.flat_params
+    unravel_params_fn = stage_metadata.unravel_params_fn
     layer_state_primal = _state_primal_for_linearization(stage_state)
 
     if stage_operator.kind == "control_only":
