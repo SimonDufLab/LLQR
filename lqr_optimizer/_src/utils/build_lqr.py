@@ -356,6 +356,30 @@ def _lqr_final_costs_and_adjoints_generic(loss_f, final_states, targets, div_f=N
     return final_q, final_lin_cost, final_lin_cost
 
 
+def _lqr_active_final_costs_and_adjoints_generic(loss_f, final_states, targets, div_f=None, div_arg=None):
+  """Generic terminal-term construction using the natural active-path tree shape."""
+  if div_f:
+    assert div_arg is not None, "div_arg must not be None when a divergence function is specified"
+
+  def loss_fn(outputs):
+    return loss_f(outputs, targets)
+
+  grad_fn = jax.grad(loss_fn)
+  final_lin_cost = grad_fn(final_states)
+
+  if div_f:
+    def div_fn(outputs):
+      return div_f(div_arg, outputs)
+
+    grad_div_fn = jax.grad(div_fn)
+    final_p = grad_div_fn(final_states)
+    _, final_q = jax.linearize(grad_div_fn, final_states)
+    return final_q, final_p, final_lin_cost
+
+  _, final_q = jax.linearize(grad_fn, final_states)
+  return final_q, final_lin_cost, final_lin_cost
+
+
 def _lqr_final_costs_and_adjoints_analytic_ce_ngd(final_states, targets, div_arg, label_smoothing):
   final_lin_cost = _cross_entropy_log_prob_gradient(final_states, targets, label_smoothing)
   final_p = -jnp.exp(div_arg)
@@ -379,6 +403,20 @@ def lqr_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_
     return _lqr_final_costs_and_adjoints_analytic_ce_ngd(final_states, targets, div_arg, label_smoothing)
 
   return _lqr_final_costs_and_adjoints_generic(loss_f, final_states, targets, div_f=div_f, div_arg=div_arg)
+
+
+def lqr_active_final_costs_and_adjoints(loss_f, final_states, targets, div_f=None, div_arg=None):
+  """Handle active-path terminal terms in the natural output tree shape."""
+  label_smoothing = _get_cross_entropy_label_smoothing(loss_f)
+
+  if label_smoothing is not None and div_f is None:
+    return _lqr_final_costs_and_adjoints_analytic_ce_newton(final_states, targets, label_smoothing)
+
+  if label_smoothing is not None and _is_ngd_divergence(div_f):
+    assert div_arg is not None, "div_arg must not be None when a divergence function is specified"
+    return _lqr_final_costs_and_adjoints_analytic_ce_ngd(final_states, targets, div_arg, label_smoothing)
+
+  return _lqr_active_final_costs_and_adjoints_generic(loss_f, final_states, targets, div_f=div_f, div_arg=div_arg)
 
 
 def lqr_backward_matrices_and_adjoints(params, states, final_adjoint, transition_transposes, layers_apply, layer_names, damping,

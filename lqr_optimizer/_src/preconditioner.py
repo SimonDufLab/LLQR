@@ -15,7 +15,8 @@ import lqr_optimizer._src.block_matrices_approx.block_structures as block_struct
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
                              lqr_active_controllable_forward_operators_and_states,
                              lqr_active_execution_forward_operators_and_states,
-                             lqr_final_costs_and_adjoints, lqr_backward_matrices_and_adjoints,
+                             lqr_final_costs_and_adjoints, lqr_active_final_costs_and_adjoints,
+                             lqr_backward_matrices_and_adjoints,
                              lqr_backward_hamiltonian_operators,
                              lqr_active_controllable_backward_hamiltonian_operators,
                              lqr_active_execution_backward_hamiltonian_operators, tree_vdot)
@@ -100,11 +101,13 @@ def _rollout_active_control_states(layer_names, flat_controls, first_transition,
 
 
 def _active_terminal_state_cotangent(final_state, final_q, final_lin_cost):
-  """Adapt the shared flat terminal operator contract back to the active state tree."""
-  flat_final_state, unravel_final_state = ravel_pytree(final_state)
-  flat_final_lin_cost = ravel_pytree(final_lin_cost)[0]
-  flat_terminal_cotangent = flat_final_lin_cost + jnp.ravel(final_q(flat_final_state))
-  return unravel_final_state(flat_terminal_cotangent)
+  """Recover the terminal cotangent on the active tree-native contract."""
+  return jax.tree_map(jnp.add, final_lin_cost, final_q(final_state))
+
+
+def _active_terminal_cost(final_state, final_q, final_lin_cost):
+  """Evaluate the active terminal contribution without flattening the final state."""
+  return tree_vdot(final_state, final_lin_cost) + 0.5 * tree_vdot(final_state, final_q(final_state))
 
 
 def _active_lqr_control_cost(layer_names, flat_controls, first_transition, transitions,
@@ -130,10 +133,7 @@ def _active_lqr_control_cost_from_rollout(layer_names, flat_controls, later_stat
     k_u, k_x = k_backward[i](u, x)
     cost += (jnp.dot(u, k_u) + tree_vdot(x, k_x)) / 2
 
-  flat_final_state = ravel_pytree(final_state)[0]
-  flat_final_lin_cost = ravel_pytree(final_lin_cost)[0]
-  flat_q_final = ravel_pytree(final_q(flat_final_state))[0]
-  return cost + jnp.dot(flat_final_state, flat_final_lin_cost) + 0.5 * jnp.dot(flat_final_state, flat_q_final)
+  return cost + _active_terminal_cost(final_state, final_q, final_lin_cost)
 
 
 def _recover_control_gradients_from_active_lqr_adjoint(layer_names, flat_controls, later_state_inputs, final_state,
@@ -281,10 +281,7 @@ def _active_execution_lqr_control_cost_from_rollout(execution_stage_specs, execu
       k_x = stage_k(x)
       cost += tree_vdot(x, k_x) / 2
 
-  flat_final_state = ravel_pytree(final_state)[0]
-  flat_final_lin_cost = ravel_pytree(final_lin_cost)[0]
-  flat_q_final = ravel_pytree(final_q(flat_final_state))[0]
-  return cost + jnp.dot(flat_final_state, flat_final_lin_cost) + 0.5 * jnp.dot(flat_final_state, flat_q_final)
+  return cost + _active_terminal_cost(final_state, final_q, final_lin_cost)
 
 
 def _recover_control_gradients_from_active_execution_adjoint(controlled_stage_names, execution_stage_specs,
@@ -478,10 +475,9 @@ class BasePreconditioner(abc.ABC):
           div_arg = states[self._divergence_args_index]
         else:
           div_arg = None
-        final_q, final_p, final_lin_cost = lqr_final_costs_and_adjoints(self._loss_fn, states[-1], targets,
-                                                                        div_f=self._divergence_function,
-                                                                        div_arg=div_arg)
-        final_lin_cost = jnp.atleast_1d(final_lin_cost)
+        final_q, final_p, final_lin_cost = lqr_active_final_costs_and_adjoints(
+          self._loss_fn, states[-1], targets, div_f=self._divergence_function, div_arg=div_arg
+        )
         if self._use_execution_stage_active_path:
           stage_k_operators = lqr_active_execution_backward_hamiltonian_operators(
             params, states, final_p, execution_stage_operators, self._execution_stage_apply,
@@ -541,11 +537,7 @@ class BasePreconditioner(abc.ABC):
           cost += (jnp.dot(u, k_u) + tree_vdot(x, k_x)) / 2
           x = transitions[i](u, x)
 
-        x1 = ravel_pytree(x)[0]
-        c1 = jnp.ravel(final_lin_cost)
-        qx1 = ravel_pytree(final_q(x1))[0]
-
-        cost += jnp.dot(x1, c1) + 0.5 * jnp.dot(x1, qx1)
+        cost += _active_terminal_cost(x, final_q, final_lin_cost)
 
         return cost
 
