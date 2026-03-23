@@ -19,7 +19,9 @@ from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
                              lqr_backward_matrices_and_adjoints,
                              lqr_backward_hamiltonian_operators,
                              lqr_active_controllable_backward_hamiltonian_operators,
+                             lqr_active_controllable_backward_hamiltonian_operators_lowmem,
                              lqr_active_execution_backward_hamiltonian_operators,
+                             lqr_active_execution_backward_hamiltonian_operators_lowmem,
                              prepare_active_execution_stage_metadata,
                              tree_vdot)
 
@@ -49,6 +51,9 @@ BLOCK_STRUCTURE_DICT = {
   'sym_swm_e-kfac': block_structures.Sym_SWM_EKFAC,
   'sym_swm_sep-e-kfac': block_structures.Sym_SWM_SeparableEKFAC,
 }
+
+
+VALID_LLQR_OPERATOR_MODES = ("cached_exact", "lowmem_exact_k")
 
 
 def _recover_loss_gradients_from_transition_transposes(params_or_layer_names, layer_names_or_transition_transposes,
@@ -437,6 +442,7 @@ class BasePreconditioner(abc.ABC):
                damping: float = 0.0,
                allow_grad_inversion: bool = False,
                divergence_args_index = -1,
+               llqr_operator_mode: str = "cached_exact",
                optax_solver_requires_value_and_grad: bool = False):
     self._divergence_function = divergence_function
     self._damping =damping
@@ -470,6 +476,11 @@ class BasePreconditioner(abc.ABC):
     self._optax_solver_requires_value_and_grad = optax_solver_requires_value_and_grad
     self._precond_on_update = precond_on_update
     self._allow_grad_inversion = allow_grad_inversion
+    if llqr_operator_mode not in VALID_LLQR_OPERATOR_MODES:
+      raise ValueError(
+        f"Unknown llqr_operator_mode '{llqr_operator_mode}'. Expected one of {VALID_LLQR_OPERATOR_MODES}."
+      )
+    self._llqr_operator_mode = llqr_operator_mode
     if normalize_grad_for_lqr:
       self._normalize_grad_for_lqr_fn = normalize_gradient
     else:
@@ -495,6 +506,9 @@ class BasePreconditioner(abc.ABC):
 
   def _should_use_shared_active_metadata_runtime(self):
     return self._use_execution_stage_active_path
+
+  def _uses_lowmem_exact_k_mode(self):
+    return self._llqr_operator_mode == "lowmem_exact_k"
 
   def _write_back_updated_preconditioner(self, updated_blocks, ema_decay, *, snapshot_preconditioner):
     if snapshot_preconditioner:
@@ -533,6 +547,7 @@ class BasePreconditioner(abc.ABC):
       def get_operators_and_gradients(params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
         use_shared_active_metadata_runtime = self._should_use_shared_active_metadata_runtime()
+        use_lowmem_exact_k_mode = self._uses_lowmem_exact_k_mode()
         if self._use_execution_stage_active_path:
           prepared_stage_metadata = prepare_active_execution_stage_metadata(
             params,
@@ -558,19 +573,31 @@ class BasePreconditioner(abc.ABC):
           self._loss_fn, states[-1], targets, div_f=self._divergence_function, div_arg=div_arg
         )
         if self._use_execution_stage_active_path:
-          stage_k_operators = lqr_active_execution_backward_hamiltonian_operators(
-            params, states, final_p, execution_stage_operators, self._execution_stage_apply,
-            self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules,
-            prepared_stage_metadata=prepared_stage_metadata,
-          )
+          if use_lowmem_exact_k_mode:
+            stage_k_operators = lqr_active_execution_backward_hamiltonian_operators_lowmem(
+              params, states, final_p, execution_stage_operators, self._execution_stage_apply,
+              self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules,
+              prepared_stage_metadata=prepared_stage_metadata,
+            )
+          else:
+            stage_k_operators = lqr_active_execution_backward_hamiltonian_operators(
+              params, states, final_p, execution_stage_operators, self._execution_stage_apply,
+              self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules,
+              prepared_stage_metadata=prepared_stage_metadata,
+            )
           gradients = _recover_loss_gradients_from_execution_stage_transposes(
             self._layer_names, self._execution_stage_specs, execution_stage_operators, final_lin_cost,
             self._controlled_stage_unravel_fns, freeze_result=isinstance(params, FrozenDict)
           )
         else:
-          first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators(
-            params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
-            self._damping, other_model_variables, layer_modules=self._layer_modules)
+          if use_lowmem_exact_k_mode:
+            first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators_lowmem(
+              params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
+              self._damping, other_model_variables, layer_modules=self._layer_modules)
+          else:
+            first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators(
+              params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
+              self._damping, other_model_variables, layer_modules=self._layer_modules)
           gradients = _recover_loss_gradients_from_transition_transposes(
             self._layer_names, transition_transposes, final_lin_cost,
             self._controlled_stage_unravel_fns,

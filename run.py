@@ -239,6 +239,7 @@ def main(cfg: DictConfig):
     damping=cfg.damping,
     allow_grad_inversion=cfg.allow_grad_inversion,
     divergence_args_index=-1,
+    llqr_operator_mode=cfg.llqr_operator_mode,
     optax_solver_requires_value_and_grad=utl.precond_solver_requires_value_and_grad(cfg.precond_solver),
   )
   if load_from_preexisting_model_state and precond_blocks is not None:
