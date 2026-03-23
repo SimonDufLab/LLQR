@@ -8,7 +8,11 @@ import jax.numpy as jnp
 import flax.linen as nn
 from flax.core import freeze
 
-from lqr_optimizer._src.utils.utils import EnhancedSequential, StageDescriptor
+from lqr_optimizer._src.utils.utils import (
+    EnhancedSequential,
+    make_controlled_stage_descriptor,
+    make_passive_stage_descriptor,
+)
 
 
 # -----------------------
@@ -413,12 +417,14 @@ def create_gpt_model(
             stage_index = len(layers)
             layers.append(module)
             param_name = f"layers_{stage_index}"
-            stage_descriptors.append(StageDescriptor(stage_name, "controlled", param_name, fast_path_kind))
+            stage_descriptors.append(
+                make_controlled_stage_descriptor(stage_name, param_name, fast_path_kind)
+            )
             return param_name
 
         def add_passive(stage_name, module, fast_path_kind=None):
             layers.append(module)
-            stage_descriptors.append(StageDescriptor(stage_name, "passive", None, fast_path_kind))
+            stage_descriptors.append(make_passive_stage_descriptor(stage_name, fast_path_kind))
 
         legacy_mapping.append(((add_controlled(
             "gpt_init",
@@ -496,10 +502,12 @@ def create_gpt_model(
                 _migrate_gpt_split_tree(loaded_batch_stats, init_batch_stats, legacy_mapping),
             )
 
-        return EnhancedSequential(
+        model = EnhancedSequential(
             layers,
             stage_descriptors=tuple(stage_descriptors),
             legacy_checkpoint_migrator=migrate_legacy_checkpoint,
         )
+        model.validate_stage_descriptors()
+        return model
 
     return inference_mode(False), inference_mode(True)

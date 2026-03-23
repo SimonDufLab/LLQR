@@ -4,7 +4,11 @@ from typing import Tuple
 
 from flax.core import freeze
 
-from lqr_optimizer._src.utils.utils import EnhancedSequential, StageDescriptor
+from lqr_optimizer._src.utils.utils import (
+  EnhancedSequential,
+  make_controlled_stage_descriptor,
+  make_passive_stage_descriptor,
+)
 
 
 # ============================================================================
@@ -344,12 +348,14 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
       stage_index = len(layers)
       layers.append(module)
       param_name = f"layers_{stage_index}"
-      stage_descriptors.append(StageDescriptor(stage_name, "controlled", param_name, fast_path_kind))
+      stage_descriptors.append(
+        make_controlled_stage_descriptor(stage_name, param_name, fast_path_kind)
+      )
       return param_name
 
     def add_passive(stage_name, module, fast_path_kind=None):
       layers.append(module)
-      stage_descriptors.append(StageDescriptor(stage_name, "passive", None, fast_path_kind))
+      stage_descriptors.append(make_passive_stage_descriptor(stage_name, fast_path_kind))
 
     def append_basic_block(prefix, features, stride, projection):
       part1_mapping = []
@@ -432,11 +438,13 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
         _migrate_split_stage_tree(loaded_batch_stats, init_batch_stats, legacy_batch_stats_mapping),
       )
 
-    return EnhancedSequential(
+    model = EnhancedSequential(
       layers,
       stage_descriptors=tuple(stage_descriptors),
       legacy_checkpoint_migrator=migrate_legacy_checkpoint,
     )
+    model.validate_stage_descriptors()
+    return model
 
   return inference_mode(False), inference_mode(True)
 
@@ -535,12 +543,14 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
       stage_index = len(layers)
       layers.append(module)
       param_name = f"layers_{stage_index}"
-      stage_descriptors.append(StageDescriptor(stage_name, "controlled", param_name, fast_path_kind))
+      stage_descriptors.append(
+        make_controlled_stage_descriptor(stage_name, param_name, fast_path_kind)
+      )
       return param_name
 
     def add_passive(stage_name, module, fast_path_kind=None):
       layers.append(module)
-      stage_descriptors.append(StageDescriptor(stage_name, "passive", None, fast_path_kind))
+      stage_descriptors.append(make_passive_stage_descriptor(stage_name, fast_path_kind))
 
     def append_bottleneck(prefix, planes, stride, projection):
       part1_mapping = []
@@ -633,10 +643,12 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
         _migrate_split_stage_tree(loaded_batch_stats, init_batch_stats, legacy_batch_stats_mapping),
       )
 
-    return EnhancedSequential(
+    model = EnhancedSequential(
       layers,
       stage_descriptors=tuple(stage_descriptors),
       legacy_checkpoint_migrator=migrate_legacy_checkpoint,
     )
+    model.validate_stage_descriptors()
+    return model
 
   return inference_mode(False), inference_mode(True)

@@ -144,6 +144,59 @@ class StageDescriptor(NamedTuple):
   fast_path_kind: Optional[str] = None
 
 
+_ALLOWED_STAGE_KINDS = frozenset(("controlled", "passive"))
+_ALLOWED_FAST_PATH_KINDS = frozenset((None, "linear_controlled", "piecewise_linear_passive"))
+
+
+def make_controlled_stage_descriptor(name: str, param_name: str, fast_path_kind: Optional[str] = None) -> StageDescriptor:
+  return StageDescriptor(name=name, kind="controlled", param_name=param_name, fast_path_kind=fast_path_kind)
+
+
+def make_passive_stage_descriptor(name: str, fast_path_kind: Optional[str] = None) -> StageDescriptor:
+  return StageDescriptor(name=name, kind="passive", param_name=None, fast_path_kind=fast_path_kind)
+
+
+def validate_stage_descriptors(stage_descriptors: Tuple[StageDescriptor, ...], *, num_layers: int) -> Tuple[StageDescriptor, ...]:
+  if len(stage_descriptors) != num_layers:
+    raise ValueError(
+      f"Stage descriptor count {len(stage_descriptors)} does not match layer count {num_layers}."
+    )
+
+  stage_names = set()
+  controlled_param_names = set()
+  for descriptor in stage_descriptors:
+    if descriptor.kind not in _ALLOWED_STAGE_KINDS:
+      raise ValueError(f"Unknown stage kind '{descriptor.kind}' for stage '{descriptor.name}'.")
+    if descriptor.name in stage_names:
+      raise ValueError(f"Duplicate execution stage name '{descriptor.name}'.")
+    stage_names.add(descriptor.name)
+
+    if descriptor.fast_path_kind not in _ALLOWED_FAST_PATH_KINDS:
+      raise ValueError(
+        f"Unknown fast_path_kind '{descriptor.fast_path_kind}' for stage '{descriptor.name}'."
+      )
+
+    if descriptor.kind == "controlled":
+      if descriptor.param_name is None:
+        raise ValueError(f"Controlled stage '{descriptor.name}' must define param_name.")
+      if descriptor.param_name in controlled_param_names:
+        raise ValueError(f"Duplicate controlled param_name '{descriptor.param_name}'.")
+      controlled_param_names.add(descriptor.param_name)
+      if descriptor.fast_path_kind == "piecewise_linear_passive":
+        raise ValueError(
+          f"Controlled stage '{descriptor.name}' cannot use passive fast_path_kind '{descriptor.fast_path_kind}'."
+        )
+    else:
+      if descriptor.param_name is not None:
+        raise ValueError(f"Passive stage '{descriptor.name}' must not define param_name.")
+      if descriptor.fast_path_kind == "linear_controlled":
+        raise ValueError(
+          f"Passive stage '{descriptor.name}' cannot use controlled fast_path_kind '{descriptor.fast_path_kind}'."
+        )
+
+  return stage_descriptors
+
+
 class EnhancedSequential(nn.Module):
   layers: List[nn.Module]
   stage_descriptors: Optional[Tuple[StageDescriptor, ...]] = None
@@ -158,11 +211,16 @@ class EnhancedSequential(nn.Module):
   @property
   def execution_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:
     if self.stage_descriptors is None:
-      return tuple(
-        StageDescriptor(name=f"layers_{i}", kind="controlled", param_name=f"layers_{i}", fast_path_kind=None)
+      stage_descriptors = tuple(
+        make_controlled_stage_descriptor(name=f"layers_{i}", param_name=f"layers_{i}", fast_path_kind=None)
         for i, _ in enumerate(self.layers)
       )
-    return self.stage_descriptors
+    else:
+      stage_descriptors = tuple(self.stage_descriptors)
+    return validate_stage_descriptors(stage_descriptors, num_layers=len(self.layers))
+
+  def validate_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:
+    return self.execution_stage_descriptors
 
   @property
   def controlled_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:

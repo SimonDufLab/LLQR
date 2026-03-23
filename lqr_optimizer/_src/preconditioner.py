@@ -493,6 +493,17 @@ class BasePreconditioner(abc.ABC):
       return True
     return False
 
+  def _should_use_shared_active_metadata_runtime(self):
+    return self._use_execution_stage_active_path
+
+  def _write_back_updated_preconditioner(self, updated_blocks, ema_decay, *, snapshot_preconditioner):
+    if snapshot_preconditioner:
+      self._block_structure.update_blocks(updated_blocks, ema_decay)
+      return
+
+    # Keep the original container identity on the no-snapshot branch.
+    self._block_structure.blocks.update(updated_blocks)
+
   def get_stats(self):
     if hasattr(self._block_structure, "_memory"):
       precond_max, precond_min = pytree_max_min(self._block_structure.get_memory())
@@ -521,6 +532,7 @@ class BasePreconditioner(abc.ABC):
     if batch_solve_precond:
       def get_operators_and_gradients(params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
+        use_shared_active_metadata_runtime = self._should_use_shared_active_metadata_runtime()
         if self._use_execution_stage_active_path:
           prepared_stage_metadata = prepare_active_execution_stage_metadata(
             params,
@@ -528,7 +540,7 @@ class BasePreconditioner(abc.ABC):
             other_model_variables,
             param_unravel_fns=self._controlled_stage_unravel_fns,
             flat_param_sizes=self._controlled_stage_flat_param_sizes,
-          )
+          ) if use_shared_active_metadata_runtime else None
           execution_stage_operators, states = lqr_active_execution_forward_operators_and_states(
             inputs, params, self._execution_stage_apply, self._execution_stage_specs, other_model_variables,
             prepared_stage_metadata=prepared_stage_metadata,
@@ -903,9 +915,13 @@ class BasePreconditioner(abc.ABC):
         snapshot_preconditioner=should_snapshot,
       )
       if should_snapshot:
-        self._block_structure.update_blocks(updated_blocks, ema_decay)
+        self._write_back_updated_preconditioner(
+          updated_blocks, ema_decay, snapshot_preconditioner=True
+        )
       else:
-        self._block_structure.blocks.update(updated_blocks)
+        self._write_back_updated_preconditioner(
+          updated_blocks, ema_decay, snapshot_preconditioner=False
+        )
 
     if not self._allow_grad_inversion and self._block_structure_name in ('scalar', "diagonal"):
       # We clip to (almost) 0 those 2 structures to avoid gradient inversion
