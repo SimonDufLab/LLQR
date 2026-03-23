@@ -106,6 +106,92 @@ def _build_state_only_transition_operator(layer_state, simpler_apply):
   return transition, transition_transpose
 
 
+def _resolve_active_checkpoint_policy(checkpoint_policy):
+  if checkpoint_policy in (None, "none"):
+    return None
+  if checkpoint_policy == "dots_no_batch_dims":
+    return jax.checkpoint_policies.dots_with_no_batch_dims_saveable
+  raise ValueError(f"Unsupported LLQR checkpoint policy '{checkpoint_policy}'")
+
+
+def _maybe_checkpoint(function, checkpoint_policy):
+  policy = _resolve_active_checkpoint_policy(checkpoint_policy)
+  if policy is None:
+    return function
+  return jax.checkpoint(function, policy=policy)
+
+
+def _build_on_demand_joint_transition_operator(layer_params, layer_state, simpler_apply,
+                                               checkpoint_policy="none"):
+  """Build a joint transition operator that recomputes JVP/VJP on every call."""
+  layer_state_primal = _state_primal_for_linearization(layer_state)
+  apply_from_linear_state = _maybe_checkpoint(simpler_apply, checkpoint_policy)
+
+  def transition(control_tangent, state_tangent,
+                 apply_from_linear_state=apply_from_linear_state,
+                 layer_params=layer_params,
+                 layer_state_primal=layer_state_primal):
+    flat_control = jnp.ravel(control_tangent)
+    _, output_tangent = jax.jvp(
+      apply_from_linear_state,
+      (layer_params, layer_state_primal),
+      (flat_control, state_tangent),
+    )
+    return output_tangent
+
+  def transition_transpose(cotangent,
+                           apply_from_linear_state=apply_from_linear_state,
+                           layer_params=layer_params,
+                           layer_state_primal=layer_state_primal):
+    _, pullback = jax.vjp(apply_from_linear_state, layer_params, layer_state_primal)
+    param_cotangent, state_cotangent = pullback(cotangent)
+    return jnp.ravel(jnp.atleast_1d(param_cotangent)), state_cotangent
+
+  return transition, transition_transpose
+
+
+def _build_on_demand_control_only_transition_operator(layer_params, simpler_apply,
+                                                      checkpoint_policy="none"):
+  """Build a control-only transition operator that recomputes JVP/VJP on every call."""
+  apply_from_control = _maybe_checkpoint(simpler_apply, checkpoint_policy)
+
+  def transition(control_tangent, apply_from_control=apply_from_control, layer_params=layer_params):
+    flat_control = jnp.ravel(control_tangent)
+    _, output_tangent = jax.jvp(apply_from_control, (layer_params,), (flat_control,))
+    return output_tangent
+
+  def transition_transpose(cotangent, apply_from_control=apply_from_control, layer_params=layer_params):
+    _, pullback = jax.vjp(apply_from_control, layer_params)
+    param_cotangent = pullback(cotangent)
+    if isinstance(param_cotangent, tuple):
+      param_cotangent = param_cotangent[0]
+    return jnp.ravel(jnp.atleast_1d(param_cotangent))
+
+  return transition, transition_transpose
+
+
+def _build_on_demand_state_only_transition_operator(layer_state, simpler_apply,
+                                                    checkpoint_policy="none"):
+  """Build a state-only transition operator that recomputes JVP/VJP on every call."""
+  layer_state_primal = _state_primal_for_linearization(layer_state)
+  apply_from_linear_state = _maybe_checkpoint(simpler_apply, checkpoint_policy)
+
+  def transition(state_tangent, apply_from_linear_state=apply_from_linear_state,
+                 layer_state_primal=layer_state_primal):
+    _, output_tangent = jax.jvp(apply_from_linear_state, (layer_state_primal,), (state_tangent,))
+    return output_tangent
+
+  def transition_transpose(cotangent, apply_from_linear_state=apply_from_linear_state,
+                           layer_state_primal=layer_state_primal):
+    _, pullback = jax.vjp(apply_from_linear_state, layer_state_primal)
+    state_cotangent = pullback(cotangent)
+    if isinstance(state_cotangent, tuple):
+      state_cotangent = state_cotangent[0]
+    return state_cotangent
+
+  return transition, transition_transpose
+
+
 class ActiveExecutionStageOperator(NamedTuple):
   kind: str
   stage_name: str
@@ -315,7 +401,8 @@ def lqr_active_controllable_forward_operators_and_states(batch, params, layers_a
   first_layer_other_vars = first_layer_metadata.other_vars
   fixed_input_state = states[0]
 
-  def first_simpler_apply(parameters):
+  def first_simpler_apply(parameters, unravel_first_params_fn=unravel_first_params_fn,
+                         first_layer_other_vars=first_layer_other_vars, fixed_input_state=fixed_input_state):
     return layers_apply({'params': unravel_first_params_fn(parameters)} | first_layer_other_vars, fixed_input_state, 0)
 
   states.append(first_simpler_apply(first_layer_params))
@@ -335,6 +422,53 @@ def lqr_active_controllable_forward_operators_and_states(batch, params, layers_a
 
     states.append(simpler_apply(layer_params, layer_state))
     transition, transition_transpose = _build_joint_transition_operator(layer_params, layer_state, simpler_apply)
+    transitions.append(transition)
+    transition_transposes.append(transition_transpose)
+
+  return first_transition, first_transition_transpose, transitions, transition_transposes, states
+
+
+def lqr_active_controllable_forward_operators_and_states_lowmem(batch, params, layers_apply, layer_names,
+                                                                other_model_variables=FrozenDict({}),
+                                                                prepared_layer_metadata=None,
+                                                                checkpoint_policy="none"):
+  """Build active-path first-order operators with on-demand JVP/VJP products."""
+  if not layer_names:
+    raise ValueError("lqr_active_controllable_forward_operators_and_states_lowmem expects at least one layer")
+  if prepared_layer_metadata is None:
+    prepared_layer_metadata = prepare_active_controllable_layer_metadata(
+      params, layer_names, other_model_variables
+    )
+
+  states = [batch]
+
+  first_layer_metadata = prepared_layer_metadata[0]
+  first_layer_params = first_layer_metadata.flat_params
+  unravel_first_params_fn = first_layer_metadata.unravel_params_fn
+  first_layer_other_vars = first_layer_metadata.other_vars
+  fixed_input_state = states[0]
+
+  def first_simpler_apply(parameters):
+    return layers_apply({'params': unravel_first_params_fn(parameters)} | first_layer_other_vars, fixed_input_state, 0)
+
+  states.append(first_simpler_apply(first_layer_params))
+  first_transition, first_transition_transpose = _build_on_demand_control_only_transition_operator(
+    first_layer_params, first_simpler_apply, checkpoint_policy=checkpoint_policy)
+
+  transitions, transition_transposes = [], []
+  for i, layer_metadata in enumerate(prepared_layer_metadata[1:], start=1):
+    layer_params = layer_metadata.flat_params
+    unravel_params_fn = layer_metadata.unravel_params_fn
+    layer_state = states[i]
+    layer_other_vars = layer_metadata.other_vars
+
+    def simpler_apply(parameters, x, unravel_params_fn=unravel_params_fn,
+                     layer_other_vars=layer_other_vars, layer_state=layer_state, i=i):
+      return layers_apply({'params': unravel_params_fn(parameters)} | layer_other_vars, _cast_state_like(layer_state, x), i)
+
+    states.append(simpler_apply(layer_params, layer_state))
+    transition, transition_transpose = _build_on_demand_joint_transition_operator(
+      layer_params, layer_state, simpler_apply, checkpoint_policy=checkpoint_policy)
     transitions.append(transition)
     transition_transposes.append(transition_transpose)
 
@@ -368,7 +502,9 @@ def lqr_active_execution_forward_operators_and_states(batch, params, stages_appl
       if not seen_control:
         fixed_input_state = stage_state
 
-        def simpler_apply(parameters):
+        def simpler_apply(parameters, unravel_params_fn=unravel_params_fn,
+                         stage_other_vars=stage_other_vars, fixed_input_state=fixed_input_state,
+                         execution_index=execution_index):
           return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars, fixed_input_state, execution_index)
 
         states.append(simpler_apply(stage_params))
@@ -378,7 +514,9 @@ def lqr_active_execution_forward_operators_and_states(batch, params, stages_appl
         )
         seen_control = True
       else:
-        def simpler_apply(parameters, x):
+        def simpler_apply(parameters, x, unravel_params_fn=unravel_params_fn,
+                         stage_other_vars=stage_other_vars, stage_state=stage_state,
+                         execution_index=execution_index):
           return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
                               _cast_state_like(stage_state, x), execution_index)
 
@@ -388,11 +526,80 @@ def lqr_active_execution_forward_operators_and_states(batch, params, stages_appl
           ActiveExecutionStageOperator("controlled", stage_spec.name, stage_spec.param_name, forward_op, transpose_op)
         )
     else:
-      def simpler_apply(x):
+      def simpler_apply(x, stage_other_vars=stage_other_vars, stage_state=stage_state,
+                       execution_index=execution_index):
         return stages_apply(stage_other_vars, _cast_state_like(stage_state, x), execution_index)
 
       states.append(simpler_apply(stage_state))
       forward_op, transpose_op = _build_state_only_transition_operator(stage_state, simpler_apply)
+      stage_operators.append(
+        ActiveExecutionStageOperator("passive", stage_spec.name, None, forward_op, transpose_op)
+      )
+
+  return stage_operators, states
+
+
+def lqr_active_execution_forward_operators_and_states_lowmem(batch, params, stages_apply, execution_stage_specs,
+                                                             other_model_variables=FrozenDict({}),
+                                                             prepared_stage_metadata=None,
+                                                             checkpoint_policy="none"):
+  """Build active-path execution-stage first-order operators with on-demand JVP/VJP products."""
+  if not execution_stage_specs:
+    raise ValueError("lqr_active_execution_forward_operators_and_states_lowmem expects at least one stage")
+  if prepared_stage_metadata is None:
+    prepared_stage_metadata = prepare_active_execution_stage_metadata(
+      params, execution_stage_specs, other_model_variables
+    )
+
+  states = [batch]
+  stage_operators = []
+  seen_control = False
+
+  for execution_index, stage_metadata in enumerate(prepared_stage_metadata):
+    stage_spec = stage_metadata.stage_spec
+    stage_state = states[-1]
+    stage_other_vars = stage_metadata.other_vars
+
+    if stage_spec.kind == "controlled":
+      stage_params = stage_metadata.flat_params
+      unravel_params_fn = stage_metadata.unravel_params_fn
+
+      if not seen_control:
+        fixed_input_state = stage_state
+
+        def simpler_apply(parameters, unravel_params_fn=unravel_params_fn,
+                         stage_other_vars=stage_other_vars, fixed_input_state=fixed_input_state,
+                         execution_index=execution_index):
+          return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars, fixed_input_state, execution_index)
+
+        states.append(simpler_apply(stage_params))
+        forward_op, transpose_op = _build_on_demand_control_only_transition_operator(
+          stage_params, simpler_apply, checkpoint_policy=checkpoint_policy)
+        stage_operators.append(
+          ActiveExecutionStageOperator("control_only", stage_spec.name, stage_spec.param_name, forward_op, transpose_op)
+        )
+        seen_control = True
+      else:
+        def simpler_apply(parameters, x, unravel_params_fn=unravel_params_fn,
+                         stage_other_vars=stage_other_vars, stage_state=stage_state,
+                         execution_index=execution_index):
+          return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
+                              _cast_state_like(stage_state, x), execution_index)
+
+        states.append(simpler_apply(stage_params, stage_state))
+        forward_op, transpose_op = _build_on_demand_joint_transition_operator(
+          stage_params, stage_state, simpler_apply, checkpoint_policy=checkpoint_policy)
+        stage_operators.append(
+          ActiveExecutionStageOperator("controlled", stage_spec.name, stage_spec.param_name, forward_op, transpose_op)
+        )
+    else:
+      def simpler_apply(x, stage_other_vars=stage_other_vars, stage_state=stage_state,
+                       execution_index=execution_index):
+        return stages_apply(stage_other_vars, _cast_state_like(stage_state, x), execution_index)
+
+      states.append(simpler_apply(stage_state))
+      forward_op, transpose_op = _build_on_demand_state_only_transition_operator(
+        stage_state, simpler_apply, checkpoint_policy=checkpoint_policy)
       stage_operators.append(
         ActiveExecutionStageOperator("passive", stage_spec.name, None, forward_op, transpose_op)
       )
@@ -763,7 +970,8 @@ def lqr_active_controllable_backward_hamiltonian_operators_lowmem(params, states
                                                                   layers_apply, layer_names, damping,
                                                                   other_model_variables=FrozenDict({}),
                                                                   layer_modules=None,
-                                                                  prepared_layer_metadata=None):
+                                                                  prepared_layer_metadata=None,
+                                                                  checkpoint_policy="none"):
   """Build on-demand active-path second-order operators with a control-only first layer."""
   if not layer_names:
     raise ValueError("lqr_active_controllable_backward_hamiltonian_operators_lowmem expects at least one layer")
@@ -788,8 +996,10 @@ def lqr_active_controllable_backward_hamiltonian_operators_lowmem(params, states
                       layer_other_vars=layer_other_vars, layer_state=layer_state, j=j):
       return layers_apply({'params': unravel_params_fn(parameters)} | layer_other_vars, _cast_state_like(layer_state, x), j)
 
-    def hamiltonian_joint(parameters, x, simpler_apply=simpler_apply, p_i=p_i):
-      return tree_vdot(simpler_apply(parameters, x), p_i)
+    checkpointed_apply = _maybe_checkpoint(simpler_apply, checkpoint_policy)
+
+    def hamiltonian_joint(parameters, x, checkpointed_apply=checkpointed_apply, p_i=p_i):
+      return tree_vdot(checkpointed_apply(parameters, x), p_i)
 
     layer_module = None if layer_modules is None else layer_modules[j]
     if _supports_piecewise_linear_active_fast_path(layer_module):
@@ -813,8 +1023,10 @@ def lqr_active_controllable_backward_hamiltonian_operators_lowmem(params, states
                           fixed_input_state=fixed_input_state):
     return layers_apply({'params': unravel_first_params_fn(parameters)} | first_layer_other_vars, fixed_input_state, 0)
 
-  def first_hamiltonian(parameters, first_simpler_apply=first_simpler_apply, p_i=p_i):
-    return tree_vdot(first_simpler_apply(parameters), p_i)
+  checkpointed_first_apply = _maybe_checkpoint(first_simpler_apply, checkpoint_policy)
+
+  def first_hamiltonian(parameters, checkpointed_first_apply=checkpointed_first_apply, p_i=p_i):
+    return tree_vdot(checkpointed_first_apply(parameters), p_i)
 
   first_layer_module = None if layer_modules is None else layer_modules[0]
   if _supports_piecewise_linear_active_fast_path(first_layer_module):
@@ -930,7 +1142,8 @@ def lqr_active_execution_backward_hamiltonian_operators_lowmem(params, states, f
                                                                stages_apply, execution_stage_specs, damping,
                                                                other_model_variables=FrozenDict({}),
                                                                layer_modules=None,
-                                                               prepared_stage_metadata=None):
+                                                               prepared_stage_metadata=None,
+                                                               checkpoint_policy="none"):
   """Build on-demand active-path second-order operators over explicit execution stages."""
   if not execution_stage_specs:
     raise ValueError("lqr_active_execution_backward_hamiltonian_operators_lowmem expects at least one stage")
@@ -960,8 +1173,10 @@ def lqr_active_execution_backward_hamiltonian_operators_lowmem(params, states, f
         def simpler_apply(x, stage_other_vars=stage_other_vars, stage_state=stage_state, execution_index=execution_index):
           return stages_apply(stage_other_vars, _cast_state_like(stage_state, x), execution_index)
 
-        def hamiltonian_x(x, simpler_apply=simpler_apply, p_i=p_i):
-          return tree_vdot(simpler_apply(x), p_i)
+        checkpointed_apply = _maybe_checkpoint(simpler_apply, checkpoint_policy)
+
+        def hamiltonian_x(x, checkpointed_apply=checkpointed_apply, p_i=p_i):
+          return tree_vdot(checkpointed_apply(x), p_i)
 
         k_i = _build_on_demand_state_only_hessian_operator(hamiltonian_x, layer_state_primal)
 
@@ -986,8 +1201,10 @@ def lqr_active_execution_backward_hamiltonian_operators_lowmem(params, states, f
                           execution_index=execution_index):
           return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars, fixed_input_state, execution_index)
 
-        def hamiltonian(parameters, simpler_apply=simpler_apply, p_i=p_i):
-          return tree_vdot(simpler_apply(parameters), p_i)
+        checkpointed_apply = _maybe_checkpoint(simpler_apply, checkpoint_policy)
+
+        def hamiltonian(parameters, checkpointed_apply=checkpointed_apply, p_i=p_i):
+          return tree_vdot(checkpointed_apply(parameters), p_i)
 
         k_i = _build_on_demand_control_only_hessian_operator(hamiltonian, layer_params, damping)
 
@@ -1004,8 +1221,10 @@ def lqr_active_execution_backward_hamiltonian_operators_lowmem(params, states, f
         return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
                             _cast_state_like(stage_state, x), execution_index)
 
-      def hamiltonian_joint(parameters, x, simpler_apply=simpler_apply, p_i=p_i):
-        return tree_vdot(simpler_apply(parameters, x), p_i)
+      checkpointed_apply = _maybe_checkpoint(simpler_apply, checkpoint_policy)
+
+      def hamiltonian_joint(parameters, x, checkpointed_apply=checkpointed_apply, p_i=p_i):
+        return tree_vdot(checkpointed_apply(parameters, x), p_i)
 
       k_i = _build_on_demand_joint_hessian_operator(
         hamiltonian_joint, layer_params, layer_state_primal, damping)

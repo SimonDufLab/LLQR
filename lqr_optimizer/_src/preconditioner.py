@@ -14,7 +14,9 @@ from lqr_optimizer._src.utils.utils import (normalize_gradient, timed_jit, pytre
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
                              lqr_active_controllable_forward_operators_and_states,
+                             lqr_active_controllable_forward_operators_and_states_lowmem,
                              lqr_active_execution_forward_operators_and_states,
+                             lqr_active_execution_forward_operators_and_states_lowmem,
                              lqr_final_costs_and_adjoints, lqr_active_final_costs_and_adjoints,
                              lqr_backward_matrices_and_adjoints,
                              lqr_backward_hamiltonian_operators,
@@ -53,7 +55,8 @@ BLOCK_STRUCTURE_DICT = {
 }
 
 
-VALID_LLQR_OPERATOR_MODES = ("cached_exact", "lowmem_exact_k")
+VALID_LLQR_OPERATOR_MODES = ("cached_exact", "lowmem_exact_k", "lowmem_exact_full")
+VALID_LLQR_CHECKPOINT_POLICIES = ("none", "dots_no_batch_dims")
 
 
 def _recover_loss_gradients_from_transition_transposes(params_or_layer_names, layer_names_or_transition_transposes,
@@ -443,6 +446,7 @@ class BasePreconditioner(abc.ABC):
                allow_grad_inversion: bool = False,
                divergence_args_index = -1,
                llqr_operator_mode: str = "cached_exact",
+               llqr_checkpoint_policy: str = "none",
                optax_solver_requires_value_and_grad: bool = False):
     self._divergence_function = divergence_function
     self._damping =damping
@@ -480,7 +484,12 @@ class BasePreconditioner(abc.ABC):
       raise ValueError(
         f"Unknown llqr_operator_mode '{llqr_operator_mode}'. Expected one of {VALID_LLQR_OPERATOR_MODES}."
       )
+    if llqr_checkpoint_policy not in VALID_LLQR_CHECKPOINT_POLICIES:
+      raise ValueError(
+        f"Unknown llqr_checkpoint_policy '{llqr_checkpoint_policy}'. Expected one of {VALID_LLQR_CHECKPOINT_POLICIES}."
+      )
     self._llqr_operator_mode = llqr_operator_mode
+    self._llqr_checkpoint_policy = llqr_checkpoint_policy
     if normalize_grad_for_lqr:
       self._normalize_grad_for_lqr_fn = normalize_gradient
     else:
@@ -509,6 +518,20 @@ class BasePreconditioner(abc.ABC):
 
   def _uses_lowmem_exact_k_mode(self):
     return self._llqr_operator_mode == "lowmem_exact_k"
+
+  def _uses_lowmem_exact_full_mode(self):
+    return self._llqr_operator_mode == "lowmem_exact_full"
+
+  def _uses_lowmem_active_k_mode(self):
+    return self._llqr_operator_mode in ("lowmem_exact_k", "lowmem_exact_full")
+
+  def _uses_lowmem_active_transition_mode(self):
+    return self._llqr_operator_mode == "lowmem_exact_full"
+
+  def _resolved_llqr_checkpoint_policy(self):
+    if not self._uses_lowmem_exact_full_mode():
+      return "none"
+    return self._llqr_checkpoint_policy
 
   def _write_back_updated_preconditioner(self, updated_blocks, ema_decay, *, snapshot_preconditioner):
     if snapshot_preconditioner:
@@ -547,7 +570,9 @@ class BasePreconditioner(abc.ABC):
       def get_operators_and_gradients(params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
         use_shared_active_metadata_runtime = self._should_use_shared_active_metadata_runtime()
-        use_lowmem_exact_k_mode = self._uses_lowmem_exact_k_mode()
+        use_lowmem_active_transition_mode = self._uses_lowmem_active_transition_mode()
+        use_lowmem_active_k_mode = self._uses_lowmem_active_k_mode()
+        resolved_checkpoint_policy = self._resolved_llqr_checkpoint_policy()
         if self._use_execution_stage_active_path:
           prepared_stage_metadata = prepare_active_execution_stage_metadata(
             params,
@@ -556,15 +581,30 @@ class BasePreconditioner(abc.ABC):
             param_unravel_fns=self._controlled_stage_unravel_fns,
             flat_param_sizes=self._controlled_stage_flat_param_sizes,
           ) if use_shared_active_metadata_runtime else None
-          execution_stage_operators, states = lqr_active_execution_forward_operators_and_states(
-            inputs, params, self._execution_stage_apply, self._execution_stage_specs, other_model_variables,
-            prepared_stage_metadata=prepared_stage_metadata,
-          )
+          if use_lowmem_active_transition_mode:
+            execution_stage_operators, states = lqr_active_execution_forward_operators_and_states_lowmem(
+              inputs, params, self._execution_stage_apply, self._execution_stage_specs, other_model_variables,
+              prepared_stage_metadata=prepared_stage_metadata,
+              checkpoint_policy=resolved_checkpoint_policy,
+            )
+          else:
+            execution_stage_operators, states = lqr_active_execution_forward_operators_and_states(
+              inputs, params, self._execution_stage_apply, self._execution_stage_specs, other_model_variables,
+              prepared_stage_metadata=prepared_stage_metadata,
+            )
         else:
-          first_transition, first_transition_transpose, transitions, transition_transposes, states = (
-            lqr_active_controllable_forward_operators_and_states(
-            inputs, params, self._layer_apply, self._layer_names, other_model_variables)
-          )
+          if use_lowmem_active_transition_mode:
+            first_transition, first_transition_transpose, transitions, transition_transposes, states = (
+              lqr_active_controllable_forward_operators_and_states_lowmem(
+                inputs, params, self._layer_apply, self._layer_names, other_model_variables,
+                checkpoint_policy=resolved_checkpoint_policy,
+              )
+            )
+          else:
+            first_transition, first_transition_transpose, transitions, transition_transposes, states = (
+              lqr_active_controllable_forward_operators_and_states(
+                inputs, params, self._layer_apply, self._layer_names, other_model_variables)
+            )
         if self._divergence_args_index is not None:
           div_arg = states[self._divergence_args_index]
         else:
@@ -573,11 +613,12 @@ class BasePreconditioner(abc.ABC):
           self._loss_fn, states[-1], targets, div_f=self._divergence_function, div_arg=div_arg
         )
         if self._use_execution_stage_active_path:
-          if use_lowmem_exact_k_mode:
+          if use_lowmem_active_k_mode:
             stage_k_operators = lqr_active_execution_backward_hamiltonian_operators_lowmem(
               params, states, final_p, execution_stage_operators, self._execution_stage_apply,
               self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules,
               prepared_stage_metadata=prepared_stage_metadata,
+              checkpoint_policy=resolved_checkpoint_policy,
             )
           else:
             stage_k_operators = lqr_active_execution_backward_hamiltonian_operators(
@@ -590,10 +631,11 @@ class BasePreconditioner(abc.ABC):
             self._controlled_stage_unravel_fns, freeze_result=isinstance(params, FrozenDict)
           )
         else:
-          if use_lowmem_exact_k_mode:
+          if use_lowmem_active_k_mode:
             first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators_lowmem(
               params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
-              self._damping, other_model_variables, layer_modules=self._layer_modules)
+              self._damping, other_model_variables, layer_modules=self._layer_modules,
+              checkpoint_policy=resolved_checkpoint_policy)
           else:
             first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators(
               params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,

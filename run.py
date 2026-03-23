@@ -236,12 +236,13 @@ def main(cfg: DictConfig):
     precond_on_update=cfg.precond_on_update,
     normalize_grad_for_lqr = cfg.normalize_grad_for_lqr,
     warm_start_precond = cfg.warm_start_precond,
-    damping=cfg.damping,
-    allow_grad_inversion=cfg.allow_grad_inversion,
-    divergence_args_index=-1,
-    llqr_operator_mode=cfg.llqr_operator_mode,
-    optax_solver_requires_value_and_grad=utl.precond_solver_requires_value_and_grad(cfg.precond_solver),
-  )
+      damping=cfg.damping,
+      allow_grad_inversion=cfg.allow_grad_inversion,
+      divergence_args_index=-1,
+      llqr_operator_mode=cfg.llqr_operator_mode,
+      llqr_checkpoint_policy=cfg.llqr_checkpoint_policy,
+      optax_solver_requires_value_and_grad=utl.precond_solver_requires_value_and_grad(cfg.precond_solver),
+    )
   if load_from_preexisting_model_state and precond_blocks is not None:
     preconditioner.load_blocks(precond_blocks)
     del precond_blocks
