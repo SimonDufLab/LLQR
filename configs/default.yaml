@@ -41,6 +41,7 @@ block_structure_init: identity
 batch_solve_precond: true
 llqr_operator_mode: cached_exact
 llqr_checkpoint_policy: none
+llqr_use_fast_paths: true
 warm_start_precond: true
 multibatch_training: false
 damping: 0.0

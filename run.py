@@ -241,6 +241,7 @@ def main(cfg: DictConfig):
       divergence_args_index=-1,
       llqr_operator_mode=cfg.llqr_operator_mode,
       llqr_checkpoint_policy=cfg.llqr_checkpoint_policy,
+      llqr_use_fast_paths=cfg.llqr_use_fast_paths,
       optax_solver_requires_value_and_grad=utl.precond_solver_requires_value_and_grad(cfg.precond_solver),
     )
   if load_from_preexisting_model_state and precond_blocks is not None:

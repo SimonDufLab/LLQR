@@ -236,6 +236,23 @@ def _build_on_demand_control_only_hessian_operator(hamiltonian, layer_params, da
   return k_i
 
 
+def _build_cached_mixed_only_hessian_operator(hamiltonian_joint, layer_params, layer_state_primal, damping):
+  grad_params_from_state = lambda x: jax.grad(hamiltonian_joint, argnums=0)(layer_params, x)
+  grad_state_from_params = lambda parameters: jax.grad(hamiltonian_joint, argnums=1)(parameters, layer_state_primal)
+
+  _, mixed_param_from_state = jax.linearize(grad_params_from_state, layer_state_primal)
+  _, mixed_state_from_params = jax.linearize(grad_state_from_params, layer_params)
+
+  def k_i(control_tangent, state_tangent,
+          mixed_param_from_state=mixed_param_from_state,
+          mixed_state_from_params=mixed_state_from_params,
+          damping=damping):
+    flat_control = jnp.ravel(control_tangent)
+    return mixed_param_from_state(state_tangent) + damping * flat_control, mixed_state_from_params(flat_control)
+
+  return k_i
+
+
 def _build_on_demand_joint_hessian_operator(hamiltonian_joint, layer_params, layer_state_primal, damping):
   joint_grad = jax.grad(hamiltonian_joint, argnums=(0, 1))
 
@@ -262,7 +279,7 @@ def _build_on_demand_state_only_hessian_operator(hamiltonian_x, layer_state_prim
   return k_i
 
 
-def _build_on_demand_piecewise_linear_mixed_operator(hamiltonian_joint, layer_params, layer_state_primal, damping):
+def _build_on_demand_mixed_only_hessian_operator(hamiltonian_joint, layer_params, layer_state_primal, damping):
   grad_params_from_state = lambda x: jax.grad(hamiltonian_joint, argnums=0)(layer_params, x)
   grad_state_from_params = lambda parameters: jax.grad(hamiltonian_joint, argnums=1)(parameters, layer_state_primal)
 
@@ -883,7 +900,8 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
                                                            layers_apply, layer_names, damping,
                                                            other_model_variables=FrozenDict({}),
                                                            layer_modules=None,
-                                                           prepared_layer_metadata=None):
+                                                           prepared_layer_metadata=None,
+                                                           use_fast_paths=True):
   """Build active-path second-order operators with a control-only first layer."""
   if not layer_names:
     raise ValueError("lqr_active_controllable_backward_hamiltonian_operators expects at least one layer")
@@ -912,20 +930,9 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
       return tree_vdot(simpler_apply(parameters, x), p_i)
 
     layer_module = None if layer_modules is None else layer_modules[j]
-    if _supports_piecewise_linear_active_fast_path(layer_module):
-      def grad_params_from_state(x):
-        return jax.grad(hamiltonian_joint, argnums=0)(layer_params, x)
-
-      def grad_state_from_params(parameters):
-        return jax.grad(hamiltonian_joint, argnums=1)(parameters, layer_state_primal)
-
-      _, mixed_param_from_state = jax.linearize(grad_params_from_state, layer_state_primal)
-      _, mixed_state_from_params = jax.linearize(grad_state_from_params, layer_params)
-
-      def k_i(control_tangent, state_tangent, mixed_param_from_state=mixed_param_from_state,
-              mixed_state_from_params=mixed_state_from_params, damping=damping):
-        flat_control = jnp.ravel(control_tangent)
-        return mixed_param_from_state(state_tangent) + damping * flat_control, mixed_state_from_params(flat_control)
+    if use_fast_paths and _supports_piecewise_linear_active_fast_path(layer_module):
+      k_i = _build_cached_mixed_only_hessian_operator(
+        hamiltonian_joint, layer_params, layer_state_primal, damping)
     else:
       _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
 
@@ -952,7 +959,7 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
     return tree_vdot(first_simpler_apply(parameters), p_i)
 
   first_layer_module = None if layer_modules is None else layer_modules[0]
-  if _supports_piecewise_linear_active_fast_path(first_layer_module):
+  if use_fast_paths and _supports_piecewise_linear_active_fast_path(first_layer_module):
     def first_k(control_tangent, damping=damping):
       flat_control = jnp.ravel(control_tangent)
       return damping * flat_control
@@ -971,7 +978,8 @@ def lqr_active_controllable_backward_hamiltonian_operators_lowmem(params, states
                                                                   other_model_variables=FrozenDict({}),
                                                                   layer_modules=None,
                                                                   prepared_layer_metadata=None,
-                                                                  checkpoint_policy="none"):
+                                                                  checkpoint_policy="none",
+                                                                  use_fast_paths=True):
   """Build on-demand active-path second-order operators with a control-only first layer."""
   if not layer_names:
     raise ValueError("lqr_active_controllable_backward_hamiltonian_operators_lowmem expects at least one layer")
@@ -1002,8 +1010,8 @@ def lqr_active_controllable_backward_hamiltonian_operators_lowmem(params, states
       return tree_vdot(checkpointed_apply(parameters, x), p_i)
 
     layer_module = None if layer_modules is None else layer_modules[j]
-    if _supports_piecewise_linear_active_fast_path(layer_module):
-      k_i = _build_on_demand_piecewise_linear_mixed_operator(
+    if use_fast_paths and _supports_piecewise_linear_active_fast_path(layer_module):
+      k_i = _build_on_demand_mixed_only_hessian_operator(
         hamiltonian_joint, layer_params, layer_state_primal, damping)
     else:
       k_i = _build_on_demand_joint_hessian_operator(
@@ -1029,7 +1037,7 @@ def lqr_active_controllable_backward_hamiltonian_operators_lowmem(params, states
     return tree_vdot(checkpointed_first_apply(parameters), p_i)
 
   first_layer_module = None if layer_modules is None else layer_modules[0]
-  if _supports_piecewise_linear_active_fast_path(first_layer_module):
+  if use_fast_paths and _supports_piecewise_linear_active_fast_path(first_layer_module):
     def first_k(control_tangent, damping=damping):
       flat_control = jnp.ravel(control_tangent)
       return damping * flat_control
@@ -1044,7 +1052,8 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
                                                         stages_apply, execution_stage_specs, damping,
                                                         other_model_variables=FrozenDict({}),
                                                         layer_modules=None,
-                                                        prepared_stage_metadata=None):
+                                                        prepared_stage_metadata=None,
+                                                        use_fast_paths=True):
   """Build active-path second-order operators over explicit execution stages."""
   if not execution_stage_specs:
     raise ValueError("lqr_active_execution_backward_hamiltonian_operators expects at least one stage")
@@ -1065,7 +1074,7 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
     stage_other_vars = stage_metadata.other_vars
 
     if stage_operator.kind == "passive":
-      if _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
+      if use_fast_paths and _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
         def k_i(state_tangent):
           return zero_tangent_tree_like(state_tangent)
       else:
@@ -1093,7 +1102,7 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
     if stage_operator.kind == "control_only":
       fixed_input_state = stage_state
 
-      if _stage_uses_linear_controlled_fast_path(stage_spec):
+      if use_fast_paths and _stage_uses_linear_controlled_fast_path(stage_spec):
         def k_i(control_tangent, damping=damping):
           flat_control = jnp.ravel(control_tangent)
           return damping * flat_control
@@ -1113,18 +1122,17 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
       k_rev.append(k_i)
       continue
 
-    if _stage_uses_linear_controlled_fast_path(stage_spec):
-      def k_i(control_tangent, state_tangent, damping=damping):
-        flat_control = jnp.ravel(control_tangent)
-        return damping * flat_control, zero_tangent_tree_like(state_tangent)
+    def simpler_apply(parameters, x):
+      return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
+                          _cast_state_like(stage_state, x), execution_index)
+
+    def hamiltonian_joint(parameters, x):
+      return tree_vdot(simpler_apply(parameters, x), p_i)
+
+    if use_fast_paths and _stage_uses_linear_controlled_fast_path(stage_spec):
+      k_i = _build_cached_mixed_only_hessian_operator(
+        hamiltonian_joint, layer_params, layer_state_primal, damping)
     else:
-      def simpler_apply(parameters, x):
-        return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
-                            _cast_state_like(stage_state, x), execution_index)
-
-      def hamiltonian_joint(parameters, x):
-        return tree_vdot(simpler_apply(parameters, x), p_i)
-
       _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
 
       def k_i(control_tangent, state_tangent, joint_hessian=joint_hessian, damping=damping):
@@ -1143,7 +1151,8 @@ def lqr_active_execution_backward_hamiltonian_operators_lowmem(params, states, f
                                                                other_model_variables=FrozenDict({}),
                                                                layer_modules=None,
                                                                prepared_stage_metadata=None,
-                                                               checkpoint_policy="none"):
+                                                               checkpoint_policy="none",
+                                                               use_fast_paths=True):
   """Build on-demand active-path second-order operators over explicit execution stages."""
   if not execution_stage_specs:
     raise ValueError("lqr_active_execution_backward_hamiltonian_operators_lowmem expects at least one stage")
@@ -1164,7 +1173,7 @@ def lqr_active_execution_backward_hamiltonian_operators_lowmem(params, states, f
     stage_other_vars = stage_metadata.other_vars
 
     if stage_operator.kind == "passive":
-      if _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
+      if use_fast_paths and _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
         def k_i(state_tangent):
           return zero_tangent_tree_like(state_tangent)
       else:
@@ -1191,7 +1200,7 @@ def lqr_active_execution_backward_hamiltonian_operators_lowmem(params, states, f
     if stage_operator.kind == "control_only":
       fixed_input_state = stage_state
 
-      if _stage_uses_linear_controlled_fast_path(stage_spec):
+      if use_fast_paths and _stage_uses_linear_controlled_fast_path(stage_spec):
         def k_i(control_tangent, damping=damping):
           flat_control = jnp.ravel(control_tangent)
           return damping * flat_control
@@ -1211,21 +1220,20 @@ def lqr_active_execution_backward_hamiltonian_operators_lowmem(params, states, f
       k_rev.append(k_i)
       continue
 
-    if _stage_uses_linear_controlled_fast_path(stage_spec):
-      def k_i(control_tangent, state_tangent, damping=damping):
-        flat_control = jnp.ravel(control_tangent)
-        return damping * flat_control, zero_tangent_tree_like(state_tangent)
+    def simpler_apply(parameters, x, unravel_params_fn=unravel_params_fn, stage_other_vars=stage_other_vars,
+                      stage_state=stage_state, execution_index=execution_index):
+      return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
+                          _cast_state_like(stage_state, x), execution_index)
+
+    checkpointed_apply = _maybe_checkpoint(simpler_apply, checkpoint_policy)
+
+    def hamiltonian_joint(parameters, x, checkpointed_apply=checkpointed_apply, p_i=p_i):
+      return tree_vdot(checkpointed_apply(parameters, x), p_i)
+
+    if use_fast_paths and _stage_uses_linear_controlled_fast_path(stage_spec):
+      k_i = _build_on_demand_mixed_only_hessian_operator(
+        hamiltonian_joint, layer_params, layer_state_primal, damping)
     else:
-      def simpler_apply(parameters, x, unravel_params_fn=unravel_params_fn, stage_other_vars=stage_other_vars,
-                        stage_state=stage_state, execution_index=execution_index):
-        return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
-                            _cast_state_like(stage_state, x), execution_index)
-
-      checkpointed_apply = _maybe_checkpoint(simpler_apply, checkpoint_policy)
-
-      def hamiltonian_joint(parameters, x, checkpointed_apply=checkpointed_apply, p_i=p_i):
-        return tree_vdot(checkpointed_apply(parameters, x), p_i)
-
       k_i = _build_on_demand_joint_hessian_operator(
         hamiltonian_joint, layer_params, layer_state_primal, damping)
 

@@ -447,6 +447,7 @@ class BasePreconditioner(abc.ABC):
                divergence_args_index = -1,
                llqr_operator_mode: str = "cached_exact",
                llqr_checkpoint_policy: str = "none",
+               llqr_use_fast_paths: bool = True,
                optax_solver_requires_value_and_grad: bool = False):
     self._divergence_function = divergence_function
     self._damping =damping
@@ -490,6 +491,7 @@ class BasePreconditioner(abc.ABC):
       )
     self._llqr_operator_mode = llqr_operator_mode
     self._llqr_checkpoint_policy = llqr_checkpoint_policy
+    self._llqr_use_fast_paths = bool(llqr_use_fast_paths)
     if normalize_grad_for_lqr:
       self._normalize_grad_for_lqr_fn = normalize_gradient
     else:
@@ -532,6 +534,9 @@ class BasePreconditioner(abc.ABC):
     if not self._uses_lowmem_exact_full_mode():
       return "none"
     return self._llqr_checkpoint_policy
+
+  def _uses_active_fast_paths(self):
+    return self._llqr_use_fast_paths
 
   def _write_back_updated_preconditioner(self, updated_blocks, ema_decay, *, snapshot_preconditioner):
     if snapshot_preconditioner:
@@ -619,12 +624,14 @@ class BasePreconditioner(abc.ABC):
               self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules,
               prepared_stage_metadata=prepared_stage_metadata,
               checkpoint_policy=resolved_checkpoint_policy,
+              use_fast_paths=self._uses_active_fast_paths(),
             )
           else:
             stage_k_operators = lqr_active_execution_backward_hamiltonian_operators(
               params, states, final_p, execution_stage_operators, self._execution_stage_apply,
               self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules,
               prepared_stage_metadata=prepared_stage_metadata,
+              use_fast_paths=self._uses_active_fast_paths(),
             )
           gradients = _recover_loss_gradients_from_execution_stage_transposes(
             self._layer_names, self._execution_stage_specs, execution_stage_operators, final_lin_cost,
@@ -635,11 +642,13 @@ class BasePreconditioner(abc.ABC):
             first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators_lowmem(
               params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
               self._damping, other_model_variables, layer_modules=self._layer_modules,
-              checkpoint_policy=resolved_checkpoint_policy)
+              checkpoint_policy=resolved_checkpoint_policy,
+              use_fast_paths=self._uses_active_fast_paths())
           else:
             first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators(
               params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
-              self._damping, other_model_variables, layer_modules=self._layer_modules)
+              self._damping, other_model_variables, layer_modules=self._layer_modules,
+              use_fast_paths=self._uses_active_fast_paths())
           gradients = _recover_loss_gradients_from_transition_transposes(
             self._layer_names, transition_transposes, final_lin_cost,
             self._controlled_stage_unravel_fns,
