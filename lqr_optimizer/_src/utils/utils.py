@@ -290,8 +290,10 @@ class EnhancedSequential(nn.Module):
 
   def maybe_migrate_legacy_checkpoint(self, loaded_params, loaded_batch_stats,
                                       init_params, init_batch_stats):
-    params_match = tuple(loaded_params.keys()) == tuple(init_params.keys())
-    batch_stats_match = tuple(loaded_batch_stats.keys()) == tuple(init_batch_stats.keys())
+    # Checkpoint round-trips can reorder top-level FrozenDict keys while preserving
+    # the actual split-stage schema. Treat key-set equality as a same-layout match.
+    params_match = set(loaded_params.keys()) == set(init_params.keys())
+    batch_stats_match = set(loaded_batch_stats.keys()) == set(init_batch_stats.keys())
     if params_match and batch_stats_match:
       return loaded_params, loaded_batch_stats, False
     if self.legacy_checkpoint_migrator is None:
