@@ -33,6 +33,7 @@ BLOCK_STRUCTURE_DICT = {
   'scalar': block_structures.ScalarBlock,
   'kfac': block_structures.KroneckerBlock,
   'e-kfac': block_structures.EKFACBlock,
+  'e-kfac-gpt': block_structures.GPTEKFACBlock,
   'sep-e-kfac': block_structures.SeparableEKFACBlock,
   'psd-e-kfac': block_structures.PSDEKFACBlock,
   'psd-sep-e-kfac': block_structures.PSDSeparableEKFACBlock,

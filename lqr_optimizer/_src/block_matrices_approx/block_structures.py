@@ -242,6 +242,8 @@ class ScalarBlock(BlockStructures):
 
 KERNEL_KEYS = ("kernel", "embedding", "pos_embedding")
 BIAS_KEYS = ("bias", "scale")
+GPT_TOK_EMBED_COMPONENT = ("tok_embed", "embedding")
+GPT_LM_HEAD_COMPONENT = ("lm_head", "kernel")
 class KroneckerBlock(BlockStructures):
   """
   A block structure that handles both kernel and bias parameters.
@@ -1301,6 +1303,160 @@ class EKFACBlock(KroneckerBlock):
         f"received {output_cotangent_flat.size}"
       )
     return layer_grads
+
+
+class GPTEKFACBlock(EKFACBlock):
+  """EKFAC variant that keeps GPT vocab-sized basis factors diagonal."""
+
+  @staticmethod
+  def _identity_diag_factor_init(dim: int) -> jnp.ndarray:
+    return jnp.ones((dim,), dtype=jnp.float32)
+
+  @staticmethod
+  def _identity_dense_factor_init(dim: int) -> jnp.ndarray:
+    return jnp.eye(dim, dtype=jnp.float32)
+
+  def _identity_inv_diag_init(self, m: int, n: int) -> jnp.ndarray:
+    return self._identity_scale * jnp.ones((m * n,), dtype=jnp.float32)
+
+  @staticmethod
+  def _is_tok_embed_component(component) -> bool:
+    return component == GPT_TOK_EMBED_COMPONENT
+
+  @staticmethod
+  def _is_lm_head_component(component) -> bool:
+    return component == GPT_LM_HEAD_COMPONENT
+
+  @staticmethod
+  def _apply_left_factor_transpose(q_a, x2d):
+    if q_a.ndim == 1:
+      return q_a[:, None] * x2d
+    return q_a.T @ x2d
+
+  @staticmethod
+  def _apply_right_factor(x2d, q_g):
+    if q_g.ndim == 1:
+      return x2d * q_g[None, :]
+    return x2d @ q_g
+
+  @staticmethod
+  def _apply_left_factor(q_a, x2d):
+    if q_a.ndim == 1:
+      return q_a[:, None] * x2d
+    return q_a @ x2d
+
+  @staticmethod
+  def _apply_right_factor_transpose(x2d, q_g):
+    if q_g.ndim == 1:
+      return x2d * q_g[None, :]
+    return x2d @ q_g.T
+
+  @classmethod
+  def _ekfac_apply_maybe_diag(cls, q_a, q_g, inv_diag, x2d):
+    x_hat = cls._apply_right_factor(cls._apply_left_factor_transpose(q_a, x2d), q_g)
+    x_hat_scaled = (inv_diag * x_hat.reshape(-1)).reshape(x2d.shape)
+    return cls._apply_right_factor_transpose(cls._apply_left_factor(q_a, x_hat_scaled), q_g)
+
+  @staticmethod
+  def _kernel_block_has_mixed_layout(block_component) -> bool:
+    return block_component[0].ndim == 1 or block_component[1].ndim == 1
+
+  def _make_blocks(self, network_params, layer_names, initialization=False):
+    blocks = {}
+    for layer_name in layer_names:
+      flat_params = flatten_dict(network_params[layer_name])
+      layer_blocks = {}
+
+      for key in flat_params.keys():
+        if any(k in key for k in KERNEL_KEYS):
+          kernel = flat_params[key]
+          if not hasattr(kernel, "shape"):
+            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
+
+          if len(kernel.shape) == 2:
+            m, n = kernel.shape
+          elif len(kernel.shape) == 4:
+            k_h, k_w, cin, cout = kernel.shape
+            m, n = k_h * k_w * cin, cout
+          else:
+            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+
+          if self._is_tok_embed_component(key):
+            layer_blocks[key] = (
+              self._identity_diag_factor_init(m),
+              self._identity_dense_factor_init(n),
+              self._identity_inv_diag_init(m, n),
+            )
+          elif self._is_lm_head_component(key):
+            layer_blocks[key] = (
+              self._identity_dense_factor_init(m),
+              self._identity_diag_factor_init(n),
+              self._identity_inv_diag_init(m, n),
+            )
+          else:
+            layer_blocks[key] = EKFACBlock.identity_block_init(self, (m, n))
+
+        if any(k in key for k in BIAS_KEYS):
+          bias = flat_params[key]
+          if not hasattr(bias, "shape"):
+            raise ValueError(f"Bias for layer {layer_name} does not have a shape attribute")
+          flat_bias, _ = ravel_pytree(bias)
+          layer_blocks[key] = self.identity_diag_init(flat_bias.shape[0])
+
+      blocks[layer_name] = layer_blocks
+    return blocks
+
+  def train_matrix_product(self, blocks, vectors):
+    product_dict = {}
+    for layer_name, layer_vectors in vectors.items():
+      layer_blocks = blocks[layer_name]
+      layer_product = {}
+
+      for component, vec_component in flatten_dict(layer_vectors).items():
+        if any(k in component for k in KERNEL_KEYS):
+          q_a, q_g, inv_diag = layer_blocks[component]
+          x2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          out2d = self._ekfac_apply_maybe_diag(q_a, q_g, inv_diag.astype(x2d.dtype), x2d)
+          layer_product[component] = out2d.reshape(orig_shape)
+        elif any(k in component for k in BIAS_KEYS):
+          diag = layer_blocks[component]
+          layer_product[component] = diag * vec_component
+        else:
+          raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+      product_dict[layer_name] = unflatten_dict(layer_product)
+    return product_dict
+
+  def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
+    layer_blocks = blocks[layer_name]
+    flat_parts = []
+    for component, vec_component in prepared_layer_vector.items():
+      if any(k in component for k in KERNEL_KEYS):
+        q_a, q_g, inv_diag = layer_blocks[component]
+        out2d = self._ekfac_apply_maybe_diag(q_a, q_g, inv_diag.astype(vec_component.dtype), vec_component)
+        flat_parts.append(jnp.ravel(out2d))
+      elif any(k in component for k in BIAS_KEYS):
+        diag = layer_blocks[component]
+        flat_parts.append(jnp.ravel(diag * vec_component))
+      else:
+        raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+    if len(flat_parts) == 1:
+      return flat_parts[0]
+    return jnp.concatenate(flat_parts)
+
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    layer_blocks = blocks[layer_name]
+    if any(
+      any(k in component for k in KERNEL_KEYS) and self._kernel_block_has_mixed_layout(block_component)
+      for component, block_component in layer_blocks.items()
+    ):
+      return self._preconditioner_param_pullback_flat_layer_generic(
+        blocks, layer_name, prepared_layer_vector, output_cotangent_flat
+      )
+    return super().preconditioner_param_pullback_flat_layer(
+      blocks, layer_name, prepared_layer_vector, output_cotangent_flat
+    )
 
 
 # --------------------------
