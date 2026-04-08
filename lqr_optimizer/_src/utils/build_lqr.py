@@ -8,6 +8,12 @@ from jax.tree_util import Partial
 from flax.core.frozen_dict import FrozenDict
 
 from lqr_optimizer._src.models.mlp import DenseRelu, InitDenseRelu
+from lqr_optimizer._src.utils.batch_experimental_operators import (
+  build_chunked_control_only_hessian_operator,
+  build_chunked_joint_param_output_operator,
+  build_chunked_joint_state_output_operator,
+  build_chunked_state_only_hessian_operator,
+)
 from lqr_optimizer._src.utils.divergence import ngd_divergence_f
 from lqr_optimizer._src.utils.utils import vjp_f, add_f, cross_entropy_loss, StageDescriptor
 
@@ -46,6 +52,36 @@ def _cast_state_like(reference_state, state):
     return state_leaf.astype(reference_leaf.dtype)
 
   return jax.tree_util.tree_map(cast_leaf, reference_state, state)
+
+
+def _supports_experimental_batch_axis(state_tree, output_cotangent, batch_axis):
+  """Return whether the current stage preserves the requested batch axis locally.
+
+  Wave 1 only chunk-slices stages whose input state and output cotangent both
+  expose the same batch axis. Stages that flatten or otherwise erase that axis
+  fall back to the exact monolithic builder.
+  """
+  state_leaves = jax.tree_util.tree_leaves(state_tree)
+  output_leaves = jax.tree_util.tree_leaves(output_cotangent)
+  if not state_leaves or not output_leaves:
+    return False
+
+  def leaf_batch_size(leaf):
+    if leaf.ndim <= batch_axis:
+      return None
+    return leaf.shape[batch_axis]
+
+  batch_size = leaf_batch_size(state_leaves[0])
+  if batch_size is None:
+    return False
+
+  for leaf in state_leaves[1:]:
+    if leaf_batch_size(leaf) != batch_size:
+      return False
+  for leaf in output_leaves:
+    if leaf_batch_size(leaf) != batch_size:
+      return False
+  return True
 
 
 def _build_joint_transition_operator(layer_params, layer_state, simpler_apply):
@@ -295,6 +331,29 @@ def _build_on_demand_mixed_only_hessian_operator(hamiltonian_joint, layer_params
     return k_u + damping * flat_control, k_x
 
   return k_i
+
+
+def _build_cached_state_output_hessian_operator(hamiltonian_joint, layer_params, layer_state_primal):
+  """Build only the state-output side of the joint Hessian operator."""
+  grad_state_from_params = lambda parameters: jax.grad(hamiltonian_joint, argnums=1)(parameters, layer_state_primal)
+
+  def hamiltonian_x(x):
+    return hamiltonian_joint(layer_params, x)
+
+  _, mixed_state_from_params = jax.linearize(grad_state_from_params, layer_params)
+  _, state_hessian = jax.linearize(jax.grad(hamiltonian_x), layer_state_primal)
+
+  def k_x(control_tangent, state_tangent,
+          mixed_state_from_params=mixed_state_from_params,
+          state_hessian=state_hessian):
+    flat_control = jnp.ravel(control_tangent)
+    return jax.tree_map(
+      jnp.add,
+      mixed_state_from_params(flat_control),
+      state_hessian(state_tangent),
+    )
+
+  return k_x
 
 
 def _stage_uses_linear_controlled_fast_path(stage_spec):
@@ -901,12 +960,17 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
                                                            other_model_variables=FrozenDict({}),
                                                            layer_modules=None,
                                                            prepared_layer_metadata=None,
-                                                           use_fast_paths=True):
+                                                           use_fast_paths=True,
+                                                           batch_experimental_mode="none",
+                                                           batch_chunk_size=None,
+                                                           batch_axis=None):
   """Build active-path second-order operators with a control-only first layer."""
   if not layer_names:
     raise ValueError("lqr_active_controllable_backward_hamiltonian_operators expects at least one layer")
   if layer_modules is not None and len(layer_modules) != len(layer_names):
     raise ValueError("layer_modules must align with layer_names in the active controllable K builder")
+  if batch_experimental_mode != "none" and batch_axis is None:
+    raise ValueError("Experimental batch operator mode requires an explicit batch_axis.")
   if prepared_layer_metadata is None:
     prepared_layer_metadata = prepare_active_controllable_layer_metadata(
       params, layer_names, other_model_variables
@@ -930,9 +994,35 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
       return tree_vdot(simpler_apply(parameters, x), p_i)
 
     layer_module = None if layer_modules is None else layer_modules[j]
+    can_use_experimental_batch_operator = (
+      batch_experimental_mode == "rm_param_only"
+      and _supports_experimental_batch_axis(layer_state, p_i, batch_axis)
+    )
     if use_fast_paths and _supports_piecewise_linear_active_fast_path(layer_module):
       k_i = _build_cached_mixed_only_hessian_operator(
         hamiltonian_joint, layer_params, layer_state_primal, damping)
+    elif can_use_experimental_batch_operator:
+      def apply_batched(parameters, x, unravel_params_fn=unravel_params_fn,
+                        layer_other_vars=layer_other_vars, layer_state=layer_state, j=j):
+        return layers_apply({'params': unravel_params_fn(parameters)} | layer_other_vars, _cast_state_like(layer_state, x), j)
+
+      chunked_k_u = build_chunked_joint_param_output_operator(
+        apply_batched,
+        layer_params,
+        layer_state,
+        p_i,
+        batch_axis=batch_axis,
+        batch_chunk_size=batch_chunk_size,
+        damping=damping,
+      )
+      state_side_k_x = _build_cached_state_output_hessian_operator(
+        hamiltonian_joint, layer_params, layer_state_primal
+      )
+
+      def k_i(control_tangent, state_tangent,
+              chunked_k_u=chunked_k_u,
+              state_side_k_x=state_side_k_x):
+        return chunked_k_u(control_tangent, state_tangent), state_side_k_x(control_tangent, state_tangent)
     else:
       _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
 
@@ -959,10 +1049,33 @@ def lqr_active_controllable_backward_hamiltonian_operators(params, states, final
     return tree_vdot(first_simpler_apply(parameters), p_i)
 
   first_layer_module = None if layer_modules is None else layer_modules[0]
+  can_use_experimental_first_operator = (
+    batch_experimental_mode == "rm_param_only"
+    and _supports_experimental_batch_axis(fixed_input_state, p_i, batch_axis)
+  )
   if use_fast_paths and _supports_piecewise_linear_active_fast_path(first_layer_module):
     def first_k(control_tangent, damping=damping):
       flat_control = jnp.ravel(control_tangent)
       return damping * flat_control
+  elif can_use_experimental_first_operator:
+    def first_apply_batched(parameters, x, unravel_first_params_fn=unravel_first_params_fn,
+                            first_layer_other_vars=first_layer_other_vars,
+                            fixed_input_state=fixed_input_state):
+      return layers_apply(
+        {'params': unravel_first_params_fn(parameters)} | first_layer_other_vars,
+        _cast_state_like(fixed_input_state, x),
+        0,
+      )
+
+    first_k = build_chunked_control_only_hessian_operator(
+      first_apply_batched,
+      first_layer_params,
+      fixed_input_state,
+      p_i,
+      batch_axis=batch_axis,
+      batch_chunk_size=batch_chunk_size,
+      damping=damping,
+    )
   else:
     _, first_r = jax.linearize(jax.grad(first_hamiltonian), first_layer_params)
 
@@ -1053,12 +1166,17 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
                                                         other_model_variables=FrozenDict({}),
                                                         layer_modules=None,
                                                         prepared_stage_metadata=None,
-                                                        use_fast_paths=True):
+                                                        use_fast_paths=True,
+                                                        batch_experimental_mode="none",
+                                                        batch_chunk_size=None,
+                                                        batch_axis=None):
   """Build active-path second-order operators over explicit execution stages."""
   if not execution_stage_specs:
     raise ValueError("lqr_active_execution_backward_hamiltonian_operators expects at least one stage")
   if layer_modules is not None and len(layer_modules) != len(execution_stage_specs):
     raise ValueError("layer_modules must align with execution_stage_specs in the active execution-stage K builder")
+  if batch_experimental_mode != "none" and batch_axis is None:
+    raise ValueError("Experimental batch operator mode requires an explicit batch_axis.")
   if prepared_stage_metadata is None:
     prepared_stage_metadata = prepare_active_execution_stage_metadata(
       params, execution_stage_specs, other_model_variables
@@ -1074,9 +1192,25 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
     stage_other_vars = stage_metadata.other_vars
 
     if stage_operator.kind == "passive":
+      can_use_experimental_batch_operator = (
+        batch_experimental_mode == "rm_param_only"
+        and _supports_experimental_batch_axis(stage_state, p_i, batch_axis)
+      )
       if use_fast_paths and _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
         def k_i(state_tangent):
           return zero_tangent_tree_like(state_tangent)
+      elif can_use_experimental_batch_operator:
+        def apply_batched(x, stage_other_vars=stage_other_vars, stage_state=stage_state,
+                          execution_index=execution_index):
+          return stages_apply(stage_other_vars, _cast_state_like(stage_state, x), execution_index)
+
+        k_i = build_chunked_state_only_hessian_operator(
+          apply_batched,
+          stage_state,
+          p_i,
+          batch_axis=batch_axis,
+          batch_chunk_size=batch_chunk_size,
+        )
       else:
         layer_state_primal = _state_primal_for_linearization(stage_state)
 
@@ -1101,11 +1235,34 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
 
     if stage_operator.kind == "control_only":
       fixed_input_state = stage_state
+      can_use_experimental_batch_operator = (
+        batch_experimental_mode == "rm_param_only"
+        and _supports_experimental_batch_axis(fixed_input_state, p_i, batch_axis)
+      )
 
       if use_fast_paths and _stage_uses_linear_controlled_fast_path(stage_spec):
         def k_i(control_tangent, damping=damping):
           flat_control = jnp.ravel(control_tangent)
           return damping * flat_control
+      elif can_use_experimental_batch_operator:
+        def apply_batched(parameters, x, unravel_params_fn=unravel_params_fn,
+                          stage_other_vars=stage_other_vars, fixed_input_state=fixed_input_state,
+                          execution_index=execution_index):
+          return stages_apply(
+            {'params': unravel_params_fn(parameters)} | stage_other_vars,
+            _cast_state_like(fixed_input_state, x),
+            execution_index,
+          )
+
+        k_i = build_chunked_control_only_hessian_operator(
+          apply_batched,
+          layer_params,
+          fixed_input_state,
+          p_i,
+          batch_axis=batch_axis,
+          batch_chunk_size=batch_chunk_size,
+          damping=damping,
+        )
       else:
         def simpler_apply(parameters):
           return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars, fixed_input_state, execution_index)
@@ -1129,9 +1286,41 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
     def hamiltonian_joint(parameters, x):
       return tree_vdot(simpler_apply(parameters, x), p_i)
 
+    can_use_experimental_batch_operator = (
+      batch_experimental_mode == "rm_param_only"
+      and _supports_experimental_batch_axis(stage_state, p_i, batch_axis)
+    )
     if use_fast_paths and _stage_uses_linear_controlled_fast_path(stage_spec):
       k_i = _build_cached_mixed_only_hessian_operator(
         hamiltonian_joint, layer_params, layer_state_primal, damping)
+    elif can_use_experimental_batch_operator:
+      def apply_batched(parameters, x, unravel_params_fn=unravel_params_fn, stage_other_vars=stage_other_vars,
+                        stage_state=stage_state, execution_index=execution_index):
+        return stages_apply({'params': unravel_params_fn(parameters)} | stage_other_vars,
+                            _cast_state_like(stage_state, x), execution_index)
+
+      chunked_k_u = build_chunked_joint_param_output_operator(
+        apply_batched,
+        layer_params,
+        stage_state,
+        p_i,
+        batch_axis=batch_axis,
+        batch_chunk_size=batch_chunk_size,
+        damping=damping,
+      )
+      state_side_k_x = build_chunked_joint_state_output_operator(
+        apply_batched,
+        layer_params,
+        stage_state,
+        p_i,
+        batch_axis=batch_axis,
+        batch_chunk_size=batch_chunk_size,
+      )
+
+      def k_i(control_tangent, state_tangent,
+              chunked_k_u=chunked_k_u,
+              state_side_k_x=state_side_k_x):
+        return chunked_k_u(control_tangent, state_tangent), state_side_k_x(control_tangent, state_tangent)
     else:
       _, joint_hessian = jax.linearize(jax.grad(hamiltonian_joint, argnums=(0, 1)), layer_params, layer_state_primal)
 

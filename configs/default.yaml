@@ -42,6 +42,8 @@ batch_solve_precond: true
 llqr_operator_mode: cached_exact
 llqr_checkpoint_policy: none
 llqr_use_fast_paths: true
+llqr_batch_experimental_mode: none
+llqr_batch_chunk_size: null
 warm_start_precond: true
 multibatch_training: false
 damping: 0.0

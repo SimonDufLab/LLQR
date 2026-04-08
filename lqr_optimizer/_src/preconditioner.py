@@ -1,6 +1,7 @@
 """Preconditioner classes and their update rules."""
 import abc
 from functools import partial
+import numbers
 
 import optax
 import jax
@@ -58,6 +59,177 @@ BLOCK_STRUCTURE_DICT = {
 
 VALID_LLQR_OPERATOR_MODES = ("cached_exact", "lowmem_exact_k", "lowmem_exact_full")
 VALID_LLQR_CHECKPOINT_POLICIES = ("none", "dots_no_batch_dims")
+VALID_LLQR_BATCH_EXPERIMENTAL_MODES = ("none", "rm_param_only")
+
+
+def _tree_add(lhs, rhs):
+  return jax.tree_map(jnp.add, lhs, rhs)
+
+
+def _tree_scalar_mul(tree, scalar):
+  return jax.tree_map(lambda leaf: leaf * scalar, tree)
+
+
+def _batch_size_from_datapoint(datapoint, batch_axis):
+  first_x = jax.tree_util.tree_leaves(datapoint)[0]
+  if not isinstance(first_x, jnp.ndarray):
+    first_x = jnp.asarray(first_x)
+  return int(first_x.shape[batch_axis])
+
+
+def _effective_loss_count(layout, batch_size):
+  if layout["mode"] == "text":
+    return int(layout["T"] * batch_size)
+  return int(batch_size)
+
+
+def _reshape_text_flat_targets(targets, layout, batch_size):
+  if layout["mode"] != "text" or layout["T"] is None:
+    raise ValueError("Text target reshaping requires a text layout with a known sequence length")
+  return jnp.asarray(targets).reshape(int(layout["T"]), int(batch_size))
+
+
+def _slice_batch_datapoint(datapoint, layout, start, size):
+  mode = layout["mode"]
+  batch_axis = layout["batch_axis"]
+  batch_size = _batch_size_from_datapoint(datapoint, batch_axis)
+  token_batch_size = None if layout["T"] is None else int(layout["T"] * batch_size)
+
+  def slice_leaf(x):
+    if not isinstance(x, jnp.ndarray):
+      x = jnp.asarray(x)
+
+    if mode == "cv":
+      if x.ndim >= 1 and x.shape[0] == batch_size:
+        return x[start:start + size]
+      return x
+
+    if x.ndim > batch_axis and x.shape[batch_axis] == batch_size:
+      idx = [slice(None)] * x.ndim
+      idx[batch_axis] = slice(start, start + size)
+      return x[tuple(idx)]
+
+    if x.ndim >= 1 and x.shape[0] == batch_size:
+      return x[start:start + size]
+
+    if token_batch_size is not None and x.ndim >= 1 and x.shape[0] == token_batch_size:
+      targets_time_batch = _reshape_text_flat_targets(x, layout, batch_size)
+      return jnp.ravel(targets_time_batch[:, start:start + size])
+
+    return x
+
+  return jax.tree_util.tree_map(slice_leaf, datapoint)
+
+
+def _concat_preconditioner_batches(batches, layout, precond_batch_size):
+  mode = layout["mode"]
+  batch_axis = layout["batch_axis"]
+
+  def concat_fn(*xs):
+    x0 = xs[0]
+    if not isinstance(x0, jnp.ndarray):
+      x0 = jnp.asarray(x0)
+
+    if mode == "cv":
+      if x0.ndim >= 1:
+        return jnp.concatenate(xs, axis=0)
+      return x0
+
+    if (
+      layout["T"] is not None
+      and x0.ndim == 1
+      and all(jnp.asarray(x).ndim == 1 and jnp.asarray(x).shape[0] % layout["T"] == 0 for x in xs)
+    ):
+      reshaped = [_reshape_text_flat_targets(x, layout, jnp.asarray(x).shape[0] // layout["T"]) for x in xs]
+      return jnp.ravel(jnp.concatenate(reshaped, axis=1))
+
+    if x0.ndim > batch_axis:
+      return jnp.concatenate(xs, axis=batch_axis)
+    if x0.ndim == 1:
+      return jnp.concatenate(xs, axis=0)
+    return x0
+
+  accumulated = jax.tree_util.tree_map(concat_fn, *batches)
+  return _slice_batch_datapoint(accumulated, layout, 0, precond_batch_size)
+
+
+def _take_full_preconditioner_datapoint(dataloader, precond_batch_size):
+  first_batch = next(dataloader)
+  layout = infer_batch_layout(first_batch)
+  batch_axis = layout["batch_axis"]
+
+  batches = [first_batch]
+  accumulated_size = _batch_size_from_datapoint(first_batch, batch_axis)
+  while accumulated_size < precond_batch_size:
+    batch = next(dataloader)
+    batches.append(batch)
+    accumulated_size += _batch_size_from_datapoint(batch, batch_axis)
+
+  return layout, _concat_preconditioner_batches(batches, layout, precond_batch_size)
+
+
+def _take_preconditioner_chunk_datapoints(dataloader, precond_batch_size, batch_chunk_size):
+  if batch_chunk_size is None:
+    raise ValueError("batch_chunk_size must be set for chunked preconditioner ingestion")
+
+  current_batch = next(dataloader)
+  layout = infer_batch_layout(current_batch)
+  batch_axis = layout["batch_axis"]
+  current_batch_size = _batch_size_from_datapoint(current_batch, batch_axis)
+  current_offset = 0
+  accumulated_size = 0
+  chunk_datapoints = []
+  chunk_weights = []
+
+  while accumulated_size < precond_batch_size:
+    available = current_batch_size - current_offset
+    remaining_total = precond_batch_size - accumulated_size
+    take_size = min(batch_chunk_size, available, remaining_total)
+    chunk_datapoints.append(_slice_batch_datapoint(current_batch, layout, current_offset, take_size))
+    chunk_weights.append(_effective_loss_count(layout, take_size))
+    accumulated_size += take_size
+    current_offset += take_size
+
+    if current_offset == current_batch_size and accumulated_size < precond_batch_size:
+      current_batch = next(dataloader)
+      current_batch_size = _batch_size_from_datapoint(current_batch, batch_axis)
+      current_offset = 0
+
+  return layout, chunk_datapoints, chunk_weights
+
+
+def _supports_chunked_execution_stage_update_layout(layout):
+  return layout["mode"] in ("cv", "text")
+
+
+def _normalize_execution_stage_update_datapoint(datapoint, layout):
+  if layout["mode"] != "text":
+    return layout, datapoint
+
+  inputs, targets = datapoint
+  inputs = jnp.asarray(inputs)
+  batch_size = int(inputs.shape[layout["batch_axis"]])
+  targets_time_batch = _reshape_text_flat_targets(targets, layout, batch_size)
+  normalized_inputs = jnp.swapaxes(inputs, 0, layout["batch_axis"])
+  normalized_targets = jnp.ravel(jnp.swapaxes(targets_time_batch, 0, 1))
+  normalized_layout = {
+    "mode": "cv",
+    "batch_axis": 0,
+    "T": layout["T"],
+  }
+  return normalized_layout, (normalized_inputs, normalized_targets)
+
+
+def _normalize_execution_stage_update_chunks(chunk_datapoints, layout):
+  normalized_layout = layout
+  normalized_datapoints = []
+  for chunk_datapoint in chunk_datapoints:
+    normalized_layout, normalized_datapoint = _normalize_execution_stage_update_datapoint(
+      chunk_datapoint,
+      layout,
+    )
+    normalized_datapoints.append(normalized_datapoint)
+  return normalized_layout, normalized_datapoints
 
 
 def _recover_loss_gradients_from_transition_transposes(params_or_layer_names, layer_names_or_transition_transposes,
@@ -449,6 +621,8 @@ class BasePreconditioner(abc.ABC):
                llqr_operator_mode: str = "cached_exact",
                llqr_checkpoint_policy: str = "none",
                llqr_use_fast_paths: bool = True,
+               llqr_batch_experimental_mode: str = "none",
+               llqr_batch_chunk_size = None,
                optax_solver_requires_value_and_grad: bool = False):
     self._divergence_function = divergence_function
     self._damping =damping
@@ -490,9 +664,32 @@ class BasePreconditioner(abc.ABC):
       raise ValueError(
         f"Unknown llqr_checkpoint_policy '{llqr_checkpoint_policy}'. Expected one of {VALID_LLQR_CHECKPOINT_POLICIES}."
       )
+    if llqr_batch_experimental_mode not in VALID_LLQR_BATCH_EXPERIMENTAL_MODES:
+      raise ValueError(
+        "Unknown llqr_batch_experimental_mode "
+        f"'{llqr_batch_experimental_mode}'. Expected one of {VALID_LLQR_BATCH_EXPERIMENTAL_MODES}."
+      )
+    if llqr_batch_experimental_mode == "none":
+      if llqr_batch_chunk_size is not None:
+        raise ValueError("llqr_batch_chunk_size must be null when llqr_batch_experimental_mode='none'.")
+    else:
+      if not batch_solve_precond:
+        raise ValueError("llqr_batch_experimental_mode='rm_param_only' requires batch_solve_precond=True.")
+      if llqr_operator_mode != "cached_exact":
+        raise ValueError("llqr_batch_experimental_mode='rm_param_only' requires llqr_operator_mode='cached_exact'.")
+      if not isinstance(llqr_batch_chunk_size, numbers.Integral) or bool(llqr_batch_chunk_size) is False:
+        raise ValueError(
+          "llqr_batch_chunk_size must be a positive integer when llqr_batch_experimental_mode='rm_param_only'."
+        )
+      if int(llqr_batch_chunk_size) <= 0:
+        raise ValueError(
+          "llqr_batch_chunk_size must be a positive integer when llqr_batch_experimental_mode='rm_param_only'."
+        )
     self._llqr_operator_mode = llqr_operator_mode
     self._llqr_checkpoint_policy = llqr_checkpoint_policy
     self._llqr_use_fast_paths = bool(llqr_use_fast_paths)
+    self._llqr_batch_experimental_mode = llqr_batch_experimental_mode
+    self._llqr_batch_chunk_size = None if llqr_batch_chunk_size is None else int(llqr_batch_chunk_size)
     if normalize_grad_for_lqr:
       self._normalize_grad_for_lqr_fn = normalize_gradient
     else:
@@ -502,6 +699,15 @@ class BasePreconditioner(abc.ABC):
                                                             batch_solve_precond=self._batch_solve_precond,
                                                             multibatch=self._multibatch,
                                                             precond_on_update=self._precond_on_update)
+    self._experimental_execution_chunk_loss_gradients_fn = None
+    self._experimental_execution_chunk_grad_only_fn = None
+    self._experimental_execution_chunk_value_and_grad_fn = None
+    if self._uses_batch_experimental_execution_stage_update_path():
+      (self._experimental_execution_chunk_loss_gradients_fn,
+       self._experimental_execution_chunk_grad_only_fn,
+       self._experimental_execution_chunk_value_and_grad_fn) = self._get_execution_stage_chunked_update_helpers(
+         precond_on_update=self._precond_on_update
+       )
     # self._jit_apply_fn = jax.jit(
     #   lambda blocks, update: self._block_structure.matrix_product(blocks, update)
     # )
@@ -538,6 +744,23 @@ class BasePreconditioner(abc.ABC):
 
   def _uses_active_fast_paths(self):
     return self._llqr_use_fast_paths
+
+  def _uses_batch_experimental_rm_param_only_mode(self):
+    return self._llqr_batch_experimental_mode == "rm_param_only"
+
+  def _resolved_batch_experimental_mode(self):
+    return self._llqr_batch_experimental_mode
+
+  def _resolved_batch_chunk_size(self):
+    return self._llqr_batch_chunk_size
+
+  def _uses_batch_experimental_execution_stage_update_path(self):
+    return (
+      self._uses_batch_experimental_rm_param_only_mode()
+      and self._use_execution_stage_active_path
+      and self._batch_solve_precond
+      and not self._multibatch
+    )
 
   def _write_back_updated_preconditioner(self, updated_blocks, ema_decay, *, snapshot_preconditioner):
     if snapshot_preconditioner:
@@ -579,6 +802,9 @@ class BasePreconditioner(abc.ABC):
         use_lowmem_active_transition_mode = self._uses_lowmem_active_transition_mode()
         use_lowmem_active_k_mode = self._uses_lowmem_active_k_mode()
         resolved_checkpoint_policy = self._resolved_llqr_checkpoint_policy()
+        batch_axis = None
+        if self._uses_batch_experimental_rm_param_only_mode():
+          batch_axis = infer_batch_layout(datapoint)["batch_axis"]
         if self._use_execution_stage_active_path:
           prepared_stage_metadata = prepare_active_execution_stage_metadata(
             params,
@@ -633,6 +859,9 @@ class BasePreconditioner(abc.ABC):
               self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules,
               prepared_stage_metadata=prepared_stage_metadata,
               use_fast_paths=self._uses_active_fast_paths(),
+              batch_experimental_mode=self._resolved_batch_experimental_mode(),
+              batch_chunk_size=self._resolved_batch_chunk_size(),
+              batch_axis=batch_axis,
             )
           gradients = _recover_loss_gradients_from_execution_stage_transposes(
             self._layer_names, self._execution_stage_specs, execution_stage_operators, final_lin_cost,
@@ -649,7 +878,10 @@ class BasePreconditioner(abc.ABC):
             first_k_backward, k_backward = lqr_active_controllable_backward_hamiltonian_operators(
               params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
               self._damping, other_model_variables, layer_modules=self._layer_modules,
-              use_fast_paths=self._uses_active_fast_paths())
+              use_fast_paths=self._uses_active_fast_paths(),
+              batch_experimental_mode=self._resolved_batch_experimental_mode(),
+              batch_chunk_size=self._resolved_batch_chunk_size(),
+              batch_axis=batch_axis)
           gradients = _recover_loss_gradients_from_transition_transposes(
             self._layer_names, transition_transposes, final_lin_cost,
             self._controlled_stage_unravel_fns,
@@ -892,6 +1124,269 @@ class BasePreconditioner(abc.ABC):
 
       return get_update
 
+  def _get_execution_stage_chunked_update_helpers(self, *, precond_on_update=False):
+    def _sanitize_preconditioner_grads(grads):
+      return jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=1.0, neginf=-1.0), grads)
+
+    def build_execution_stage_problem(params, other_model_variables, datapoint, trainstate_opt_state,
+                                      loss_scale, batch_axis, *,
+                                      include_stage_k):
+      inputs, targets = datapoint
+      prepared_stage_metadata = prepare_active_execution_stage_metadata(
+        params,
+        self._execution_stage_specs,
+        other_model_variables,
+        param_unravel_fns=self._controlled_stage_unravel_fns,
+        flat_param_sizes=self._controlled_stage_flat_param_sizes,
+      ) if self._should_use_shared_active_metadata_runtime() else None
+      execution_stage_operators, states = lqr_active_execution_forward_operators_and_states(
+        inputs,
+        params,
+        self._execution_stage_apply,
+        self._execution_stage_specs,
+        other_model_variables,
+        prepared_stage_metadata=prepared_stage_metadata,
+      )
+      if self._divergence_args_index is not None:
+        div_arg = states[self._divergence_args_index]
+      else:
+        div_arg = None
+      scaled_loss_fn = lambda logits, labels: loss_scale * self._loss_fn(logits, labels)
+      final_q, final_p, final_lin_cost = lqr_active_final_costs_and_adjoints(
+        scaled_loss_fn,
+        states[-1],
+        targets,
+        div_f=self._divergence_function,
+        div_arg=div_arg,
+      )
+
+      stage_k_operators = None
+      if include_stage_k:
+        stage_k_operators = lqr_active_execution_backward_hamiltonian_operators(
+          params,
+          states,
+          final_p,
+          execution_stage_operators,
+          self._execution_stage_apply,
+          self._execution_stage_specs,
+          self._damping,
+          other_model_variables,
+          layer_modules=self._layer_modules,
+          prepared_stage_metadata=prepared_stage_metadata,
+          use_fast_paths=self._uses_active_fast_paths(),
+          batch_experimental_mode=self._resolved_batch_experimental_mode(),
+          batch_chunk_size=self._resolved_batch_chunk_size(),
+          batch_axis=batch_axis,
+        )
+
+      gradients = _recover_loss_gradients_from_execution_stage_transposes(
+        self._layer_names,
+        self._execution_stage_specs,
+        execution_stage_operators,
+        final_lin_cost,
+        self._controlled_stage_unravel_fns,
+        freeze_result=isinstance(params, FrozenDict),
+      )
+      if precond_on_update:
+        gradients, _ = self._trainstate_solver.update(gradients, trainstate_opt_state, params)
+      gradients = self._normalize_grad_for_lqr_fn(gradients)
+      gradients = jax.tree_map(lambda v: -1.0 * v, gradients)
+
+      operators = None
+      if include_stage_k:
+        operators = (execution_stage_operators, stage_k_operators, final_q, final_lin_cost)
+      return gradients, operators
+
+    @Partial(jax.jit, static_argnums=(5,))
+    def get_chunk_loss_gradients(params, other_model_variables, datapoint, trainstate_opt_state,
+                                 loss_scale, batch_axis):
+      gradients, _ = build_execution_stage_problem(
+        params,
+        other_model_variables,
+        datapoint,
+        trainstate_opt_state,
+        loss_scale,
+        batch_axis,
+        include_stage_k=False,
+      )
+      return gradients
+
+    @Partial(jax.jit, static_argnums=(7,))
+    def get_chunk_grad_only(preconditioner, params, other_model_variables, datapoint,
+                            trainstate_opt_state, prepared_gradients, loss_scale, batch_axis):
+      _, operators = build_execution_stage_problem(
+        params,
+        other_model_variables,
+        datapoint,
+        trainstate_opt_state,
+        loss_scale,
+        batch_axis,
+        include_stage_k=True,
+      )
+      grads = _recover_preconditioner_gradients_from_active_execution_control_adjoint(
+        self._block_structure,
+        preconditioner,
+        self._layer_names,
+        self._execution_stage_specs,
+        prepared_gradients,
+        operators,
+      )
+      return _sanitize_preconditioner_grads(grads)
+
+    @Partial(jax.jit, static_argnums=(7,))
+    def get_chunk_value_and_grad(preconditioner, params, other_model_variables, datapoint,
+                                 trainstate_opt_state, prepared_gradients, loss_scale, batch_axis):
+      _, operators = build_execution_stage_problem(
+        params,
+        other_model_variables,
+        datapoint,
+        trainstate_opt_state,
+        loss_scale,
+        batch_axis,
+        include_stage_k=True,
+      )
+      value, grads = _active_execution_preconditioner_value_and_grad_from_control_adjoint(
+        self._block_structure,
+        preconditioner,
+        self._layer_names,
+        self._execution_stage_specs,
+        prepared_gradients,
+        operators,
+      )
+      return value, _sanitize_preconditioner_grads(grads)
+
+    return get_chunk_loss_gradients, get_chunk_grad_only, get_chunk_value_and_grad
+
+  def _accumulate_execution_stage_chunked_prepared_gradients(self, params, other_model_variables,
+                                                             chunk_datapoints, chunk_weights, batch_axis,
+                                                             trainstate_opt_state):
+    total_weight = float(sum(chunk_weights))
+    if total_weight <= 0:
+      raise ValueError("Expected a positive effective loss count for chunked execution-stage updates")
+
+    accumulated_gradients = None
+    for chunk_datapoint, chunk_weight in zip(chunk_datapoints, chunk_weights):
+      gradients = self._experimental_execution_chunk_loss_gradients_fn(
+        params,
+        other_model_variables,
+        chunk_datapoint,
+        trainstate_opt_state,
+        float(chunk_weight) / total_weight,
+        batch_axis,
+      )
+      if accumulated_gradients is None:
+        accumulated_gradients = gradients
+      else:
+        accumulated_gradients = _tree_add(accumulated_gradients, gradients)
+
+    return self._block_structure.prepare_train_vectors(accumulated_gradients)
+
+  def _experimental_execution_stage_grad_only(self, preconditioner, params, other_model_variables,
+                                              chunk_datapoints, chunk_weights, batch_axis, trainstate_opt_state,
+                                              prepared_gradients):
+    total_weight = float(sum(chunk_weights))
+    accumulated_grads = None
+    for chunk_datapoint, chunk_weight in zip(chunk_datapoints, chunk_weights):
+      grads = self._experimental_execution_chunk_grad_only_fn(
+        preconditioner,
+        params,
+        other_model_variables,
+        chunk_datapoint,
+        trainstate_opt_state,
+        prepared_gradients,
+        float(chunk_weight) / total_weight,
+        batch_axis,
+      )
+      if accumulated_grads is None:
+        accumulated_grads = grads
+      else:
+        accumulated_grads = _tree_add(accumulated_grads, grads)
+    return accumulated_grads
+
+  def _experimental_execution_stage_value_and_grad(self, preconditioner, params, other_model_variables,
+                                                   chunk_datapoints, chunk_weights, batch_axis, trainstate_opt_state,
+                                                   prepared_gradients):
+    total_weight = float(sum(chunk_weights))
+    accumulated_value = 0.0
+    accumulated_grads = None
+    for chunk_datapoint, chunk_weight in zip(chunk_datapoints, chunk_weights):
+      value, grads = self._experimental_execution_chunk_value_and_grad_fn(
+        preconditioner,
+        params,
+        other_model_variables,
+        chunk_datapoint,
+        trainstate_opt_state,
+        prepared_gradients,
+        float(chunk_weight) / total_weight,
+        batch_axis,
+      )
+      accumulated_value += value
+      if accumulated_grads is None:
+        accumulated_grads = grads
+      else:
+        accumulated_grads = _tree_add(accumulated_grads, grads)
+    return accumulated_value, accumulated_grads
+
+  def _run_chunked_execution_stage_update(self, preconditioner, params, precond_lr, other_model_variables,
+                                          chunk_datapoints, chunk_weights, batch_axis, trainstate_opt_state, *,
+                                          snapshot_preconditioner):
+    if snapshot_preconditioner:
+      current_preconditioner = _deep_copy_pytree(preconditioner)
+    else:
+      current_preconditioner = preconditioner
+
+    prepared_gradients = self._accumulate_execution_stage_chunked_prepared_gradients(
+      params,
+      other_model_variables,
+      chunk_datapoints,
+      chunk_weights,
+      batch_axis,
+      trainstate_opt_state,
+    )
+    opt_state = self._optax_solver.init(current_preconditioner)
+
+    for _ in range(self._preconditioner_update_steps):
+      if self._optax_solver_requires_value_and_grad:
+        def chunked_value_and_grad_fn(local_preconditioner):
+          return self._experimental_execution_stage_value_and_grad(
+            local_preconditioner,
+            params,
+            other_model_variables,
+            chunk_datapoints,
+            chunk_weights,
+            batch_axis,
+            trainstate_opt_state,
+            prepared_gradients,
+          )
+
+        _, preconditioner_grad = chunked_value_and_grad_fn(current_preconditioner)
+        updates, opt_state = self._optax_solver.update(
+          preconditioner_grad,
+          opt_state,
+          current_preconditioner,
+          value_and_grad_fn=chunked_value_and_grad_fn,
+        )
+      else:
+        preconditioner_grad = self._experimental_execution_stage_grad_only(
+          current_preconditioner,
+          params,
+          other_model_variables,
+          chunk_datapoints,
+          chunk_weights,
+          batch_axis,
+          trainstate_opt_state,
+          prepared_gradients,
+        )
+        updates, opt_state = self._optax_solver.update(
+          preconditioner_grad,
+          opt_state,
+          current_preconditioner,
+        )
+      updates = jax.tree_map(lambda g: g * precond_lr, updates)
+      current_preconditioner = optax.apply_updates(current_preconditioner, updates)
+
+    return jax.tree_map(jnp.nan_to_num, current_preconditioner)
+
   def update_preconditioner(self, params, dataloader, precond_lr, opt_state, precond_batch_size, ema_decay=0, other_model_variables=FrozenDict({})):
     """params is the current weights of the NN"""
     if self._multibatch:
@@ -899,100 +1394,57 @@ class BasePreconditioner(abc.ABC):
         self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
                                        opt_state), ema_decay)
     else:
-      # Accumulate batches until we reach (or exceed) the requested preconditioner batch size
-      # First batch to infer layout
-      b0 = next(dataloader)
-      layout = infer_batch_layout(b0)
-      mode = layout["mode"]
-      batch_axis = layout["batch_axis"]
-      T = layout["T"]  # only used in text mode
-
-      # Now start accumulation with the first batch already taken
-      batches = [b0]
-      # "Batch size" = size along batch_axis of x
-      first_x = jax.tree_util.tree_leaves(b0)[0]
-      if not isinstance(first_x, jnp.ndarray):
-        first_x = jnp.asarray(first_x)
-      current_B = first_x.shape[batch_axis]
-      acc_size = int(current_B)
-
-      while acc_size < precond_batch_size:
-        b = next(dataloader)
-        x_leaf = jax.tree_util.tree_leaves(b)[0]
-        if not isinstance(x_leaf, jnp.ndarray):
-          x_leaf = jnp.asarray(x_leaf)
-        B = x_leaf.shape[batch_axis]
-        batches.append(b)
-        acc_size += int(B)
-
-      # Concatenate according to layout
-      def concat_fn(*xs):
-        x0 = xs[0]
-        if not isinstance(x0, jnp.ndarray):
-          x0 = jnp.asarray(x0)
-
-        if mode == "cv":
-          # CV: batch axis always 0 for all arrays
-          if x0.ndim >= 1:
-            return jnp.concatenate(xs, axis=0)
-          else:
-            return x0
-
-        else:  # mode == "text"
-          # For text:
-          # - inputs: [T, B] -> concat along axis=1 (batch axis)
-          # - targets: [T*B] -> concat along axis=0
-          if x0.ndim >= 2:
-            # assume it's something like [T, B, ...] and batch_axis is 1
-            return jnp.concatenate(xs, axis=batch_axis)
-          elif x0.ndim == 1:
-            # flattened targets
-            return jnp.concatenate(xs, axis=0)
-          else:
-            return x0
-
-      acc_batches = jax.tree_util.tree_map(concat_fn, *batches)
-
-      # Clip to exactly precond_batch_size along batch dimension
-      def clip_fn(x):
-        if not isinstance(x, jnp.ndarray):
-          x = jnp.asarray(x)
-
-        if mode == "cv":
-          # x: [B, ...] or [B]
-          if x.ndim >= 1:
-            return x[:precond_batch_size]
-          else:
-            return x
-
-        else:  # mode == "text"
-          if x.ndim >= 2:
-            # inputs: [T, B_total] -> [T, precond_batch_size]
-            # batch_axis is 1 here
-            idx = [slice(None)] * x.ndim
-            idx[batch_axis] = slice(0, precond_batch_size)
-            return x[tuple(idx)]
-          elif x.ndim == 1 and T is not None:
-            # targets: [T*B_total] -> [T * precond_batch_size]
-            return x[: T * precond_batch_size]
-          else:
-            return x
-
-      acc_batches = jax.tree_util.tree_map(clip_fn, acc_batches)
       if self._warm_start_precond and not hasattr(self._block_structure, "_memory"):
         _blocks = self._block_structure.blocks
       else:
         _blocks = self._block_structure.reinit_blocks()
       should_snapshot = self._should_snapshot_preconditioner_for_update(ema_decay)
-      updated_blocks = self._update_preconditioner_fn(
-        _blocks,
-        params,
-        precond_lr,
-        other_model_variables,
-        acc_batches,
-        opt_state,
-        snapshot_preconditioner=should_snapshot,
-      )
+      if self._uses_batch_experimental_execution_stage_update_path():
+        layout, chunk_datapoints, chunk_weights = _take_preconditioner_chunk_datapoints(
+          dataloader,
+          precond_batch_size,
+          self._resolved_batch_chunk_size(),
+        )
+        if _supports_chunked_execution_stage_update_layout(layout):
+          normalized_layout, normalized_chunk_datapoints = _normalize_execution_stage_update_chunks(
+            chunk_datapoints,
+            layout,
+          )
+          updated_blocks = self._run_chunked_execution_stage_update(
+            _blocks,
+            params,
+            precond_lr,
+            other_model_variables,
+            normalized_chunk_datapoints,
+            chunk_weights,
+            normalized_layout["batch_axis"],
+            opt_state,
+            snapshot_preconditioner=should_snapshot,
+          )
+        else:
+          acc_batches = _concat_preconditioner_batches(chunk_datapoints, layout, precond_batch_size)
+          updated_blocks = self._update_preconditioner_fn(
+            _blocks,
+            params,
+            precond_lr,
+            other_model_variables,
+            acc_batches,
+            opt_state,
+            snapshot_preconditioner=should_snapshot,
+          )
+      else:
+        layout, acc_batches = _take_full_preconditioner_datapoint(dataloader, precond_batch_size)
+        if self._use_execution_stage_active_path:
+          _, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
+        updated_blocks = self._update_preconditioner_fn(
+          _blocks,
+          params,
+          precond_lr,
+          other_model_variables,
+          acc_batches,
+          opt_state,
+          snapshot_preconditioner=should_snapshot,
+        )
       if should_snapshot:
         self._write_back_updated_preconditioner(
           updated_blocks, ema_decay, snapshot_preconditioner=True
@@ -1015,87 +1467,37 @@ class BasePreconditioner(abc.ABC):
         blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
                                        opt_state)
     else:
-      # Accumulate batches until we reach (or exceed) the requested preconditioner batch size
-      # First batch to infer layout
-      b0 = next(dataloader)
-      layout = infer_batch_layout(b0)
-      mode = layout["mode"]
-      batch_axis = layout["batch_axis"]
-      T = layout["T"]  # only used in text mode
-
-      # Now start accumulation with the first batch already taken
-      batches = [b0]
-      # "Batch size" = size along batch_axis of x
-      first_x = jax.tree_util.tree_leaves(b0)[0]
-      if not isinstance(first_x, jnp.ndarray):
-        first_x = jnp.asarray(first_x)
-      current_B = first_x.shape[batch_axis]
-      acc_size = int(current_B)
-
-      while acc_size < precond_batch_size:
-        b = next(dataloader)
-        x_leaf = jax.tree_util.tree_leaves(b)[0]
-        if not isinstance(x_leaf, jnp.ndarray):
-          x_leaf = jnp.asarray(x_leaf)
-        B = x_leaf.shape[batch_axis]
-        batches.append(b)
-        acc_size += int(B)
-
-      # Concatenate according to layout
-      def concat_fn(*xs):
-        x0 = xs[0]
-        if not isinstance(x0, jnp.ndarray):
-          x0 = jnp.asarray(x0)
-
-        if mode == "cv":
-          # CV: batch axis always 0 for all arrays
-          if x0.ndim >= 1:
-            return jnp.concatenate(xs, axis=0)
-          else:
-            return x0
-
-        else:  # mode == "text"
-          # For text:
-          # - inputs: [T, B] -> concat along axis=1 (batch axis)
-          # - targets: [T*B] -> concat along axis=0
-          if x0.ndim >= 2:
-            # assume it's something like [T, B, ...] and batch_axis is 1
-            return jnp.concatenate(xs, axis=batch_axis)
-          elif x0.ndim == 1:
-            # flattened targets
-            return jnp.concatenate(xs, axis=0)
-          else:
-            return x0
-
-      acc_batches = jax.tree_util.tree_map(concat_fn, *batches)
-
-      # Clip to exactly precond_batch_size along batch dimension
-      def clip_fn(x):
-        if not isinstance(x, jnp.ndarray):
-          x = jnp.asarray(x)
-
-        if mode == "cv":
-          # x: [B, ...] or [B]
-          if x.ndim >= 1:
-            return x[:precond_batch_size]
-          else:
-            return x
-
-        else:  # mode == "text"
-          if x.ndim >= 2:
-            # inputs: [T, B_total] -> [T, precond_batch_size]
-            # batch_axis is 1 here
-            idx = [slice(None)] * x.ndim
-            idx[batch_axis] = slice(0, precond_batch_size)
-            return x[tuple(idx)]
-          elif x.ndim == 1 and T is not None:
-            # targets: [T*B_total] -> [T * precond_batch_size]
-            return x[: T * precond_batch_size]
-          else:
-            return x
-
-      acc_batches = jax.tree_util.tree_map(clip_fn, acc_batches)
-      blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
+      if self._uses_batch_experimental_execution_stage_update_path():
+        layout, chunk_datapoints, chunk_weights = _take_preconditioner_chunk_datapoints(
+          dataloader,
+          precond_batch_size,
+          self._resolved_batch_chunk_size(),
+        )
+        if _supports_chunked_execution_stage_update_layout(layout):
+          normalized_layout, normalized_chunk_datapoints = _normalize_execution_stage_update_chunks(
+            chunk_datapoints,
+            layout,
+          )
+          blocks = self._run_chunked_execution_stage_update(
+            self._block_structure.blocks,
+            params,
+            precond_lr,
+            other_model_variables,
+            normalized_chunk_datapoints,
+            chunk_weights,
+            normalized_layout["batch_axis"],
+            opt_state,
+            snapshot_preconditioner=True,
+          )
+        else:
+          acc_batches = _concat_preconditioner_batches(chunk_datapoints, layout, precond_batch_size)
+          blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
+                                     acc_batches, opt_state)
+      else:
+        layout, acc_batches = _take_full_preconditioner_datapoint(dataloader, precond_batch_size)
+        if self._use_execution_stage_active_path:
+          _, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
+        blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
                                      acc_batches, opt_state)
 
   def expose_blocks(self):

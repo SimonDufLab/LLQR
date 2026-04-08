@@ -1,6 +1,6 @@
 """Simple dictionary file to match string identifiers to the desired output"""
 from jax.tree_util import Partial
-from lqr_optimizer._src.models.mlp import create_mlp
+from lqr_optimizer._src.models.mlp import create_mlp, create_mlp_legacy
 from lqr_optimizer._src.models.resnet import create_resnet18, create_resnet50
 from lqr_optimizer._src.models.grok_model import create_grok_model
 from lqr_optimizer._src.models.gpt import create_gpt_model
@@ -12,6 +12,7 @@ from lqr_optimizer._src.utils.utils import (cosine_annealing_schedule_per_epoch,
 
 model_choice = {
   "mlp": create_mlp,
+  "mlp-legacy": create_mlp_legacy,
   "resnet-18": create_resnet18,
   "resnet-50": create_resnet50,
   "grok-transformer": create_grok_model,
