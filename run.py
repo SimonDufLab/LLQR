@@ -236,16 +236,19 @@ def main(cfg: DictConfig):
     precond_on_update=cfg.precond_on_update,
     normalize_grad_for_lqr = cfg.normalize_grad_for_lqr,
     warm_start_precond = cfg.warm_start_precond,
-      damping=cfg.damping,
-      allow_grad_inversion=cfg.allow_grad_inversion,
-      divergence_args_index=-1,
-      llqr_operator_mode=cfg.llqr_operator_mode,
-      llqr_checkpoint_policy=cfg.llqr_checkpoint_policy,
-      llqr_use_fast_paths=cfg.llqr_use_fast_paths,
-      llqr_batch_experimental_mode=cfg.llqr_batch_experimental_mode,
-      llqr_batch_chunk_size=cfg.llqr_batch_chunk_size,
-      optax_solver_requires_value_and_grad=utl.precond_solver_requires_value_and_grad(cfg.precond_solver),
-    )
+    damping=cfg.damping,
+    allow_grad_inversion=cfg.allow_grad_inversion,
+    divergence_args_index=-1,
+    llqr_operator_mode=cfg.llqr_operator_mode,
+    llqr_checkpoint_policy=cfg.llqr_checkpoint_policy,
+    llqr_use_fast_paths=cfg.llqr_use_fast_paths,
+    llqr_batch_experimental_mode=cfg.llqr_batch_experimental_mode,
+    llqr_batch_chunk_size=cfg.llqr_batch_chunk_size,
+    optax_solver_requires_value_and_grad=utl.precond_solver_requires_value_and_grad(cfg.precond_solver),
+  )
+  llqr_batch_update_gate = preconditioner.describe_batch_experimental_update_gate()
+  print(f"LLQR batch update gate: {llqr_batch_update_gate}")
+  run["llqr_batch_update_gate"] = llqr_batch_update_gate
   if load_from_preexisting_model_state and precond_blocks is not None:
     preconditioner.load_blocks(precond_blocks)
     del precond_blocks
@@ -584,6 +587,8 @@ def main(cfg: DictConfig):
     starting_step = 0
     best_acc = 0
     prev_elapsed_time = 0
+  logged_first_batch_update_route = False
+  last_logged_batch_update_route = None
 
   print(f"Continuing training from step {starting_step}")
   for step in range(starting_step, total_steps):
@@ -603,6 +608,9 @@ def main(cfg: DictConfig):
       precond_lr = precond_lr_fn(step)
       preconditioner.compile_precond_updater(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size,
                                            other_model_variables={'batch_stats': state.batch_stats})
+      compile_route = preconditioner.describe_last_batch_experimental_update_route()
+      print(f"Compiled LLQR preconditioner update route: {compile_route}")
+      run["llqr_batch_compile_route"] = compile_route
       load_from_preexisting_model_state = False
     if (step % _update_precond_every) == 0 and cfg.use_preconditioner and step < cfg.update_preconditioner_until:
       # The preconditioner update can be run on a mini-batch from the dataloader
@@ -612,6 +620,16 @@ def main(cfg: DictConfig):
       _ema_decay = ema_fn(step)
       preconditioner.update_preconditioner(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size, _ema_decay,
                                            other_model_variables={'batch_stats': state.batch_stats})
+      update_route = preconditioner.describe_last_batch_experimental_update_route()
+      if not logged_first_batch_update_route:
+        print(f"LLQR preconditioner update route at step {step}: {update_route}")
+        run["llqr_batch_first_update_route"] = update_route
+        logged_first_batch_update_route = True
+      if last_logged_batch_update_route != update_route:
+        if logged_first_batch_update_route and last_logged_batch_update_route is not None:
+          print(f"LLQR preconditioner update route changed at step {step}: {update_route}")
+        run["llqr_batch_last_update_route"] = update_route
+        last_logged_batch_update_route = dict(update_route)
       precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
       # !!Remove below when timing against non-2nd order methods!! (Affect computation time)
       run.track(precond_max, name="Maximum across preconditioner", step=step)

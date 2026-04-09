@@ -699,6 +699,8 @@ class BasePreconditioner(abc.ABC):
                                                             batch_solve_precond=self._batch_solve_precond,
                                                             multibatch=self._multibatch,
                                                             precond_on_update=self._precond_on_update)
+    self._batch_experimental_update_gate = self._batch_experimental_execution_stage_update_gate_details()
+    self._last_batch_experimental_update_route = None
     self._experimental_execution_chunk_loss_gradients_fn = None
     self._experimental_execution_chunk_grad_only_fn = None
     self._experimental_execution_chunk_value_and_grad_fn = None
@@ -753,6 +755,72 @@ class BasePreconditioner(abc.ABC):
 
   def _resolved_batch_chunk_size(self):
     return self._llqr_batch_chunk_size
+
+  def _batch_experimental_execution_stage_update_gate_details(self):
+    blocked_by = []
+    if not self._uses_batch_experimental_rm_param_only_mode():
+      blocked_by.append("mode_not_rm_param_only")
+    if not self._use_execution_stage_active_path:
+      blocked_by.append("no_execution_stage_active_path")
+    if not self._batch_solve_precond:
+      blocked_by.append("batch_solve_precond_disabled")
+    if self._multibatch:
+      blocked_by.append("multibatch_enabled")
+    return {
+      "batch_experimental_mode": self._resolved_batch_experimental_mode(),
+      "batch_chunk_size": self._resolved_batch_chunk_size(),
+      "use_execution_stage_active_path": bool(self._use_execution_stage_active_path),
+      "batch_solve_precond": bool(self._batch_solve_precond),
+      "multibatch": bool(self._multibatch),
+      "uses_streamed_execution_stage_update_path": not blocked_by,
+      "blocked_by": blocked_by,
+    }
+
+  def describe_batch_experimental_update_gate(self):
+    return dict(self._batch_experimental_update_gate)
+
+  def _serialize_batch_layout(self, layout):
+    if layout is None:
+      return None
+    serialized = {}
+    for key in ("mode", "batch_axis", "T"):
+      value = layout.get(key)
+      if value is None:
+        serialized[key] = None
+      elif isinstance(value, numbers.Integral):
+        serialized[key] = int(value)
+      else:
+        serialized[key] = value
+    return serialized
+
+  def _record_batch_experimental_update_route(self, *, operation, route, precond_batch_size,
+                                              layout=None, normalized_layout=None,
+                                              chunk_datapoints=None, chunk_weights=None,
+                                              fallback_reason=None):
+    route_info = self.describe_batch_experimental_update_gate()
+    route_info.update({
+      "operation": operation,
+      "route": route,
+      "precond_batch_size": int(precond_batch_size),
+    })
+    if layout is not None:
+      route_info["layout"] = self._serialize_batch_layout(layout)
+      route_info["layout_supported"] = bool(_supports_chunked_execution_stage_update_layout(layout))
+    if normalized_layout is not None:
+      route_info["normalized_layout"] = self._serialize_batch_layout(normalized_layout)
+    if chunk_datapoints is not None:
+      route_info["chunk_count"] = len(chunk_datapoints)
+    if chunk_weights is not None:
+      route_info["chunk_weights"] = [int(weight) for weight in chunk_weights]
+    if fallback_reason is not None:
+      route_info["fallback_reason"] = fallback_reason
+    self._last_batch_experimental_update_route = route_info
+    return route_info
+
+  def describe_last_batch_experimental_update_route(self):
+    if self._last_batch_experimental_update_route is None:
+      return None
+    return dict(self._last_batch_experimental_update_route)
 
   def _uses_batch_experimental_execution_stage_update_path(self):
     return (
@@ -1390,6 +1458,11 @@ class BasePreconditioner(abc.ABC):
   def update_preconditioner(self, params, dataloader, precond_lr, opt_state, precond_batch_size, ema_decay=0, other_model_variables=FrozenDict({})):
     """params is the current weights of the NN"""
     if self._multibatch:
+      self._record_batch_experimental_update_route(
+        operation="update",
+        route="multibatch",
+        precond_batch_size=precond_batch_size,
+      )
       self._block_structure.update_blocks(
         self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
                                        opt_state), ema_decay)
@@ -1410,6 +1483,15 @@ class BasePreconditioner(abc.ABC):
             chunk_datapoints,
             layout,
           )
+          self._record_batch_experimental_update_route(
+            operation="update",
+            route="chunked_execution_stage",
+            precond_batch_size=precond_batch_size,
+            layout=layout,
+            normalized_layout=normalized_layout,
+            chunk_datapoints=normalized_chunk_datapoints,
+            chunk_weights=chunk_weights,
+          )
           updated_blocks = self._run_chunked_execution_stage_update(
             _blocks,
             params,
@@ -1423,6 +1505,15 @@ class BasePreconditioner(abc.ABC):
           )
         else:
           acc_batches = _concat_preconditioner_batches(chunk_datapoints, layout, precond_batch_size)
+          self._record_batch_experimental_update_route(
+            operation="update",
+            route="chunked_execution_stage_layout_fallback",
+            precond_batch_size=precond_batch_size,
+            layout=layout,
+            chunk_datapoints=chunk_datapoints,
+            chunk_weights=chunk_weights,
+            fallback_reason=f"unsupported_layout:{layout.get('mode')}",
+          )
           updated_blocks = self._update_preconditioner_fn(
             _blocks,
             params,
@@ -1436,6 +1527,12 @@ class BasePreconditioner(abc.ABC):
         layout, acc_batches = _take_full_preconditioner_datapoint(dataloader, precond_batch_size)
         if self._use_execution_stage_active_path:
           _, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
+        self._record_batch_experimental_update_route(
+          operation="update",
+          route="full_batch",
+          precond_batch_size=precond_batch_size,
+          layout=layout,
+        )
         updated_blocks = self._update_preconditioner_fn(
           _blocks,
           params,
@@ -1464,6 +1561,11 @@ class BasePreconditioner(abc.ABC):
   def compile_precond_updater(self, params, dataloader, precond_lr, opt_state, precond_batch_size, other_model_variables=FrozenDict({})):
     """For when we want to trigger jax compilation of _update_preconditioner_fn without applying the update"""
     if self._multibatch:
+        self._record_batch_experimental_update_route(
+          operation="compile",
+          route="multibatch",
+          precond_batch_size=precond_batch_size,
+        )
         blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
                                        opt_state)
     else:
@@ -1478,6 +1580,15 @@ class BasePreconditioner(abc.ABC):
             chunk_datapoints,
             layout,
           )
+          self._record_batch_experimental_update_route(
+            operation="compile",
+            route="chunked_execution_stage",
+            precond_batch_size=precond_batch_size,
+            layout=layout,
+            normalized_layout=normalized_layout,
+            chunk_datapoints=normalized_chunk_datapoints,
+            chunk_weights=chunk_weights,
+          )
           blocks = self._run_chunked_execution_stage_update(
             self._block_structure.blocks,
             params,
@@ -1491,12 +1602,27 @@ class BasePreconditioner(abc.ABC):
           )
         else:
           acc_batches = _concat_preconditioner_batches(chunk_datapoints, layout, precond_batch_size)
+          self._record_batch_experimental_update_route(
+            operation="compile",
+            route="chunked_execution_stage_layout_fallback",
+            precond_batch_size=precond_batch_size,
+            layout=layout,
+            chunk_datapoints=chunk_datapoints,
+            chunk_weights=chunk_weights,
+            fallback_reason=f"unsupported_layout:{layout.get('mode')}",
+          )
           blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
                                      acc_batches, opt_state)
       else:
         layout, acc_batches = _take_full_preconditioner_datapoint(dataloader, precond_batch_size)
         if self._use_execution_stage_active_path:
           _, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
+        self._record_batch_experimental_update_route(
+          operation="compile",
+          route="full_batch",
+          precond_batch_size=precond_batch_size,
+          layout=layout,
+        )
         blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
                                      acc_batches, opt_state)
 
