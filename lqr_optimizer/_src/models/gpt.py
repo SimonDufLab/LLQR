@@ -11,6 +11,7 @@ from flax.core import freeze
 from lqr_optimizer._src.utils.utils import (
     EnhancedSequential,
     make_controlled_stage_descriptor,
+    make_lqr_segment_descriptor,
     make_passive_stage_descriptor,
 )
 
@@ -411,6 +412,7 @@ def create_gpt_model(
     def inference_mode(deterministic: bool):
         layers = []
         stage_descriptors = []
+        lqr_segment_descriptors = []
         legacy_mapping = []
 
         def add_controlled(stage_name, module, fast_path_kind=None):
@@ -442,19 +444,24 @@ def create_gpt_model(
                 deterministic=deterministic,
             ),
         ), None),))
+        lqr_segment_descriptors.append(make_lqr_segment_descriptor("gpt_init", ("gpt_init",)))
 
         for block_index in range(depth):
             block_mapping = []
+            block_stage_names = []
             if layer_norm:
+                stage_name = f"block_{block_index}_attn_pre_ln"
                 block_mapping.append((add_controlled(
-                    f"block_{block_index}_attn_pre_ln",
+                    stage_name,
                     LayerNormCarryStage(layer_norm_eps=layer_norm_eps, norm_name="LayerNorm_0"),
                 ), {"LayerNorm_0": "LayerNorm_0"}))
+                block_stage_names.append(stage_name)
             else:
                 raise ValueError("Wave-5.a GPT stage splitting currently requires layer_norm=True.")
 
+            stage_name = f"block_{block_index}_attn_core"
             block_mapping.append((add_controlled(
-                f"block_{block_index}_attn_core",
+                stage_name,
                 AttentionCoreFromCarryStage(
                     hidden_dim=emb_dim,
                     heads=num_heads,
@@ -463,33 +470,47 @@ def create_gpt_model(
                     deterministic=deterministic,
                 ),
             ), {"GPTSelfAttention_0": "GPTSelfAttention_0"}))
+            block_stage_names.append(stage_name)
+            stage_name = f"block_{block_index}_attn_residual"
             add_passive(
-                f"block_{block_index}_attn_residual",
+                stage_name,
                 ResidualAddDropoutStage(rate=resid_dropout, deterministic=deterministic),
                 fast_path_kind="piecewise_linear_passive" if deterministic else None,
                 passive_state_hessian="zero" if deterministic else "generic",
             )
+            block_stage_names.append(stage_name)
 
             if linear:
+                stage_name = f"block_{block_index}_mlp_pre_ln"
                 block_mapping.append((add_controlled(
-                    f"block_{block_index}_mlp_pre_ln",
+                    stage_name,
                     LayerNormCarryStage(layer_norm_eps=layer_norm_eps, norm_name="LayerNorm_1"),
                 ), {"LayerNorm_1": "LayerNorm_1"}))
+                block_stage_names.append(stage_name)
+                stage_name = f"block_{block_index}_fc1"
                 block_mapping.append((add_controlled(
-                    f"block_{block_index}_fc1",
+                    stage_name,
                     FC1FromCarryStage(mlp_dim=width_mlp),
                     fast_path_kind="linear_controlled",
                 ), {"FeedForward_0": {"fc1": "fc1"}}))
-                add_passive(f"block_{block_index}_gelu", GELUFromCarryStage(), passive_state_hessian="generic")
+                block_stage_names.append(stage_name)
+                stage_name = f"block_{block_index}_gelu"
+                add_passive(stage_name, GELUFromCarryStage(), passive_state_hessian="generic")
+                block_stage_names.append(stage_name)
+                stage_name = f"block_{block_index}_fc2_residual"
                 block_mapping.append((add_controlled(
-                    f"block_{block_index}_fc2_residual",
+                    stage_name,
                     FC2ResidualStage(dim=emb_dim, resid_dropout=resid_dropout, deterministic=deterministic),
                     fast_path_kind="linear_controlled" if deterministic else None,
                 ), {"FeedForward_0": {"fc2": "fc2"}}))
+                block_stage_names.append(stage_name)
 
             legacy_mapping.append(tuple(block_mapping))
+            lqr_segment_descriptors.append(
+                make_lqr_segment_descriptor(f"block_{block_index}", tuple(block_stage_names))
+            )
 
-        legacy_mapping.append(((add_controlled(
+        final_key = add_controlled(
             "gpt_final",
             GPTFinalLayer(
                 vocab_size=vocab_size,
@@ -497,7 +518,9 @@ def create_gpt_model(
                 layer_norm_eps=layer_norm_eps,
                 deterministic=deterministic,
             ),
-        ), None),))
+        )
+        legacy_mapping.append(((final_key, None),))
+        lqr_segment_descriptors.append(make_lqr_segment_descriptor("gpt_final", ("gpt_final",)))
 
         def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):
             return (
@@ -508,6 +531,7 @@ def create_gpt_model(
         model = EnhancedSequential(
             layers,
             stage_descriptors=tuple(stage_descriptors),
+            lqr_segment_descriptors=tuple(lqr_segment_descriptors),
             legacy_checkpoint_migrator=migrate_legacy_checkpoint,
         )
         model.validate_stage_descriptors()

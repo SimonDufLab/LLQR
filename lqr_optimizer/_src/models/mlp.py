@@ -5,6 +5,7 @@ from flax.core import freeze
 from lqr_optimizer._src.utils.utils import (
   EnhancedSequential,
   make_controlled_stage_descriptor,
+  make_lqr_segment_descriptor,
   make_passive_stage_descriptor,
 )
 
@@ -110,6 +111,11 @@ def create_mlp(num_classes: int) -> Tuple[nn.Module, None]:
     make_controlled_stage_descriptor("logits", "layers_4", fast_path_kind="linear_controlled"),
     make_passive_stage_descriptor("log_softmax", passive_state_hessian="generic"),
   )
+  lqr_segment_descriptors = (
+    make_lqr_segment_descriptor("dense0_relu0", ("dense0", "relu0")),
+    make_lqr_segment_descriptor("dense1_relu1", ("dense1", "relu1")),
+    make_lqr_segment_descriptor("logits_log_softmax", ("logits", "log_softmax")),
+  )
 
   def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):
     return (
@@ -120,6 +126,7 @@ def create_mlp(num_classes: int) -> Tuple[nn.Module, None]:
   model = EnhancedSequential(
     layers,
     stage_descriptors=stage_descriptors,
+    lqr_segment_descriptors=lqr_segment_descriptors,
     legacy_checkpoint_migrator=migrate_legacy_checkpoint,
   )
   model.validate_stage_descriptors()

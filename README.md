@@ -36,5 +36,6 @@ Start with the workspace-level docs index:
 Then use:
 - `../docs/lqr-simplified-repo-map.md`
 - `../docs/lqr-simplified-change-impact.md`
+- `../docs/lqr-simplified-architecture-stage-contract.md`
 - `../docs/lqr-simplified-methodology.md`
 - `../docs/lqr-simplified-agent-notes.md`

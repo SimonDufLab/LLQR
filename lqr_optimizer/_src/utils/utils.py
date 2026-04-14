@@ -145,6 +145,19 @@ class StageDescriptor(NamedTuple):
   passive_state_hessian: Optional[str] = None
 
 
+class LqrSegmentDescriptor(NamedTuple):
+  name: str
+  execution_stage_names: Tuple[str, ...]
+
+
+class ResolvedLqrSegmentDescriptor(NamedTuple):
+  name: str
+  start_index: int
+  stop_index: int
+  execution_stage_descriptors: Tuple[StageDescriptor, ...]
+  controlled_param_names: Tuple[str, ...]
+
+
 _ALLOWED_STAGE_KINDS = frozenset(("controlled", "passive"))
 _ALLOWED_FAST_PATH_KINDS = frozenset((None, "linear_controlled", "piecewise_linear_passive"))
 _ALLOWED_PASSIVE_STATE_HESSIANS = frozenset((None, "zero", "generic"))
@@ -165,6 +178,10 @@ def make_passive_stage_descriptor(name: str, fast_path_kind: Optional[str] = Non
     fast_path_kind=fast_path_kind,
     passive_state_hessian=passive_state_hessian,
   )
+
+
+def make_lqr_segment_descriptor(name: str, execution_stage_names: Tuple[str, ...]) -> LqrSegmentDescriptor:
+  return LqrSegmentDescriptor(name=name, execution_stage_names=tuple(execution_stage_names))
 
 
 def validate_stage_descriptors(stage_descriptors: Tuple[StageDescriptor, ...], *, num_layers: int) -> Tuple[StageDescriptor, ...]:
@@ -220,9 +237,73 @@ def validate_stage_descriptors(stage_descriptors: Tuple[StageDescriptor, ...], *
   return stage_descriptors
 
 
+def validate_lqr_segment_descriptors(lqr_segment_descriptors: Tuple[LqrSegmentDescriptor, ...],
+                                     execution_stage_descriptors: Tuple[StageDescriptor, ...]
+                                     ) -> Tuple[ResolvedLqrSegmentDescriptor, ...]:
+  stage_index_by_name = {stage.name: index for index, stage in enumerate(execution_stage_descriptors)}
+  segment_names = set()
+  covered_stage_names = set()
+  expected_start = 0
+  resolved_segments = []
+
+  if not lqr_segment_descriptors and execution_stage_descriptors:
+    raise ValueError("LLQR segment descriptors must not be empty when execution stages exist.")
+
+  for segment in lqr_segment_descriptors:
+    if not segment.name:
+      raise ValueError("LLQR segment names must be non-empty.")
+    if segment.name in segment_names:
+      raise ValueError(f"Duplicate LLQR segment name '{segment.name}'.")
+    segment_names.add(segment.name)
+
+    execution_stage_names = tuple(segment.execution_stage_names)
+    if not execution_stage_names:
+      raise ValueError(f"LLQR segment '{segment.name}' must reference at least one execution stage.")
+
+    segment_indices = []
+    for stage_name in execution_stage_names:
+      if stage_name not in stage_index_by_name:
+        raise ValueError(
+          f"LLQR segment '{segment.name}' references unknown execution stage '{stage_name}'."
+        )
+      if stage_name in covered_stage_names:
+        raise ValueError(
+          f"Execution stage '{stage_name}' appears in more than one LLQR segment."
+        )
+      covered_stage_names.add(stage_name)
+      segment_indices.append(stage_index_by_name[stage_name])
+
+    expected_indices = list(range(expected_start, expected_start + len(segment_indices)))
+    if segment_indices != expected_indices:
+      raise ValueError(
+        f"LLQR segment '{segment.name}' must cover a contiguous execution-stage slice in forward order."
+      )
+
+    segment_stage_descriptors = tuple(execution_stage_descriptors[index] for index in segment_indices)
+    controlled_param_names = tuple(
+      stage.param_name for stage in segment_stage_descriptors if stage.kind == "controlled"
+    )
+    resolved_segments.append(
+      ResolvedLqrSegmentDescriptor(
+        name=segment.name,
+        start_index=expected_start,
+        stop_index=expected_start + len(segment_indices),
+        execution_stage_descriptors=segment_stage_descriptors,
+        controlled_param_names=controlled_param_names,
+      )
+    )
+    expected_start += len(segment_indices)
+
+  if expected_start != len(execution_stage_descriptors):
+    raise ValueError("LLQR segments must cover every execution stage exactly once.")
+
+  return tuple(resolved_segments)
+
+
 class EnhancedSequential(nn.Module):
   layers: List[nn.Module]
   stage_descriptors: Optional[Tuple[StageDescriptor, ...]] = None
+  lqr_segment_descriptors: Optional[Tuple[LqrSegmentDescriptor, ...]] = None
   legacy_checkpoint_migrator: Optional[Callable[[Any, Any, Any, Any], Tuple[Any, Any]]] = None
 
   def __call__(self, x: Any) -> Any:
@@ -243,7 +324,28 @@ class EnhancedSequential(nn.Module):
     return validate_stage_descriptors(stage_descriptors, num_layers=len(self.layers))
 
   def validate_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:
-    return self.execution_stage_descriptors
+    stage_descriptors = self.execution_stage_descriptors
+    self.validate_lqr_segment_descriptors()
+    return stage_descriptors
+
+  @property
+  def resolved_lqr_segment_descriptors(self) -> Tuple[ResolvedLqrSegmentDescriptor, ...]:
+    execution_stage_descriptors = self.execution_stage_descriptors
+    if self.lqr_segment_descriptors is None:
+      if self.stage_descriptors is not None:
+        raise ValueError(
+          "Models with explicit execution stage descriptors must also provide explicit LLQR segment descriptors."
+        )
+      lqr_segment_descriptors = tuple(
+        make_lqr_segment_descriptor(stage.name, (stage.name,))
+        for stage in execution_stage_descriptors
+      )
+    else:
+      lqr_segment_descriptors = tuple(self.lqr_segment_descriptors)
+    return validate_lqr_segment_descriptors(lqr_segment_descriptors, execution_stage_descriptors)
+
+  def validate_lqr_segment_descriptors(self) -> Tuple[ResolvedLqrSegmentDescriptor, ...]:
+    return self.resolved_lqr_segment_descriptors
 
   @property
   def controlled_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:

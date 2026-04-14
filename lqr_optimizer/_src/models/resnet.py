@@ -7,6 +7,7 @@ from flax.core import freeze
 from lqr_optimizer._src.utils.utils import (
   EnhancedSequential,
   make_controlled_stage_descriptor,
+  make_lqr_segment_descriptor,
   make_passive_stage_descriptor,
 )
 
@@ -341,6 +342,7 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
   def inference_mode(inference: bool):
     layers = []
     stage_descriptors = []
+    lqr_segment_descriptors = []
     legacy_mapping = []
     legacy_batch_stats_mapping = []
 
@@ -399,6 +401,15 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
         part2_batch_stats_mapping.append((skip_bn_key, ("BatchNorm_1",)))
       add_passive(f"{prefix}_add_relu", TupleAddReluStage(), fast_path_kind="piecewise_linear_passive",
                   passive_state_hessian="zero")
+      part1_stage_names = (f"{prefix}_conv1", f"{prefix}_bn1", f"{prefix}_relu1")
+      part2_stage_names = [f"{prefix}_conv2", f"{prefix}_bn2"]
+      if projection:
+        part2_stage_names.extend((f"{prefix}_skip_proj_conv", f"{prefix}_skip_proj_bn"))
+      part2_stage_names.append(f"{prefix}_add_relu")
+      lqr_segment_descriptors.extend((
+        make_lqr_segment_descriptor(f"{prefix}_part1", part1_stage_names),
+        make_lqr_segment_descriptor(f"{prefix}_part2", tuple(part2_stage_names)),
+      ))
       return (
         tuple(part1_mapping),
         tuple(part2_mapping),
@@ -413,6 +424,9 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
     legacy_mapping.append(((stem_conv_key, ("Conv_0",)), (stem_bn_key, ("BatchNorm_0",))))
     legacy_batch_stats_mapping.append(((stem_bn_key, ("BatchNorm_0",)),))
     add_passive("stem_relu", ReluStage(), fast_path_kind="piecewise_linear_passive", passive_state_hessian="zero")
+    lqr_segment_descriptors.append(
+      make_lqr_segment_descriptor("stem", ("stem_conv", "stem_bn", "stem_relu"))
+    )
 
     block_specs = [
       (STARTING_FEATURES, 1, False),
@@ -434,7 +448,9 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
       legacy_batch_stats_mapping.append(part1_batch_stats_mapping)
       legacy_batch_stats_mapping.append(part2_batch_stats_mapping)
 
-    legacy_mapping.append(((add_controlled("head", GPoolDenseLogSoftmax(num_classes)), None),))
+    head_key = add_controlled("head", GPoolDenseLogSoftmax(num_classes))
+    legacy_mapping.append(((head_key, None),))
+    lqr_segment_descriptors.append(make_lqr_segment_descriptor("head", ("head",)))
 
     def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):
       return (
@@ -445,6 +461,7 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
     model = EnhancedSequential(
       layers,
       stage_descriptors=tuple(stage_descriptors),
+      lqr_segment_descriptors=tuple(lqr_segment_descriptors),
       legacy_checkpoint_migrator=migrate_legacy_checkpoint,
     )
     model.validate_stage_descriptors()
@@ -540,6 +557,7 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
   def inference_mode(inference: bool):
     layers = []
     stage_descriptors = []
+    lqr_segment_descriptors = []
     legacy_mapping = []
     legacy_batch_stats_mapping = []
 
@@ -613,6 +631,17 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
         part3_batch_stats_mapping.append((skip_bn_key, ("BatchNorm_1",)))
       add_passive(f"{prefix}_add_relu", TupleAddReluStage(), fast_path_kind="piecewise_linear_passive",
                   passive_state_hessian="zero")
+      part1_stage_names = (f"{prefix}_conv1", f"{prefix}_bn1", f"{prefix}_relu1")
+      part2_stage_names = (f"{prefix}_conv2", f"{prefix}_bn2", f"{prefix}_relu2")
+      part3_stage_names = [f"{prefix}_conv3", f"{prefix}_bn3"]
+      if projection:
+        part3_stage_names.extend((f"{prefix}_skip_proj_conv", f"{prefix}_skip_proj_bn"))
+      part3_stage_names.append(f"{prefix}_add_relu")
+      lqr_segment_descriptors.extend((
+        make_lqr_segment_descriptor(f"{prefix}_part1", part1_stage_names),
+        make_lqr_segment_descriptor(f"{prefix}_part2", part2_stage_names),
+        make_lqr_segment_descriptor(f"{prefix}_part3", tuple(part3_stage_names)),
+      ))
       return (
         tuple(part1_mapping),
         tuple(part2_mapping),
@@ -630,6 +659,9 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
     legacy_batch_stats_mapping.append(((stem_bn_key, ("BatchNorm_0",)),))
     add_passive("stem_relu", ReluStage(), fast_path_kind="piecewise_linear_passive", passive_state_hessian="zero")
     add_passive("stem_pool", MaxPoolStage(), passive_state_hessian="zero")
+    lqr_segment_descriptors.append(
+      make_lqr_segment_descriptor("stem", ("stem_conv", "stem_bn", "stem_relu", "stem_pool"))
+    )
 
     block_id = 0
     for stage_idx, (planes, num_blocks) in enumerate(zip(STAGE_PLANES, STAGE_BLOCKS)):
@@ -644,7 +676,9 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
         legacy_batch_stats_mapping.extend(bottleneck_mappings[3:])
         block_id += 1
 
-    legacy_mapping.append(((add_controlled("head", GPoolDenseLogSoftmax(num_classes)), None),))
+    head_key = add_controlled("head", GPoolDenseLogSoftmax(num_classes))
+    legacy_mapping.append(((head_key, None),))
+    lqr_segment_descriptors.append(make_lqr_segment_descriptor("head", ("head",)))
 
     def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):
       return (
@@ -655,6 +689,7 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
     model = EnhancedSequential(
       layers,
       stage_descriptors=tuple(stage_descriptors),
+      lqr_segment_descriptors=tuple(lqr_segment_descriptors),
       legacy_checkpoint_migrator=migrate_legacy_checkpoint,
     )
     model.validate_stage_descriptors()
