@@ -102,11 +102,13 @@ def create_mlp(num_classes: int) -> Tuple[nn.Module, None]:
   ]
   stage_descriptors = (
     make_controlled_stage_descriptor("dense0", "layers_0", fast_path_kind="linear_controlled"),
-    make_passive_stage_descriptor("relu0", fast_path_kind="piecewise_linear_passive"),
+    make_passive_stage_descriptor("relu0", fast_path_kind="piecewise_linear_passive",
+                                  passive_state_hessian="zero"),
     make_controlled_stage_descriptor("dense1", "layers_2", fast_path_kind="linear_controlled"),
-    make_passive_stage_descriptor("relu1", fast_path_kind="piecewise_linear_passive"),
+    make_passive_stage_descriptor("relu1", fast_path_kind="piecewise_linear_passive",
+                                  passive_state_hessian="zero"),
     make_controlled_stage_descriptor("logits", "layers_4", fast_path_kind="linear_controlled"),
-    make_passive_stage_descriptor("log_softmax"),
+    make_passive_stage_descriptor("log_softmax", passive_state_hessian="generic"),
   )
 
   def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):

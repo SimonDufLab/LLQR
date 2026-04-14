@@ -353,9 +353,11 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
       )
       return param_name
 
-    def add_passive(stage_name, module, fast_path_kind=None):
+    def add_passive(stage_name, module, fast_path_kind=None, passive_state_hessian=None):
       layers.append(module)
-      stage_descriptors.append(make_passive_stage_descriptor(stage_name, fast_path_kind))
+      stage_descriptors.append(
+        make_passive_stage_descriptor(stage_name, fast_path_kind, passive_state_hessian)
+      )
 
     def append_basic_block(prefix, features, stride, projection):
       part1_mapping = []
@@ -372,7 +374,8 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
                                fast_path_kind="linear_controlled" if inference else None)
       part1_mapping.append((bn1_key, ("BatchNorm_0",)))
       part1_batch_stats_mapping.append((bn1_key, ("BatchNorm_0",)))
-      add_passive(f"{prefix}_relu1", TupleReluStage(), fast_path_kind="piecewise_linear_passive")
+      add_passive(f"{prefix}_relu1", TupleReluStage(), fast_path_kind="piecewise_linear_passive",
+                  passive_state_hessian="zero")
       part2_mapping.append((add_controlled(f"{prefix}_conv2",
                                            TupleMainConvStage(features=features, kernel_size=(3, 3),
                                                               strides=(1, 1), conv_name="Conv_0"),
@@ -394,7 +397,8 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
                                      fast_path_kind="linear_controlled" if inference else None)
         part2_mapping.append((skip_bn_key, ("BatchNorm_1",)))
         part2_batch_stats_mapping.append((skip_bn_key, ("BatchNorm_1",)))
-      add_passive(f"{prefix}_add_relu", TupleAddReluStage(), fast_path_kind="piecewise_linear_passive")
+      add_passive(f"{prefix}_add_relu", TupleAddReluStage(), fast_path_kind="piecewise_linear_passive",
+                  passive_state_hessian="zero")
       return (
         tuple(part1_mapping),
         tuple(part2_mapping),
@@ -408,7 +412,7 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
                                  fast_path_kind="linear_controlled" if inference else None)
     legacy_mapping.append(((stem_conv_key, ("Conv_0",)), (stem_bn_key, ("BatchNorm_0",))))
     legacy_batch_stats_mapping.append(((stem_bn_key, ("BatchNorm_0",)),))
-    add_passive("stem_relu", ReluStage(), fast_path_kind="piecewise_linear_passive")
+    add_passive("stem_relu", ReluStage(), fast_path_kind="piecewise_linear_passive", passive_state_hessian="zero")
 
     block_specs = [
       (STARTING_FEATURES, 1, False),
@@ -548,9 +552,11 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
       )
       return param_name
 
-    def add_passive(stage_name, module, fast_path_kind=None):
+    def add_passive(stage_name, module, fast_path_kind=None, passive_state_hessian=None):
       layers.append(module)
-      stage_descriptors.append(make_passive_stage_descriptor(stage_name, fast_path_kind))
+      stage_descriptors.append(
+        make_passive_stage_descriptor(stage_name, fast_path_kind, passive_state_hessian)
+      )
 
     def append_bottleneck(prefix, planes, stride, projection):
       part1_mapping = []
@@ -570,7 +576,8 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
                                fast_path_kind="linear_controlled" if inference else None)
       part1_mapping.append((bn1_key, ("BatchNorm_0",)))
       part1_batch_stats_mapping.append((bn1_key, ("BatchNorm_0",)))
-      add_passive(f"{prefix}_relu1", TupleReluStage(), fast_path_kind="piecewise_linear_passive")
+      add_passive(f"{prefix}_relu1", TupleReluStage(), fast_path_kind="piecewise_linear_passive",
+                  passive_state_hessian="zero")
       part2_mapping.append((add_controlled(f"{prefix}_conv2",
                                            TupleMainConvStage(features=planes, kernel_size=(3, 3),
                                                               strides=(stride, stride), conv_name="Conv_0"),
@@ -581,7 +588,8 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
                                fast_path_kind="linear_controlled" if inference else None)
       part2_mapping.append((bn2_key, ("BatchNorm_0",)))
       part2_batch_stats_mapping.append((bn2_key, ("BatchNorm_0",)))
-      add_passive(f"{prefix}_relu2", TupleReluStage(), fast_path_kind="piecewise_linear_passive")
+      add_passive(f"{prefix}_relu2", TupleReluStage(), fast_path_kind="piecewise_linear_passive",
+                  passive_state_hessian="zero")
       part3_mapping.append((add_controlled(f"{prefix}_conv3",
                                            TupleMainConvStage(features=out_channels, kernel_size=(1, 1),
                                                               strides=(1, 1), conv_name="Conv_0"),
@@ -603,7 +611,8 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
                                      fast_path_kind="linear_controlled" if inference else None)
         part3_mapping.append((skip_bn_key, ("BatchNorm_1",)))
         part3_batch_stats_mapping.append((skip_bn_key, ("BatchNorm_1",)))
-      add_passive(f"{prefix}_add_relu", TupleAddReluStage(), fast_path_kind="piecewise_linear_passive")
+      add_passive(f"{prefix}_add_relu", TupleAddReluStage(), fast_path_kind="piecewise_linear_passive",
+                  passive_state_hessian="zero")
       return (
         tuple(part1_mapping),
         tuple(part2_mapping),
@@ -619,8 +628,8 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
                                  fast_path_kind="linear_controlled" if inference else None)
     legacy_mapping.append(((stem_conv_key, ("Conv_0",)), (stem_bn_key, ("BatchNorm_0",))))
     legacy_batch_stats_mapping.append(((stem_bn_key, ("BatchNorm_0",)),))
-    add_passive("stem_relu", ReluStage(), fast_path_kind="piecewise_linear_passive")
-    add_passive("stem_pool", MaxPoolStage())
+    add_passive("stem_relu", ReluStage(), fast_path_kind="piecewise_linear_passive", passive_state_hessian="zero")
+    add_passive("stem_pool", MaxPoolStage(), passive_state_hessian="zero")
 
     block_id = 0
     for stage_idx, (planes, num_blocks) in enumerate(zip(STAGE_PLANES, STAGE_BLOCKS)):

@@ -360,8 +360,8 @@ def _stage_uses_linear_controlled_fast_path(stage_spec):
   return getattr(stage_spec, "fast_path_kind", None) == "linear_controlled"
 
 
-def _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
-  return getattr(stage_spec, "fast_path_kind", None) == "piecewise_linear_passive"
+def _stage_has_zero_passive_state_hessian(stage_spec):
+  return getattr(stage_spec, "passive_state_hessian", None) == "zero"
 
 
 def _stage_other_variables(other_model_variables, param_name):
@@ -1196,7 +1196,7 @@ def lqr_active_execution_backward_hamiltonian_operators(params, states, final_ad
         batch_experimental_mode == "rm_param_only"
         and _supports_experimental_batch_axis(stage_state, p_i, batch_axis)
       )
-      if use_fast_paths and _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
+      if _stage_has_zero_passive_state_hessian(stage_spec):
         def k_i(state_tangent):
           return zero_tangent_tree_like(state_tangent)
       elif can_use_experimental_batch_operator:
@@ -1362,7 +1362,7 @@ def lqr_active_execution_backward_hamiltonian_operators_lowmem(params, states, f
     stage_other_vars = stage_metadata.other_vars
 
     if stage_operator.kind == "passive":
-      if use_fast_paths and _stage_uses_piecewise_linear_passive_fast_path(stage_spec):
+      if _stage_has_zero_passive_state_hessian(stage_spec):
         def k_i(state_tangent):
           return zero_tangent_tree_like(state_tangent)
       else:

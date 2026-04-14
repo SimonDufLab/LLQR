@@ -142,18 +142,29 @@ class StageDescriptor(NamedTuple):
   kind: str
   param_name: Optional[str] = None
   fast_path_kind: Optional[str] = None
+  passive_state_hessian: Optional[str] = None
 
 
 _ALLOWED_STAGE_KINDS = frozenset(("controlled", "passive"))
 _ALLOWED_FAST_PATH_KINDS = frozenset((None, "linear_controlled", "piecewise_linear_passive"))
+_ALLOWED_PASSIVE_STATE_HESSIANS = frozenset((None, "zero", "generic"))
 
 
 def make_controlled_stage_descriptor(name: str, param_name: str, fast_path_kind: Optional[str] = None) -> StageDescriptor:
   return StageDescriptor(name=name, kind="controlled", param_name=param_name, fast_path_kind=fast_path_kind)
 
 
-def make_passive_stage_descriptor(name: str, fast_path_kind: Optional[str] = None) -> StageDescriptor:
-  return StageDescriptor(name=name, kind="passive", param_name=None, fast_path_kind=fast_path_kind)
+def make_passive_stage_descriptor(name: str, fast_path_kind: Optional[str] = None,
+                                  passive_state_hessian: Optional[str] = None) -> StageDescriptor:
+  if passive_state_hessian is None and fast_path_kind == "piecewise_linear_passive":
+    passive_state_hessian = "zero"
+  return StageDescriptor(
+    name=name,
+    kind="passive",
+    param_name=None,
+    fast_path_kind=fast_path_kind,
+    passive_state_hessian=passive_state_hessian,
+  )
 
 
 def validate_stage_descriptors(stage_descriptors: Tuple[StageDescriptor, ...], *, num_layers: int) -> Tuple[StageDescriptor, ...]:
@@ -175,6 +186,10 @@ def validate_stage_descriptors(stage_descriptors: Tuple[StageDescriptor, ...], *
       raise ValueError(
         f"Unknown fast_path_kind '{descriptor.fast_path_kind}' for stage '{descriptor.name}'."
       )
+    if descriptor.passive_state_hessian not in _ALLOWED_PASSIVE_STATE_HESSIANS:
+      raise ValueError(
+        f"Unknown passive_state_hessian '{descriptor.passive_state_hessian}' for stage '{descriptor.name}'."
+      )
 
     if descriptor.kind == "controlled":
       if descriptor.param_name is None:
@@ -186,12 +201,20 @@ def validate_stage_descriptors(stage_descriptors: Tuple[StageDescriptor, ...], *
         raise ValueError(
           f"Controlled stage '{descriptor.name}' cannot use passive fast_path_kind '{descriptor.fast_path_kind}'."
         )
+      if descriptor.passive_state_hessian is not None:
+        raise ValueError(
+          f"Controlled stage '{descriptor.name}' cannot define passive_state_hessian."
+        )
     else:
       if descriptor.param_name is not None:
         raise ValueError(f"Passive stage '{descriptor.name}' must not define param_name.")
       if descriptor.fast_path_kind == "linear_controlled":
         raise ValueError(
           f"Passive stage '{descriptor.name}' cannot use controlled fast_path_kind '{descriptor.fast_path_kind}'."
+        )
+      if descriptor.fast_path_kind == "piecewise_linear_passive" and descriptor.passive_state_hessian != "zero":
+        raise ValueError(
+          f"Passive stage '{descriptor.name}' with piecewise_linear_passive fast_path_kind must declare zero state Hessian."
         )
 
   return stage_descriptors
