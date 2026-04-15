@@ -310,7 +310,7 @@ def main(cfg: DictConfig):
   def precond_apply_fn(blocks, grads):
     return preconditioner.apply(blocks, grads)
 
-  if not cfg.fsam_mode:
+  if not cfg.sam_mode:
     @jax.jit
     def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
       acc_steps = x_acc.shape[0]
@@ -356,7 +356,7 @@ def main(cfg: DictConfig):
         )
 
       return new_state, mean_loss, key_out
-  elif cfg.fsam_mode=='past_fsam':
+  elif cfg.sam_mode=='past_fsam':
     @jax.jit
     def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
       acc_steps = x_acc.shape[0]
@@ -370,8 +370,8 @@ def main(cfg: DictConfig):
         g_last=state.g_last,  # stored last gradient (perturbed)
         g_bar=state.gbar,  # running EMA buffer
         precond_apply_fn=precond_apply_fn,
-        rho=cfg.asam_rho,
-        mode=cfg.gbar_mode,
+        rho=cfg.perturbation_rho,
+        mode=cfg.perturb_mode,
         eps=cfg.gbar_eps,
       )
 
@@ -434,7 +434,7 @@ def main(cfg: DictConfig):
         precond_blocks=precond_blocks,
         precond_apply_fn=precond_apply_fn,
         beta=cfg.gbar_beta,
-        mode=cfg.gbar_mode,
+        mode=cfg.perturb_mode,
         eps=cfg.gbar_eps,
       )
 
@@ -448,7 +448,7 @@ def main(cfg: DictConfig):
       )
 
       return new_state, mean_loss, key_out
-  elif cfg.fsam_mode=='base_fsam':
+  elif cfg.sam_mode=='base_fsam':
     @jax.jit
     def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
       """
@@ -514,8 +514,8 @@ def main(cfg: DictConfig):
         g_last=mean_grads_center,  # reuse API: pass current gradient as "g_last"
         g_bar=state.gbar,
         precond_apply_fn=precond_apply_fn,
-        rho=cfg.asam_rho,
-        mode=cfg.gbar_mode,
+        rho=cfg.perturbation_rho,
+        mode=cfg.perturb_mode,
         eps=cfg.gbar_eps,
       )
 
@@ -556,7 +556,7 @@ def main(cfg: DictConfig):
         precond_blocks=precond_blocks,
         precond_apply_fn=precond_apply_fn,
         beta=cfg.gbar_beta,
-        mode=cfg.gbar_mode,
+        mode=cfg.perturb_mode,
         eps=cfg.gbar_eps,
       )
 
@@ -565,6 +565,8 @@ def main(cfg: DictConfig):
       # For logging, you can return either center or perturbed loss.
       # mean_loss_pert is usually the one aligned with the actual update.
       return new_state, mean_loss_pert, key_out
+  else:
+    raise ValueError(f"Unsupported sam_mode: {cfg.sam_mode}")
 
   def train_step(state, precond_blocks, train_dataloader, dropout_key):
     x_acc, y_acc = utl.next_accumulated_batches(train_dataloader, cfg.grad_acc_steps)

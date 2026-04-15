@@ -1393,11 +1393,54 @@ def tree_normalize_per_layer(tree, eps=1e-12):
   norms = tree_l2_norm_per_layer(tree, eps)
   return jax.tree_map(lambda sub, n: jax.tree_map(lambda x: x / n, sub), tree, norms)
 
-# -----------------------------
-# New strategy: noise-aligned perturbation
-#   v := g_last - g_bar   (proxy for batch noise)
-#   eps := rho * P v / sqrt(v^T P v)
-# -----------------------------
+def make_perturbation_from_vector(
+    *,
+    precond_blocks,
+    vector,
+    precond_apply_fn,
+    rho: float,
+    mode: str,
+    eps: float = 1e-12,
+):
+  """Build a perturbation tree from an already chosen perturbation vector."""
+  vector = jax.lax.stop_gradient(vector)
+
+  if mode == "ema_grad":
+    transformed = vector
+  elif mode == "ema_precond_grad":
+    transformed = precond_apply_fn(precond_blocks, vector)
+  elif mode == "ema_direction":
+    transformed = precond_apply_fn(precond_blocks, vector)
+    transformed = tree_normalize(transformed, eps)
+  else:
+    raise ValueError(f"Unknown perturb_mode: {mode}")
+
+  # sqrt(v^T P^T P v). Less principled than sqrt(v^T P v), but more stable.
+  denom = jnp.sqrt(tree_dot(transformed, transformed) + eps)
+  direction = tree_mul_scalar(transformed, 1.0 / denom)
+  return tree_mul_scalar(direction, rho)
+
+
+def make_perturbation_from_grad(
+    *,
+    precond_blocks,
+    grad,
+    precond_apply_fn,
+    rho: float,
+    mode: str,
+    eps: float = 1e-12,
+):
+  """Thin wrapper for SAM-style perturbations built directly from a gradient."""
+  return make_perturbation_from_vector(
+    precond_blocks=precond_blocks,
+    vector=grad,
+    precond_apply_fn=precond_apply_fn,
+    rho=rho,
+    mode=mode,
+    eps=eps,
+  )
+
+
 def make_perturbation_from_noise(
     precond_blocks,
     g_last,
@@ -1409,40 +1452,19 @@ def make_perturbation_from_noise(
 ):
   """
   Returns epsilon pytree to add to params, where direction is aligned with
-  the "noise proxy" v = g_last - g_bar, and scaled in the P^{-1}-metric.
-
-  epsilon = rho * P v / sqrt(v^T P v)
-
-  All computations are stop_gradient'ed to avoid higher-order deps.
+  the "noise proxy" v = g_last - g_bar.
   """
   g_last = jax.lax.stop_gradient(g_last)
   g_bar  = jax.lax.stop_gradient(g_bar)
-  # if mode == "ema_grad":
-  #   g_last = g_last
-  #
-  # elif mode == "ema_precond_grad":
-  #   g_last = precond_apply_fn(precond_blocks, g_last)  # P g^{pert}
-  #
-  # elif mode == "ema_direction":
-  #   g_last = precond_apply_fn(precond_blocks, g_last)
-  #   g_last = tree_normalize(g_last, eps)  # unit direction in P-space
-
-  v = tree_sub(g_last, g_bar)                 # noise proxy
-  if mode == "ema_grad":
-    Pv = v
-  elif mode == "ema_precond_grad":
-    Pv = precond_apply_fn(precond_blocks, v)        # P v
-  elif mode == "ema_direction":
-    Pv = precond_apply_fn(precond_blocks, v)
-    Pv = tree_normalize(Pv, eps)  # unit direction in P-space
-  else:
-    raise ValueError(f"Unknown gbar_mode: {mode}")
-  # denom = jnp.sqrt(tree_dot(v, Pv) + eps)  # sqrt(v^T P v)
-  denom = jnp.sqrt(tree_dot(Pv, Pv) + eps)     # sqrt(v^T P^T P v) Less principled, but seems more numerically stable
-
-  direction = tree_mul_scalar(Pv, 1.0 / denom)
-  eps_tree = tree_mul_scalar(direction, rho)
-  return eps_tree
+  v = tree_sub(g_last, g_bar)
+  return make_perturbation_from_vector(
+    precond_blocks=precond_blocks,
+    vector=v,
+    precond_apply_fn=precond_apply_fn,
+    rho=rho,
+    mode=mode,
+    eps=eps,
+  )
 
 
 def update_gbar(
@@ -1471,7 +1493,7 @@ def update_gbar(
   #   target = tree_normalize(Pg, eps)  # unit direction in P-space
   #
   # else:
-  #   raise ValueError(f"Unknown gbar_mode: {mode}")
+  #   raise ValueError(f"Unknown perturb_mode: {mode}")
 
   target = mean_grads_pert
 

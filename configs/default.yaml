@@ -55,10 +55,10 @@ ema_decay: 0.0 # EMA decay value for updating the preconditioner
 preempt_handling: false
 jobid: null  # To manually restart a previous job
 
-# Asam training options
-fsam_mode: null # "base_fsam" | "past_fsam"
-asam_rho: 0.1
-gbar_mode: 'ema_grad' # "ema_grad" | "ema_precond_grad" | "ema_direction"
+# SAM / Friendly-SAM training options
+sam_mode: null # "base_fsam" | "past_fsam"
+perturbation_rho: 0.1
+perturb_mode: 'ema_grad' # "ema_grad" | "ema_precond_grad" | "ema_direction"
 gbar_beta: 0.9
 gbar_eps: 1e-12
 batch_overlap_fraction: 0.0 #Roll-out strategy over minibatches, for past_fsam
