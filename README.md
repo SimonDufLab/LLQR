@@ -25,7 +25,7 @@ python run.py experiment=resnet18-cifar10
 - `lqr_optimizer/_src/preconditioner.py`: relaxed LLQR preconditioner logic
 - `lqr_optimizer/_src/exact_methods.py`: exact or benchmark-style second-order helpers
 - `lqr_optimizer/_src/utils/build_lqr.py`: LQR object construction from model linearization
-- `lqr_optimizer/_src/utils/build_lqr_segments.py`: grouped full-batch LLQR segment builders for split execution-stage models
+- `lqr_optimizer/_src/utils/build_lqr_segments.py`: grouped LLQR segment builders used by full-batch and chunked split execution-stage updates
 - `lqr_optimizer/_src/models/`: architecture definitions
 - `lqr_optimizer/_src/block_matrices_approx/`: structured inverse-preconditioner parameterizations
 

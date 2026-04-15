@@ -914,6 +914,14 @@ class BasePreconditioner(abc.ABC):
     self._use_spectral_norm = bool(use_spectral_norm)
     self._llqr_batch_experimental_mode = llqr_batch_experimental_mode
     self._llqr_batch_chunk_size = None if llqr_batch_chunk_size is None else int(llqr_batch_chunk_size)
+    if (
+      self._llqr_batch_experimental_mode == "rm_param_only"
+      and self._use_execution_stage_active_path
+      and not self._lqr_segment_specs
+    ):
+      raise ValueError(
+        "Chunked grouped LLQR updates require resolved LLQR segment descriptors."
+      )
     if normalize_grad_for_lqr:
       self._normalize_grad_for_lqr_fn = normalize_gradient
     else:
@@ -925,13 +933,13 @@ class BasePreconditioner(abc.ABC):
                                                             precond_on_update=self._precond_on_update)
     self._batch_experimental_update_gate = self._batch_experimental_execution_stage_update_gate_details()
     self._last_batch_experimental_update_route = None
-    self._experimental_execution_chunk_loss_gradients_fn = None
-    self._experimental_execution_chunk_grad_only_fn = None
-    self._experimental_execution_chunk_value_and_grad_fn = None
+    self._experimental_grouped_chunk_loss_gradients_fn = None
+    self._experimental_grouped_chunk_grad_only_fn = None
+    self._experimental_grouped_chunk_value_and_grad_fn = None
     if self._uses_batch_experimental_execution_stage_update_path():
-      (self._experimental_execution_chunk_loss_gradients_fn,
-       self._experimental_execution_chunk_grad_only_fn,
-       self._experimental_execution_chunk_value_and_grad_fn) = self._get_execution_stage_chunked_update_helpers(
+      (self._experimental_grouped_chunk_loss_gradients_fn,
+       self._experimental_grouped_chunk_grad_only_fn,
+       self._experimental_grouped_chunk_value_and_grad_fn) = self._get_grouped_chunked_update_helpers(
          precond_on_update=self._precond_on_update
        )
     # self._jit_apply_fn = jax.jit(
@@ -971,15 +979,23 @@ class BasePreconditioner(abc.ABC):
   def _uses_active_fast_paths(self):
     return self._llqr_use_fast_paths and not self._use_spectral_norm
 
+  def _uses_grouped_execution_stage_operator_path(self):
+    return self._use_execution_stage_active_path and bool(self._lqr_segment_specs)
+
   def _uses_grouped_full_batch_execution_stage_path(self):
     return (
-      self._use_execution_stage_active_path
-      and bool(self._lqr_segment_specs)
+      self._uses_grouped_execution_stage_operator_path()
       and self._resolved_batch_experimental_mode() == "none"
     )
 
+  def _uses_grouped_chunked_execution_stage_path(self):
+    return (
+      self._uses_batch_experimental_execution_stage_update_path()
+      and self._uses_grouped_execution_stage_operator_path()
+    )
+
   def describe_llqr_operator_route(self):
-    if self._uses_grouped_full_batch_execution_stage_path():
+    if self._uses_grouped_execution_stage_operator_path():
       operator_granularity = "lqr_segment"
     elif self._use_execution_stage_active_path:
       operator_granularity = "execution_stage"
@@ -992,6 +1008,7 @@ class BasePreconditioner(abc.ABC):
       "controlled_param_count": len(self._layer_names),
       "llqr_operator_mode": self._llqr_operator_mode,
       "uses_grouped_full_batch_path": self._uses_grouped_full_batch_execution_stage_path(),
+      "uses_grouped_chunked_path": self._uses_grouped_chunked_execution_stage_path(),
       "uses_fast_paths": self._uses_active_fast_paths(),
     }
 
@@ -1021,6 +1038,9 @@ class BasePreconditioner(abc.ABC):
       "batch_solve_precond": bool(self._batch_solve_precond),
       "multibatch": bool(self._multibatch),
       "uses_streamed_execution_stage_update_path": not blocked_by,
+      "uses_streamed_lqr_segment_update_path": (
+        not blocked_by and self._uses_grouped_execution_stage_operator_path()
+      ),
       "blocked_by": blocked_by,
     }
 
@@ -1051,6 +1071,7 @@ class BasePreconditioner(abc.ABC):
       "route": route,
       "precond_batch_size": int(precond_batch_size),
     })
+    route_info.update(self.describe_llqr_operator_route())
     if layout is not None:
       route_info["layout"] = self._serialize_batch_layout(layout)
       route_info["layout_supported"] = bool(_supports_chunked_execution_stage_update_layout(layout))
@@ -1106,7 +1127,7 @@ class BasePreconditioner(abc.ABC):
 
 
   def _get_evaluate_lqr(self, optax_solver=None, steps=1, batch_solve_precond=True, multibatch=False, precond_on_update=False):
-    use_grouped_full_batch_execution_stage_path = self._uses_grouped_full_batch_execution_stage_path()
+    use_grouped_execution_stage_operator_path = self._uses_grouped_execution_stage_operator_path()
 
     def compute_loss(_params, _other_model_variables, x, y):
       if type(_other_model_variables) is FrozenDict:
@@ -1131,7 +1152,7 @@ class BasePreconditioner(abc.ABC):
             param_unravel_fns=self._controlled_stage_unravel_fns,
             flat_param_sizes=self._controlled_stage_flat_param_sizes,
           ) if use_shared_active_metadata_runtime else None
-          if use_grouped_full_batch_execution_stage_path:
+          if use_grouped_execution_stage_operator_path:
             if use_lowmem_active_transition_mode:
               segment_operators, states = lqr_active_segment_forward_operators_and_states_lowmem(
                 inputs, params, self._execution_stage_apply, self._lqr_segment_specs, other_model_variables,
@@ -1175,7 +1196,7 @@ class BasePreconditioner(abc.ABC):
           self._loss_fn, states[-1], targets, div_f=self._divergence_function, div_arg=div_arg
         )
         if self._use_execution_stage_active_path:
-          if use_grouped_full_batch_execution_stage_path:
+          if use_grouped_execution_stage_operator_path:
             if use_lowmem_active_k_mode:
               segment_k_operators = lqr_active_segment_backward_hamiltonian_operators_lowmem(
                 params, states, final_p, segment_operators, self._execution_stage_apply,
@@ -1213,7 +1234,7 @@ class BasePreconditioner(abc.ABC):
               batch_chunk_size=self._resolved_batch_chunk_size(),
               batch_axis=batch_axis,
             )
-          if not use_grouped_full_batch_execution_stage_path:
+          if not use_grouped_execution_stage_operator_path:
             gradients = _recover_loss_gradients_from_execution_stage_transposes(
               self._layer_names, self._execution_stage_specs, execution_stage_operators, final_lin_cost,
               self._controlled_stage_unravel_fns, freeze_result=isinstance(params, FrozenDict)
@@ -1245,7 +1266,7 @@ class BasePreconditioner(abc.ABC):
         prepared_gradients = self._block_structure.prepare_train_vectors(gradients)
 
         if self._use_execution_stage_active_path:
-          if use_grouped_full_batch_execution_stage_path:
+          if use_grouped_execution_stage_operator_path:
             return prepared_gradients, (segment_operators, segment_k_operators, final_q, final_lin_cost)
           return prepared_gradients, (execution_stage_operators, stage_k_operators, final_q, final_lin_cost)
 
@@ -1255,7 +1276,7 @@ class BasePreconditioner(abc.ABC):
 
       # def lqr_cost(_preconditioner, input_size, gradients, kernel_shapes, operators):
       def lqr_cost(_preconditioner, prepared_gradients, operators):
-        if use_grouped_full_batch_execution_stage_path:
+        if use_grouped_execution_stage_operator_path:
           segment_operators, segment_k_operators, final_q, final_lin_cost = operators
           flat_controls = _materialize_active_flat_controls(
             self._block_structure, _preconditioner, self._layer_names, prepared_gradients
@@ -1306,7 +1327,7 @@ class BasePreconditioner(abc.ABC):
         return grads
 
       def lqr_grad_only_fn(_preconditioner, prepared_gradients, operators):
-        if use_grouped_full_batch_execution_stage_path:
+        if use_grouped_execution_stage_operator_path:
           grads = _recover_preconditioner_gradients_from_active_lqr_segment_control_adjoint(
             self._block_structure, _preconditioner, self._layer_names, self._lqr_segment_specs,
             prepared_gradients, operators
@@ -1322,7 +1343,7 @@ class BasePreconditioner(abc.ABC):
         return _sanitize_preconditioner_grads(grads)
 
       def lqr_value_and_grad_fn(_preconditioner, prepared_gradients, operators):
-        if use_grouped_full_batch_execution_stage_path:
+        if use_grouped_execution_stage_operator_path:
           value, grads = _active_lqr_segment_preconditioner_value_and_grad_from_control_adjoint(
             self._block_structure, _preconditioner, self._layer_names, self._lqr_segment_specs,
             prepared_gradients, operators
@@ -1500,13 +1521,14 @@ class BasePreconditioner(abc.ABC):
 
       return get_update
 
-  def _get_execution_stage_chunked_update_helpers(self, *, precond_on_update=False):
+  def _get_grouped_chunked_update_helpers(self, *, precond_on_update=False):
     def _sanitize_preconditioner_grads(grads):
       return jax.tree_map(Partial(jnp.nan_to_num, nan=0.0, posinf=1.0, neginf=-1.0), grads)
 
-    def build_execution_stage_problem(params, other_model_variables, datapoint, trainstate_opt_state,
+    def build_grouped_segment_problem(params, other_model_variables, datapoint, trainstate_opt_state,
                                       loss_scale, batch_axis, *,
-                                      include_stage_k):
+                                      include_segment_k):
+      del batch_axis
       inputs, targets = datapoint
       prepared_stage_metadata = prepare_active_execution_stage_metadata(
         params,
@@ -1515,11 +1537,11 @@ class BasePreconditioner(abc.ABC):
         param_unravel_fns=self._controlled_stage_unravel_fns,
         flat_param_sizes=self._controlled_stage_flat_param_sizes,
       ) if self._should_use_shared_active_metadata_runtime() else None
-      execution_stage_operators, states = lqr_active_execution_forward_operators_and_states(
+      segment_operators, states = lqr_active_segment_forward_operators_and_states(
         inputs,
         params,
         self._execution_stage_apply,
-        self._execution_stage_specs,
+        self._lqr_segment_specs,
         other_model_variables,
         prepared_stage_metadata=prepared_stage_metadata,
       )
@@ -1536,29 +1558,25 @@ class BasePreconditioner(abc.ABC):
         div_arg=div_arg,
       )
 
-      stage_k_operators = None
-      if include_stage_k:
-        stage_k_operators = lqr_active_execution_backward_hamiltonian_operators(
+      segment_k_operators = None
+      if include_segment_k:
+        segment_k_operators = lqr_active_segment_backward_hamiltonian_operators(
           params,
           states,
           final_p,
-          execution_stage_operators,
+          segment_operators,
           self._execution_stage_apply,
-          self._execution_stage_specs,
+          self._lqr_segment_specs,
           self._damping,
           other_model_variables,
-          layer_modules=self._layer_modules,
           prepared_stage_metadata=prepared_stage_metadata,
           use_fast_paths=self._uses_active_fast_paths(),
-          batch_experimental_mode=self._resolved_batch_experimental_mode(),
-          batch_chunk_size=self._resolved_batch_chunk_size(),
-          batch_axis=batch_axis,
         )
 
-      gradients = _recover_loss_gradients_from_execution_stage_transposes(
+      gradients = _recover_loss_gradients_from_lqr_segment_transposes(
         self._layer_names,
-        self._execution_stage_specs,
-        execution_stage_operators,
+        self._lqr_segment_specs,
+        segment_operators,
         final_lin_cost,
         self._controlled_stage_unravel_fns,
         freeze_result=isinstance(params, FrozenDict),
@@ -1569,41 +1587,41 @@ class BasePreconditioner(abc.ABC):
       gradients = jax.tree_map(lambda v: -1.0 * v, gradients)
 
       operators = None
-      if include_stage_k:
-        operators = (execution_stage_operators, stage_k_operators, final_q, final_lin_cost)
+      if include_segment_k:
+        operators = (segment_operators, segment_k_operators, final_q, final_lin_cost)
       return gradients, operators
 
     @Partial(jax.jit, static_argnums=(5,))
     def get_chunk_loss_gradients(params, other_model_variables, datapoint, trainstate_opt_state,
                                  loss_scale, batch_axis):
-      gradients, _ = build_execution_stage_problem(
+      gradients, _ = build_grouped_segment_problem(
         params,
         other_model_variables,
         datapoint,
         trainstate_opt_state,
         loss_scale,
         batch_axis,
-        include_stage_k=False,
+        include_segment_k=False,
       )
       return gradients
 
     @Partial(jax.jit, static_argnums=(7,))
     def get_chunk_grad_only(preconditioner, params, other_model_variables, datapoint,
                             trainstate_opt_state, prepared_gradients, loss_scale, batch_axis):
-      _, operators = build_execution_stage_problem(
+      _, operators = build_grouped_segment_problem(
         params,
         other_model_variables,
         datapoint,
         trainstate_opt_state,
         loss_scale,
         batch_axis,
-        include_stage_k=True,
+        include_segment_k=True,
       )
-      grads = _recover_preconditioner_gradients_from_active_execution_control_adjoint(
+      grads = _recover_preconditioner_gradients_from_active_lqr_segment_control_adjoint(
         self._block_structure,
         preconditioner,
         self._layer_names,
-        self._execution_stage_specs,
+        self._lqr_segment_specs,
         prepared_gradients,
         operators,
       )
@@ -1612,20 +1630,20 @@ class BasePreconditioner(abc.ABC):
     @Partial(jax.jit, static_argnums=(7,))
     def get_chunk_value_and_grad(preconditioner, params, other_model_variables, datapoint,
                                  trainstate_opt_state, prepared_gradients, loss_scale, batch_axis):
-      _, operators = build_execution_stage_problem(
+      _, operators = build_grouped_segment_problem(
         params,
         other_model_variables,
         datapoint,
         trainstate_opt_state,
         loss_scale,
         batch_axis,
-        include_stage_k=True,
+        include_segment_k=True,
       )
-      value, grads = _active_execution_preconditioner_value_and_grad_from_control_adjoint(
+      value, grads = _active_lqr_segment_preconditioner_value_and_grad_from_control_adjoint(
         self._block_structure,
         preconditioner,
         self._layer_names,
-        self._execution_stage_specs,
+        self._lqr_segment_specs,
         prepared_gradients,
         operators,
       )
@@ -1633,16 +1651,16 @@ class BasePreconditioner(abc.ABC):
 
     return get_chunk_loss_gradients, get_chunk_grad_only, get_chunk_value_and_grad
 
-  def _accumulate_execution_stage_chunked_prepared_gradients(self, params, other_model_variables,
-                                                             chunk_datapoints, chunk_weights, batch_axis,
-                                                             trainstate_opt_state):
+  def _accumulate_grouped_chunked_prepared_gradients(self, params, other_model_variables,
+                                                     chunk_datapoints, chunk_weights, batch_axis,
+                                                     trainstate_opt_state):
     total_weight = float(sum(chunk_weights))
     if total_weight <= 0:
-      raise ValueError("Expected a positive effective loss count for chunked execution-stage updates")
+      raise ValueError("Expected a positive effective loss count for chunked grouped LLQR updates")
 
     accumulated_gradients = None
     for chunk_datapoint, chunk_weight in zip(chunk_datapoints, chunk_weights):
-      gradients = self._experimental_execution_chunk_loss_gradients_fn(
+      gradients = self._experimental_grouped_chunk_loss_gradients_fn(
         params,
         other_model_variables,
         chunk_datapoint,
@@ -1657,13 +1675,13 @@ class BasePreconditioner(abc.ABC):
 
     return self._block_structure.prepare_train_vectors(accumulated_gradients)
 
-  def _experimental_execution_stage_grad_only(self, preconditioner, params, other_model_variables,
+  def _experimental_grouped_chunked_grad_only(self, preconditioner, params, other_model_variables,
                                               chunk_datapoints, chunk_weights, batch_axis, trainstate_opt_state,
                                               prepared_gradients):
     total_weight = float(sum(chunk_weights))
     accumulated_grads = None
     for chunk_datapoint, chunk_weight in zip(chunk_datapoints, chunk_weights):
-      grads = self._experimental_execution_chunk_grad_only_fn(
+      grads = self._experimental_grouped_chunk_grad_only_fn(
         preconditioner,
         params,
         other_model_variables,
@@ -1679,14 +1697,14 @@ class BasePreconditioner(abc.ABC):
         accumulated_grads = _tree_add(accumulated_grads, grads)
     return accumulated_grads
 
-  def _experimental_execution_stage_value_and_grad(self, preconditioner, params, other_model_variables,
+  def _experimental_grouped_chunked_value_and_grad(self, preconditioner, params, other_model_variables,
                                                    chunk_datapoints, chunk_weights, batch_axis, trainstate_opt_state,
                                                    prepared_gradients):
     total_weight = float(sum(chunk_weights))
     accumulated_value = 0.0
     accumulated_grads = None
     for chunk_datapoint, chunk_weight in zip(chunk_datapoints, chunk_weights):
-      value, grads = self._experimental_execution_chunk_value_and_grad_fn(
+      value, grads = self._experimental_grouped_chunk_value_and_grad_fn(
         preconditioner,
         params,
         other_model_variables,
@@ -1703,15 +1721,15 @@ class BasePreconditioner(abc.ABC):
         accumulated_grads = _tree_add(accumulated_grads, grads)
     return accumulated_value, accumulated_grads
 
-  def _run_chunked_execution_stage_update(self, preconditioner, params, precond_lr, other_model_variables,
-                                          chunk_datapoints, chunk_weights, batch_axis, trainstate_opt_state, *,
-                                          snapshot_preconditioner):
+  def _run_grouped_chunked_update(self, preconditioner, params, precond_lr, other_model_variables,
+                                  chunk_datapoints, chunk_weights, batch_axis, trainstate_opt_state, *,
+                                  snapshot_preconditioner):
     if snapshot_preconditioner:
       current_preconditioner = _deep_copy_pytree(preconditioner)
     else:
       current_preconditioner = preconditioner
 
-    prepared_gradients = self._accumulate_execution_stage_chunked_prepared_gradients(
+    prepared_gradients = self._accumulate_grouped_chunked_prepared_gradients(
       params,
       other_model_variables,
       chunk_datapoints,
@@ -1724,7 +1742,7 @@ class BasePreconditioner(abc.ABC):
     for _ in range(self._preconditioner_update_steps):
       if self._optax_solver_requires_value_and_grad:
         def chunked_value_and_grad_fn(local_preconditioner):
-          return self._experimental_execution_stage_value_and_grad(
+          return self._experimental_grouped_chunked_value_and_grad(
             local_preconditioner,
             params,
             other_model_variables,
@@ -1743,7 +1761,7 @@ class BasePreconditioner(abc.ABC):
           value_and_grad_fn=chunked_value_and_grad_fn,
         )
       else:
-        preconditioner_grad = self._experimental_execution_stage_grad_only(
+        preconditioner_grad = self._experimental_grouped_chunked_grad_only(
           current_preconditioner,
           params,
           other_model_variables,
@@ -1793,14 +1811,14 @@ class BasePreconditioner(abc.ABC):
           )
           self._record_batch_experimental_update_route(
             operation="update",
-            route="chunked_execution_stage",
+            route="chunked_lqr_segment",
             precond_batch_size=precond_batch_size,
             layout=layout,
             normalized_layout=normalized_layout,
             chunk_datapoints=normalized_chunk_datapoints,
             chunk_weights=chunk_weights,
           )
-          updated_blocks = self._run_chunked_execution_stage_update(
+          updated_blocks = self._run_grouped_chunked_update(
             _blocks,
             params,
             precond_lr,
@@ -1815,7 +1833,7 @@ class BasePreconditioner(abc.ABC):
           acc_batches = _concat_preconditioner_batches(chunk_datapoints, layout, precond_batch_size)
           self._record_batch_experimental_update_route(
             operation="update",
-            route="chunked_execution_stage_layout_fallback",
+            route="chunked_lqr_segment_layout_fallback",
             precond_batch_size=precond_batch_size,
             layout=layout,
             chunk_datapoints=chunk_datapoints,
@@ -1890,14 +1908,14 @@ class BasePreconditioner(abc.ABC):
           )
           self._record_batch_experimental_update_route(
             operation="compile",
-            route="chunked_execution_stage",
+            route="chunked_lqr_segment",
             precond_batch_size=precond_batch_size,
             layout=layout,
             normalized_layout=normalized_layout,
             chunk_datapoints=normalized_chunk_datapoints,
             chunk_weights=chunk_weights,
           )
-          blocks = self._run_chunked_execution_stage_update(
+          blocks = self._run_grouped_chunked_update(
             self._block_structure.blocks,
             params,
             precond_lr,
@@ -1912,7 +1930,7 @@ class BasePreconditioner(abc.ABC):
           acc_batches = _concat_preconditioner_batches(chunk_datapoints, layout, precond_batch_size)
           self._record_batch_experimental_update_route(
             operation="compile",
-            route="chunked_execution_stage_layout_fallback",
+            route="chunked_lqr_segment_layout_fallback",
             precond_batch_size=precond_batch_size,
             layout=layout,
             chunk_datapoints=chunk_datapoints,
