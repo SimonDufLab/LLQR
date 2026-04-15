@@ -28,6 +28,7 @@ from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
                              prepare_active_execution_stage_metadata,
                              tree_vdot)
 from lqr_optimizer._src.utils.build_lqr_segments import (
+                             VALID_LQR_SEGMENT_SECOND_ORDER_MODES,
                              lqr_active_segment_forward_operators_and_states,
                              lqr_active_segment_forward_operators_and_states_lowmem,
                              lqr_active_segment_backward_hamiltonian_operators,
@@ -65,6 +66,7 @@ BLOCK_STRUCTURE_DICT = {
 VALID_LLQR_OPERATOR_MODES = ("cached_exact", "lowmem_exact_k", "lowmem_exact_full")
 VALID_LLQR_CHECKPOINT_POLICIES = ("none", "dots_no_batch_dims")
 VALID_LLQR_BATCH_EXPERIMENTAL_MODES = ("none", "rm_param_only")
+VALID_LLQR_SECOND_ORDER_MODES = VALID_LQR_SEGMENT_SECOND_ORDER_MODES
 
 
 def _tree_add(lhs, rhs):
@@ -840,6 +842,8 @@ class BasePreconditioner(abc.ABC):
                llqr_use_fast_paths: bool = True,
                llqr_batch_experimental_mode: str = "none",
                llqr_batch_chunk_size = None,
+               llqr_second_order_mode: str = "batched_exact",
+               llqr_second_order_chunk_size = None,
                use_spectral_norm: bool = False,
                optax_solver_requires_value_and_grad: bool = False):
     self._divergence_function = divergence_function
@@ -892,6 +896,31 @@ class BasePreconditioner(abc.ABC):
         "Unknown llqr_batch_experimental_mode "
         f"'{llqr_batch_experimental_mode}'. Expected one of {VALID_LLQR_BATCH_EXPERIMENTAL_MODES}."
       )
+    if llqr_second_order_mode not in VALID_LLQR_SECOND_ORDER_MODES:
+      raise ValueError(
+        "Unknown llqr_second_order_mode "
+        f"'{llqr_second_order_mode}'. Expected one of {VALID_LLQR_SECOND_ORDER_MODES}."
+      )
+    if llqr_second_order_mode == "batched_exact":
+      if llqr_second_order_chunk_size is not None:
+        raise ValueError("llqr_second_order_chunk_size must be null when llqr_second_order_mode='batched_exact'.")
+    else:
+      if llqr_second_order_chunk_size is not None:
+        if (
+            not isinstance(llqr_second_order_chunk_size, numbers.Integral)
+            or isinstance(llqr_second_order_chunk_size, bool)
+            or int(llqr_second_order_chunk_size) <= 0
+        ):
+          raise ValueError(
+            "llqr_second_order_chunk_size must be a positive integer when "
+            "llqr_second_order_mode='sample_separable_exact'."
+          )
+      if not batch_solve_precond:
+        raise ValueError("llqr_second_order_mode='sample_separable_exact' requires batch_solve_precond=True.")
+      if not self._uses_grouped_execution_stage_operator_path():
+        raise ValueError(
+          "llqr_second_order_mode='sample_separable_exact' requires a grouped LLQR segment operator path."
+        )
     if llqr_batch_experimental_mode == "none":
       if llqr_batch_chunk_size is not None:
         raise ValueError("llqr_batch_chunk_size must be null when llqr_batch_experimental_mode='none'.")
@@ -914,6 +943,10 @@ class BasePreconditioner(abc.ABC):
     self._use_spectral_norm = bool(use_spectral_norm)
     self._llqr_batch_experimental_mode = llqr_batch_experimental_mode
     self._llqr_batch_chunk_size = None if llqr_batch_chunk_size is None else int(llqr_batch_chunk_size)
+    self._llqr_second_order_mode = llqr_second_order_mode
+    self._llqr_second_order_chunk_size = (
+      None if llqr_second_order_chunk_size is None else int(llqr_second_order_chunk_size)
+    )
     if (
       self._llqr_batch_experimental_mode == "rm_param_only"
       and self._use_execution_stage_active_path
@@ -1001,7 +1034,7 @@ class BasePreconditioner(abc.ABC):
       operator_granularity = "execution_stage"
     else:
       operator_granularity = "controlled_layer"
-    return {
+    route = {
       "operator_granularity": operator_granularity,
       "execution_stage_count": len(self._execution_stage_specs),
       "lqr_segment_count": len(self._lqr_segment_specs),
@@ -1011,6 +1044,8 @@ class BasePreconditioner(abc.ABC):
       "uses_grouped_chunked_path": self._uses_grouped_chunked_execution_stage_path(),
       "uses_fast_paths": self._uses_active_fast_paths(),
     }
+    route.update(self._second_order_route_details())
+    return route
 
   def _uses_batch_experimental_rm_param_only_mode(self):
     return self._llqr_batch_experimental_mode == "rm_param_only"
@@ -1020,6 +1055,62 @@ class BasePreconditioner(abc.ABC):
 
   def _resolved_batch_chunk_size(self):
     return self._llqr_batch_chunk_size
+
+  def _uses_sample_separable_second_order(self):
+    return self._llqr_second_order_mode == "sample_separable_exact"
+
+  def _resolved_second_order_chunk_size(self, *, fallback_batch_size):
+    if not self._uses_sample_separable_second_order():
+      return None
+    if self._llqr_second_order_chunk_size is not None:
+      return self._llqr_second_order_chunk_size
+    return int(fallback_batch_size)
+
+  def _second_order_route_details(self, *, precond_batch_size=None, batch_axis=None,
+                                  chunk_datapoints=None, fallback_chunk_size=None):
+    details = {
+      "second_order_mode": self._llqr_second_order_mode,
+      "configured_second_order_chunk_size": self._llqr_second_order_chunk_size,
+      "uses_sample_separable_second_order": self._uses_sample_separable_second_order(),
+      "resolved_second_order_chunk_size": None,
+      "second_order_batch_axis": None,
+      "second_order_chunk_count": None,
+    }
+    if not self._uses_sample_separable_second_order():
+      return details
+
+    resolved_batch_axis = 0 if batch_axis is None else int(batch_axis)
+    if fallback_chunk_size is None:
+      fallback_chunk_size = precond_batch_size
+    if fallback_chunk_size is None:
+      if self._llqr_second_order_chunk_size is not None:
+        details.update({
+          "resolved_second_order_chunk_size": int(self._llqr_second_order_chunk_size),
+          "second_order_batch_axis": resolved_batch_axis,
+        })
+      return details
+    resolved_chunk_size = self._resolved_second_order_chunk_size(
+      fallback_batch_size=fallback_chunk_size
+    )
+
+    if chunk_datapoints is None:
+      if precond_batch_size is None:
+        chunk_count = None
+      else:
+        chunk_count = (int(precond_batch_size) + resolved_chunk_size - 1) // resolved_chunk_size
+    else:
+      chunk_count = sum(
+        (_batch_size_from_datapoint(chunk_datapoint, resolved_batch_axis) + resolved_chunk_size - 1)
+        // resolved_chunk_size
+        for chunk_datapoint in chunk_datapoints
+      )
+
+    details.update({
+      "resolved_second_order_chunk_size": int(resolved_chunk_size),
+      "second_order_batch_axis": resolved_batch_axis,
+      "second_order_chunk_count": None if chunk_count is None else int(chunk_count),
+    })
+    return details
 
   def _batch_experimental_execution_stage_update_gate_details(self):
     blocked_by = []
@@ -1031,7 +1122,7 @@ class BasePreconditioner(abc.ABC):
       blocked_by.append("batch_solve_precond_disabled")
     if self._multibatch:
       blocked_by.append("multibatch_enabled")
-    return {
+    gate_details = {
       "batch_experimental_mode": self._resolved_batch_experimental_mode(),
       "batch_chunk_size": self._resolved_batch_chunk_size(),
       "use_execution_stage_active_path": bool(self._use_execution_stage_active_path),
@@ -1043,6 +1134,8 @@ class BasePreconditioner(abc.ABC):
       ),
       "blocked_by": blocked_by,
     }
+    gate_details.update(self._second_order_route_details())
+    return gate_details
 
   def describe_batch_experimental_update_gate(self):
     return dict(self._batch_experimental_update_gate)
@@ -1072,6 +1165,26 @@ class BasePreconditioner(abc.ABC):
       "precond_batch_size": int(precond_batch_size),
     })
     route_info.update(self.describe_llqr_operator_route())
+    route_batch_axis = None
+    if normalized_layout is not None:
+      route_batch_axis = normalized_layout.get("batch_axis")
+    elif layout is not None:
+      route_batch_axis = layout.get("batch_axis")
+    fallback_chunk_size = precond_batch_size
+    if chunk_datapoints is not None and self._llqr_second_order_chunk_size is None:
+      resolved_batch_axis = 0 if route_batch_axis is None else int(route_batch_axis)
+      fallback_chunk_size = max(
+        _batch_size_from_datapoint(chunk_datapoint, resolved_batch_axis)
+        for chunk_datapoint in chunk_datapoints
+      )
+    elif chunk_datapoints is not None:
+      fallback_chunk_size = self._resolved_batch_chunk_size()
+    route_info.update(self._second_order_route_details(
+      precond_batch_size=precond_batch_size,
+      batch_axis=route_batch_axis,
+      chunk_datapoints=chunk_datapoints,
+      fallback_chunk_size=fallback_chunk_size,
+    ))
     if layout is not None:
       route_info["layout"] = self._serialize_batch_layout(layout)
       route_info["layout_supported"] = bool(_supports_chunked_execution_stage_update_layout(layout))
@@ -1137,6 +1250,12 @@ class BasePreconditioner(abc.ABC):
     if batch_solve_precond:
       def get_operators_and_gradients(params, other_model_variables, datapoint, trainstate_opt_state):
         inputs, targets = datapoint
+        second_order_batch_axis = 0 if self._uses_sample_separable_second_order() else None
+        second_order_chunk_size = None
+        if self._uses_sample_separable_second_order():
+          second_order_chunk_size = self._resolved_second_order_chunk_size(
+            fallback_batch_size=_batch_size_from_datapoint(datapoint, second_order_batch_axis)
+          )
         use_shared_active_metadata_runtime = self._should_use_shared_active_metadata_runtime()
         use_lowmem_active_transition_mode = self._uses_lowmem_active_transition_mode()
         use_lowmem_active_k_mode = self._uses_lowmem_active_k_mode()
@@ -1204,6 +1323,9 @@ class BasePreconditioner(abc.ABC):
                 prepared_stage_metadata=prepared_stage_metadata,
                 checkpoint_policy=resolved_checkpoint_policy,
                 use_fast_paths=self._uses_active_fast_paths(),
+                second_order_mode=self._llqr_second_order_mode,
+                second_order_chunk_size=second_order_chunk_size,
+                batch_axis=second_order_batch_axis,
               )
             else:
               segment_k_operators = lqr_active_segment_backward_hamiltonian_operators(
@@ -1211,6 +1333,9 @@ class BasePreconditioner(abc.ABC):
                 self._lqr_segment_specs, self._damping, other_model_variables,
                 prepared_stage_metadata=prepared_stage_metadata,
                 use_fast_paths=self._uses_active_fast_paths(),
+                second_order_mode=self._llqr_second_order_mode,
+                second_order_chunk_size=second_order_chunk_size,
+                batch_axis=second_order_batch_axis,
               )
             gradients = _recover_loss_gradients_from_lqr_segment_transposes(
               self._layer_names, self._lqr_segment_specs, segment_operators, final_lin_cost,
@@ -1528,8 +1653,13 @@ class BasePreconditioner(abc.ABC):
     def build_grouped_segment_problem(params, other_model_variables, datapoint, trainstate_opt_state,
                                       loss_scale, batch_axis, *,
                                       include_segment_k):
-      del batch_axis
       inputs, targets = datapoint
+      second_order_batch_axis = batch_axis if self._uses_sample_separable_second_order() else None
+      second_order_chunk_size = None
+      if self._uses_sample_separable_second_order():
+        second_order_chunk_size = self._resolved_second_order_chunk_size(
+          fallback_batch_size=_batch_size_from_datapoint(datapoint, second_order_batch_axis)
+        )
       prepared_stage_metadata = prepare_active_execution_stage_metadata(
         params,
         self._execution_stage_specs,
@@ -1571,6 +1701,9 @@ class BasePreconditioner(abc.ABC):
           other_model_variables,
           prepared_stage_metadata=prepared_stage_metadata,
           use_fast_paths=self._uses_active_fast_paths(),
+          second_order_mode=self._llqr_second_order_mode,
+          second_order_chunk_size=second_order_chunk_size,
+          batch_axis=second_order_batch_axis,
         )
 
       gradients = _recover_loss_gradients_from_lqr_segment_transposes(
@@ -1851,13 +1984,15 @@ class BasePreconditioner(abc.ABC):
           )
       else:
         layout, acc_batches = _take_full_preconditioner_datapoint(dataloader, precond_batch_size)
+        normalized_layout = layout
         if self._use_execution_stage_active_path:
-          _, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
+          normalized_layout, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
         self._record_batch_experimental_update_route(
           operation="update",
           route="full_batch",
           precond_batch_size=precond_batch_size,
           layout=layout,
+          normalized_layout=normalized_layout,
         )
         updated_blocks = self._update_preconditioner_fn(
           _blocks,
@@ -1941,13 +2076,15 @@ class BasePreconditioner(abc.ABC):
                                      acc_batches, opt_state)
       else:
         layout, acc_batches = _take_full_preconditioner_datapoint(dataloader, precond_batch_size)
+        normalized_layout = layout
         if self._use_execution_stage_active_path:
-          _, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
+          normalized_layout, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
         self._record_batch_experimental_update_route(
           operation="compile",
           route="full_batch",
           precond_batch_size=precond_batch_size,
           layout=layout,
+          normalized_layout=normalized_layout,
         )
         blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
                                      acc_batches, opt_state)

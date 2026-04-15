@@ -244,6 +244,8 @@ def main(cfg: DictConfig):
     llqr_use_fast_paths=cfg.llqr_use_fast_paths,
     llqr_batch_experimental_mode=cfg.llqr_batch_experimental_mode,
     llqr_batch_chunk_size=cfg.llqr_batch_chunk_size,
+    llqr_second_order_mode=cfg.llqr_second_order_mode,
+    llqr_second_order_chunk_size=cfg.llqr_second_order_chunk_size,
     optax_solver_requires_value_and_grad=utl.precond_solver_requires_value_and_grad(cfg.precond_solver),
   )
   llqr_batch_update_gate = preconditioner.describe_batch_experimental_update_gate()
