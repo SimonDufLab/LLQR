@@ -56,6 +56,21 @@ def _move_batch_axis_to_front(tree, batch_axis):
   return jax.tree_util.tree_map(move_leaf, tree)
 
 
+def _move_output_batch_axis_to_front(tree, batch_axis, batch_size):
+  def move_leaf(leaf):
+    if leaf.ndim > batch_axis and leaf.shape[batch_axis] == batch_size:
+      return jnp.moveaxis(leaf, batch_axis, 0)
+    if batch_axis == 0 and leaf.ndim >= 1 and leaf.shape[0] % batch_size == 0:
+      per_sample = leaf.shape[0] // batch_size
+      return leaf.reshape((batch_size, per_sample) + leaf.shape[1:])
+    raise ValueError(
+      "Sample-separable second-order operator could not align output cotangent "
+      f"shape {leaf.shape} with batch size {batch_size} on axis {batch_axis}."
+    )
+
+  return jax.tree_util.tree_map(move_leaf, tree)
+
+
 def _pad_and_chunk_tree(tree, chunk_size):
   leaves = jax.tree_util.tree_leaves(tree)
   if not leaves:
@@ -82,7 +97,8 @@ def _pad_and_chunk_tree(tree, chunk_size):
 
 def _prepare_chunked_state_and_output(state_batch, output_cotangent, batch_axis, chunk_size):
   moved_state = _move_batch_axis_to_front(state_batch, batch_axis)
-  moved_output = _move_batch_axis_to_front(output_cotangent, batch_axis)
+  batch_size = int(jax.tree_util.tree_leaves(moved_state)[0].shape[0])
+  moved_output = _move_output_batch_axis_to_front(output_cotangent, batch_axis, batch_size)
   state_chunks, mask = _pad_and_chunk_tree(moved_state, chunk_size)
   output_chunks, _ = _pad_and_chunk_tree(moved_output, chunk_size)
   return moved_state, state_chunks, output_chunks, mask
@@ -96,32 +112,36 @@ def _expand_single_sample_tree(tree, batch_axis):
   return jax.tree_util.tree_map(lambda leaf: jnp.expand_dims(leaf, axis=batch_axis), tree)
 
 
-def _squeeze_single_sample_tree(tree, batch_axis):
-  def squeeze_leaf(leaf):
-    if leaf.ndim <= batch_axis:
-      raise ValueError(
-        f"Sample-separable second-order operator expected output batch axis {batch_axis} "
-        f"to exist on every leaf, got shape {leaf.shape}"
-      )
-    return jnp.squeeze(leaf, axis=batch_axis)
+def _extract_single_sample_output_tree(tree, batch_axis, reference_sample_output):
+  def extract_leaf(leaf, reference):
+    if leaf.shape == reference.shape:
+      return leaf
+    if leaf.ndim > batch_axis and leaf.shape[batch_axis] == 1:
+      squeezed = jnp.squeeze(leaf, axis=batch_axis)
+      if squeezed.shape == reference.shape:
+        return squeezed
+    raise ValueError(
+      "Sample-separable second-order operator could not align single-sample "
+      f"output shape {leaf.shape} with cotangent shape {reference.shape}."
+    )
 
-  return jax.tree_util.tree_map(squeeze_leaf, tree)
+  return jax.tree_util.tree_map(extract_leaf, tree, reference_sample_output)
 
 
 def _single_sample_apply(apply_batched, batch_axis):
-  def apply_single(params, sample_state):
+  def apply_single(params, sample_state, sample_output_cotangent):
     batched_state = _expand_single_sample_tree(sample_state, batch_axis)
     batched_output = apply_batched(params, batched_state)
-    return _squeeze_single_sample_tree(batched_output, batch_axis)
+    return _extract_single_sample_output_tree(batched_output, batch_axis, sample_output_cotangent)
 
   return apply_single
 
 
 def _single_sample_state_only_apply(apply_state_batched, batch_axis):
-  def apply_single(sample_state):
+  def apply_single(sample_state, sample_output_cotangent):
     batched_state = _expand_single_sample_tree(sample_state, batch_axis)
     batched_output = apply_state_batched(batched_state)
-    return _squeeze_single_sample_tree(batched_output, batch_axis)
+    return _extract_single_sample_output_tree(batched_output, batch_axis, sample_output_cotangent)
 
   return apply_single
 
@@ -177,7 +197,8 @@ def build_sample_separable_second_order_actions(apply_batched, params, state_bat
   apply_single = _single_sample_apply(apply_batched, batch_axis)
 
   def sample_hamiltonian(current_params, sample_state, sample_output_cotangent):
-    return _tree_vdot(apply_single(current_params, sample_state), sample_output_cotangent)
+    return _tree_vdot(apply_single(current_params, sample_state, sample_output_cotangent),
+                      sample_output_cotangent)
 
   grad_params = jax.grad(sample_hamiltonian, argnums=0)
   grad_state = jax.grad(sample_hamiltonian, argnums=1)
@@ -268,7 +289,7 @@ def build_sample_separable_state_only_action(apply_state_batched, state_batch, o
   apply_single = _single_sample_state_only_apply(apply_state_batched, batch_axis)
 
   def sample_hamiltonian(sample_state, sample_output_cotangent):
-    return _tree_vdot(apply_single(sample_state), sample_output_cotangent)
+    return _tree_vdot(apply_single(sample_state, sample_output_cotangent), sample_output_cotangent)
 
   grad_state = jax.grad(sample_hamiltonian, argnums=0)
 

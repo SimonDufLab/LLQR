@@ -444,7 +444,13 @@ def create_gpt_model(
                 deterministic=deterministic,
             ),
         ), None),))
-        lqr_segment_descriptors.append(make_lqr_segment_descriptor("gpt_init", ("gpt_init",)))
+        lqr_segment_descriptors.append(
+            make_lqr_segment_descriptor(
+                "gpt_init",
+                ("gpt_init",),
+                sample_separable_second_order=bool(deterministic),
+            )
+        )
 
         for block_index in range(depth):
             block_mapping = []
@@ -507,7 +513,11 @@ def create_gpt_model(
 
             legacy_mapping.append(tuple(block_mapping))
             lqr_segment_descriptors.append(
-                make_lqr_segment_descriptor(f"block_{block_index}", tuple(block_stage_names))
+                make_lqr_segment_descriptor(
+                    f"block_{block_index}",
+                    tuple(block_stage_names),
+                    sample_separable_second_order=bool(deterministic),
+                )
             )
 
         final_key = add_controlled(
@@ -520,7 +530,13 @@ def create_gpt_model(
             ),
         )
         legacy_mapping.append(((final_key, None),))
-        lqr_segment_descriptors.append(make_lqr_segment_descriptor("gpt_final", ("gpt_final",)))
+        lqr_segment_descriptors.append(
+            make_lqr_segment_descriptor(
+                "gpt_final",
+                ("gpt_final",),
+                sample_separable_second_order=bool(deterministic),
+            )
+        )
 
         def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):
             return (

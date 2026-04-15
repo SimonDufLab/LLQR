@@ -407,8 +407,12 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
         part2_stage_names.extend((f"{prefix}_skip_proj_conv", f"{prefix}_skip_proj_bn"))
       part2_stage_names.append(f"{prefix}_add_relu")
       lqr_segment_descriptors.extend((
-        make_lqr_segment_descriptor(f"{prefix}_part1", part1_stage_names),
-        make_lqr_segment_descriptor(f"{prefix}_part2", tuple(part2_stage_names)),
+        make_lqr_segment_descriptor(
+          f"{prefix}_part1", part1_stage_names, sample_separable_second_order=bool(inference)
+        ),
+        make_lqr_segment_descriptor(
+          f"{prefix}_part2", tuple(part2_stage_names), sample_separable_second_order=bool(inference)
+        ),
       ))
       return (
         tuple(part1_mapping),
@@ -425,7 +429,9 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
     legacy_batch_stats_mapping.append(((stem_bn_key, ("BatchNorm_0",)),))
     add_passive("stem_relu", ReluStage(), fast_path_kind="piecewise_linear_passive", passive_state_hessian="zero")
     lqr_segment_descriptors.append(
-      make_lqr_segment_descriptor("stem", ("stem_conv", "stem_bn", "stem_relu"))
+      make_lqr_segment_descriptor(
+        "stem", ("stem_conv", "stem_bn", "stem_relu"), sample_separable_second_order=bool(inference)
+      )
     )
 
     block_specs = [
@@ -450,7 +456,9 @@ def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
 
     head_key = add_controlled("head", GPoolDenseLogSoftmax(num_classes))
     legacy_mapping.append(((head_key, None),))
-    lqr_segment_descriptors.append(make_lqr_segment_descriptor("head", ("head",)))
+    lqr_segment_descriptors.append(
+      make_lqr_segment_descriptor("head", ("head",), sample_separable_second_order=bool(inference))
+    )
 
     def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):
       return (
@@ -638,9 +646,15 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
         part3_stage_names.extend((f"{prefix}_skip_proj_conv", f"{prefix}_skip_proj_bn"))
       part3_stage_names.append(f"{prefix}_add_relu")
       lqr_segment_descriptors.extend((
-        make_lqr_segment_descriptor(f"{prefix}_part1", part1_stage_names),
-        make_lqr_segment_descriptor(f"{prefix}_part2", part2_stage_names),
-        make_lqr_segment_descriptor(f"{prefix}_part3", tuple(part3_stage_names)),
+        make_lqr_segment_descriptor(
+          f"{prefix}_part1", part1_stage_names, sample_separable_second_order=bool(inference)
+        ),
+        make_lqr_segment_descriptor(
+          f"{prefix}_part2", part2_stage_names, sample_separable_second_order=bool(inference)
+        ),
+        make_lqr_segment_descriptor(
+          f"{prefix}_part3", tuple(part3_stage_names), sample_separable_second_order=bool(inference)
+        ),
       ))
       return (
         tuple(part1_mapping),
@@ -660,7 +674,11 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
     add_passive("stem_relu", ReluStage(), fast_path_kind="piecewise_linear_passive", passive_state_hessian="zero")
     add_passive("stem_pool", MaxPoolStage(), passive_state_hessian="zero")
     lqr_segment_descriptors.append(
-      make_lqr_segment_descriptor("stem", ("stem_conv", "stem_bn", "stem_relu", "stem_pool"))
+      make_lqr_segment_descriptor(
+        "stem",
+        ("stem_conv", "stem_bn", "stem_relu", "stem_pool"),
+        sample_separable_second_order=bool(inference),
+      )
     )
 
     block_id = 0
@@ -678,7 +696,9 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
 
     head_key = add_controlled("head", GPoolDenseLogSoftmax(num_classes))
     legacy_mapping.append(((head_key, None),))
-    lqr_segment_descriptors.append(make_lqr_segment_descriptor("head", ("head",)))
+    lqr_segment_descriptors.append(
+      make_lqr_segment_descriptor("head", ("head",), sample_separable_second_order=bool(inference))
+    )
 
     def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):
       return (

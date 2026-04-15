@@ -90,11 +90,44 @@ def _validate_lqr_segment_second_order_options(second_order_mode, second_order_c
   return second_order_mode, int(second_order_chunk_size), int(batch_axis)
 
 
+def describe_lqr_segment_sample_separable_support(lqr_segment_specs):
+  unsupported_segments = []
+  supported_count = 0
+  for segment_spec in lqr_segment_specs:
+    policy = getattr(segment_spec, "sample_separable_second_order", None)
+    if policy is True:
+      supported_count += 1
+      continue
+    reason = "metadata_missing" if policy is None else "metadata_false"
+    unsupported_segments.append({"name": segment_spec.name, "reason": reason})
+  return {
+    "sample_separable_supported_segment_count": supported_count,
+    "sample_separable_unsupported_segments": unsupported_segments,
+  }
+
+
+def _validate_sample_separable_segment_support(lqr_segment_specs):
+  support = describe_lqr_segment_sample_separable_support(lqr_segment_specs)
+  if support["sample_separable_unsupported_segments"]:
+    unsupported = ", ".join(
+      f"{item['name']}:{item['reason']}"
+      for item in support["sample_separable_unsupported_segments"]
+    )
+    raise ValueError(
+      "sample_separable_exact requires every LLQR segment to declare "
+      f"sample-separable second-order support; unsupported segments: {unsupported}"
+    )
+  return support
+
+
 def describe_lqr_segment_second_order_route(lqr_segment_specs, *, second_order_mode="batched_exact",
                                             second_order_chunk_size=None, batch_axis=None):
   second_order_mode, second_order_chunk_size, batch_axis = _validate_lqr_segment_second_order_options(
     second_order_mode, second_order_chunk_size, batch_axis
   )
+  support = describe_lqr_segment_sample_separable_support(lqr_segment_specs)
+  if second_order_mode == "sample_separable_exact":
+    _validate_sample_separable_segment_support(lqr_segment_specs)
   return {
     "second_order_mode": second_order_mode,
     "second_order_chunk_size": second_order_chunk_size,
@@ -102,6 +135,7 @@ def describe_lqr_segment_second_order_route(lqr_segment_specs, *, second_order_m
     "uses_sample_separable_second_order": second_order_mode == "sample_separable_exact",
     "lqr_segment_count": len(lqr_segment_specs),
     "controlled_param_count": sum(len(segment.controlled_param_names) for segment in lqr_segment_specs),
+    **support,
   }
 
 
@@ -385,6 +419,8 @@ def _lqr_active_segment_backward_hamiltonian_operators(params, states, final_adj
   second_order_mode, second_order_chunk_size, batch_axis = _validate_lqr_segment_second_order_options(
     second_order_mode, second_order_chunk_size, batch_axis
   )
+  if second_order_mode == "sample_separable_exact":
+    _validate_sample_separable_segment_support(lqr_segment_specs)
   if prepared_stage_metadata is None:
     prepared_stage_metadata = prepare_active_execution_stage_metadata(
       params,

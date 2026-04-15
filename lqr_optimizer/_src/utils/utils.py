@@ -148,6 +148,7 @@ class StageDescriptor(NamedTuple):
 class LqrSegmentDescriptor(NamedTuple):
   name: str
   execution_stage_names: Tuple[str, ...]
+  sample_separable_second_order: Optional[bool] = None
 
 
 class ResolvedLqrSegmentDescriptor(NamedTuple):
@@ -156,6 +157,7 @@ class ResolvedLqrSegmentDescriptor(NamedTuple):
   stop_index: int
   execution_stage_descriptors: Tuple[StageDescriptor, ...]
   controlled_param_names: Tuple[str, ...]
+  sample_separable_second_order: Optional[bool] = None
 
 
 _ALLOWED_STAGE_KINDS = frozenset(("controlled", "passive"))
@@ -180,8 +182,13 @@ def make_passive_stage_descriptor(name: str, fast_path_kind: Optional[str] = Non
   )
 
 
-def make_lqr_segment_descriptor(name: str, execution_stage_names: Tuple[str, ...]) -> LqrSegmentDescriptor:
-  return LqrSegmentDescriptor(name=name, execution_stage_names=tuple(execution_stage_names))
+def make_lqr_segment_descriptor(name: str, execution_stage_names: Tuple[str, ...],
+                                sample_separable_second_order: Optional[bool] = None) -> LqrSegmentDescriptor:
+  return LqrSegmentDescriptor(
+    name=name,
+    execution_stage_names=tuple(execution_stage_names),
+    sample_separable_second_order=sample_separable_second_order,
+  )
 
 
 def validate_stage_descriptors(stage_descriptors: Tuple[StageDescriptor, ...], *, num_layers: int) -> Tuple[StageDescriptor, ...]:
@@ -254,6 +261,14 @@ def validate_lqr_segment_descriptors(lqr_segment_descriptors: Tuple[LqrSegmentDe
       raise ValueError("LLQR segment names must be non-empty.")
     if segment.name in segment_names:
       raise ValueError(f"Duplicate LLQR segment name '{segment.name}'.")
+    if (
+        segment.sample_separable_second_order is not None
+        and not isinstance(segment.sample_separable_second_order, bool)
+    ):
+      raise ValueError(
+        f"LLQR segment '{segment.name}' has invalid sample_separable_second_order policy "
+        f"'{segment.sample_separable_second_order}'. Expected None, True, or False."
+      )
     segment_names.add(segment.name)
 
     execution_stage_names = tuple(segment.execution_stage_names)
@@ -290,6 +305,7 @@ def validate_lqr_segment_descriptors(lqr_segment_descriptors: Tuple[LqrSegmentDe
         stop_index=expected_start + len(segment_indices),
         execution_stage_descriptors=segment_stage_descriptors,
         controlled_param_names=controlled_param_names,
+        sample_separable_second_order=segment.sample_separable_second_order,
       )
     )
     expected_start += len(segment_indices)

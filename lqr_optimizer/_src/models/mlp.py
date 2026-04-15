@@ -112,9 +112,9 @@ def create_mlp(num_classes: int) -> Tuple[nn.Module, None]:
     make_passive_stage_descriptor("log_softmax", passive_state_hessian="generic"),
   )
   lqr_segment_descriptors = (
-    make_lqr_segment_descriptor("dense0_relu0", ("dense0", "relu0")),
-    make_lqr_segment_descriptor("dense1_relu1", ("dense1", "relu1")),
-    make_lqr_segment_descriptor("logits_log_softmax", ("logits", "log_softmax")),
+    make_lqr_segment_descriptor("dense0_relu0", ("dense0", "relu0"), sample_separable_second_order=True),
+    make_lqr_segment_descriptor("dense1_relu1", ("dense1", "relu1"), sample_separable_second_order=True),
+    make_lqr_segment_descriptor("logits_log_softmax", ("logits", "log_softmax"), sample_separable_second_order=True),
   )
 
   def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):

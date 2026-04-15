@@ -29,6 +29,7 @@ from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
                              tree_vdot)
 from lqr_optimizer._src.utils.build_lqr_segments import (
                              VALID_LQR_SEGMENT_SECOND_ORDER_MODES,
+                             describe_lqr_segment_sample_separable_support,
                              lqr_active_segment_forward_operators_and_states,
                              lqr_active_segment_forward_operators_and_states_lowmem,
                              lqr_active_segment_backward_hamiltonian_operators,
@@ -921,6 +922,17 @@ class BasePreconditioner(abc.ABC):
         raise ValueError(
           "llqr_second_order_mode='sample_separable_exact' requires a grouped LLQR segment operator path."
         )
+      unsupported_segments = self._sample_separable_segment_support_details()[
+        "sample_separable_unsupported_segments"
+      ]
+      if unsupported_segments:
+        unsupported = ", ".join(
+          f"{item['name']}:{item['reason']}" for item in unsupported_segments
+        )
+        raise ValueError(
+          "llqr_second_order_mode='sample_separable_exact' requires sample-separable "
+          f"LLQR segment metadata; unsupported segments: {unsupported}"
+        )
     if llqr_batch_experimental_mode == "none":
       if llqr_batch_chunk_size is not None:
         raise ValueError("llqr_batch_chunk_size must be null when llqr_batch_experimental_mode='none'.")
@@ -1059,6 +1071,14 @@ class BasePreconditioner(abc.ABC):
   def _uses_sample_separable_second_order(self):
     return self._llqr_second_order_mode == "sample_separable_exact"
 
+  def _sample_separable_segment_support_details(self):
+    if not self._lqr_segment_specs:
+      return {
+        "sample_separable_supported_segment_count": 0,
+        "sample_separable_unsupported_segments": [],
+      }
+    return describe_lqr_segment_sample_separable_support(self._lqr_segment_specs)
+
   def _resolved_second_order_chunk_size(self, *, fallback_batch_size):
     if not self._uses_sample_separable_second_order():
       return None
@@ -1076,6 +1096,7 @@ class BasePreconditioner(abc.ABC):
       "second_order_batch_axis": None,
       "second_order_chunk_count": None,
     }
+    details.update(self._sample_separable_segment_support_details())
     if not self._uses_sample_separable_second_order():
       return details
 
