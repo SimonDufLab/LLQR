@@ -1508,6 +1508,61 @@ def update_gbar(
   return jax.lax.stop_gradient(new_gbar)
 
 
+def resolve_sam_state_buffers(
+    *,
+    sam_mode: str,
+    g_bar,
+    g_last,
+    mean_grads_center,
+    mean_grads_pert,
+    precond_blocks,
+    precond_apply_fn,
+    beta: float,
+    mode: str,
+    eps: float = 1e-12,
+):
+  """Return the post-step ``(gbar, g_last)`` pair for a SAM-family mode."""
+  if sam_mode == "base_sam":
+    return (
+      jax.lax.stop_gradient(g_bar),
+      jax.lax.stop_gradient(g_last),
+    )
+
+  if sam_mode == "base_fsam":
+    if mean_grads_center is None:
+      raise ValueError("base_fsam requires mean_grads_center to update gbar.")
+    return (
+      update_gbar(
+        g_bar=g_bar,
+        mean_grads_pert=mean_grads_center,
+        precond_blocks=precond_blocks,
+        precond_apply_fn=precond_apply_fn,
+        beta=beta,
+        mode=mode,
+        eps=eps,
+      ),
+      jax.lax.stop_gradient(g_last),
+    )
+
+  if sam_mode == "past_fsam":
+    if mean_grads_pert is None:
+      raise ValueError("past_fsam requires mean_grads_pert to update g_last.")
+    return (
+      update_gbar(
+        g_bar=g_bar,
+        mean_grads_pert=g_last,
+        precond_blocks=precond_blocks,
+        precond_apply_fn=precond_apply_fn,
+        beta=beta,
+        mode=mode,
+        eps=eps,
+      ),
+      jax.lax.stop_gradient(mean_grads_pert),
+    )
+
+  raise ValueError(f"Unsupported sam_mode for state-buffer updates: {sam_mode}")
+
+
 #################################
 # Checkpointing utils
 #################################

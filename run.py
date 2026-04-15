@@ -310,57 +310,116 @@ def main(cfg: DictConfig):
   def precond_apply_fn(blocks, grads):
     return preconditioner.apply(blocks, grads)
 
+  def accumulate_grads(params_for_grad, batch_stats_init, key_in, x_acc, y_acc):
+    """Accumulate loss/grads over x_acc, y_acc at fixed params_for_grad."""
+    acc_steps = x_acc.shape[0]
+    key, subkey0 = jax.random.split(key_in)
+    (loss0, new_model_state0), grads0 = compute_updates(
+      params_for_grad, batch_stats_init, x_acc[0], y_acc[0], subkey0
+    )
+
+    def body(carry, inp):
+      sum_loss, sum_grads, batch_stats, key = carry
+      x, y = inp
+      key, subkey = jax.random.split(key)
+
+      (loss, new_model_state), grads = compute_updates(
+        params_for_grad, batch_stats, x, y, subkey
+      )
+
+      sum_loss = sum_loss + loss
+      sum_grads = jax.tree_map(jnp.add, sum_grads, grads)
+      batch_stats = new_model_state["batch_stats"]
+      return (sum_loss, sum_grads, batch_stats, key), None
+
+    init = (loss0, grads0, new_model_state0["batch_stats"], key)
+    (sum_loss, sum_grads, final_batch_stats, key_out), _ = jax.lax.scan(
+      body, init, (x_acc[1:], y_acc[1:])
+    )
+
+    mean_loss = sum_loss / acc_steps
+    mean_grads = jax.tree_map(lambda v: v / acc_steps, sum_grads)
+    return mean_loss, mean_grads, final_batch_stats, key_out
+
+  def apply_training_update(state, precond_blocks, grads, batch_stats):
+    if cfg.precond_on_update:
+      return state.apply_gradients_and_precond(
+        grads=grads,
+        precond_apply=lambda g: precond_apply_fn(precond_blocks, g),
+        normalize_conv_params=cfg.normalize_conv_params,
+        batch_stats=batch_stats,
+      )
+
+    precond_grads = precond_apply_fn(precond_blocks, grads)
+    return state.apply_gradients(
+      grads=precond_grads,
+      normalize_conv_params=cfg.normalize_conv_params,
+      batch_stats=batch_stats,
+    )
+
   if not cfg.sam_mode:
     @jax.jit
     def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
-      acc_steps = x_acc.shape[0]
-
-      key, subkey0 = jax.random.split(dropout_key)
-      (loss0, new_model_state0), grads0 = compute_updates(
-        state.params, state.batch_stats, x_acc[0], y_acc[0], subkey0
+      mean_loss, mean_grads, final_batch_stats, key_out = accumulate_grads(
+        state.params, state.batch_stats, dropout_key, x_acc, y_acc
       )
-
-      def body(carry, inp):
-        sum_loss, sum_grads, batch_stats, key = carry
-        x, y = inp
-        key, subkey = jax.random.split(key)
-        (loss, new_model_state), grads = compute_updates(
-          state.params, batch_stats, x, y, subkey
-        )
-        sum_loss = sum_loss + loss
-        sum_grads = jax.tree_util.tree_map(jnp.add, sum_grads, grads)
-        batch_stats = new_model_state["batch_stats"]
-        return (sum_loss, sum_grads, batch_stats, key), None
-
-      init = (loss0, grads0, new_model_state0["batch_stats"], key)
-      (sum_loss, sum_grads, final_batch_stats, key_out), _ = jax.lax.scan(
-        body, init, (x_acc[1:], y_acc[1:])
+      new_state = apply_training_update(
+        state, precond_blocks, mean_grads, final_batch_stats
       )
-
-      mean_loss = sum_loss / acc_steps
-      mean_grads = jax.tree_util.tree_map(lambda v: v / acc_steps, sum_grads)
-
-      if cfg.precond_on_update:
-        new_state = state.apply_gradients_and_precond(
-          grads=mean_grads,
-          precond_apply=lambda g: precond_apply_fn(precond_blocks, g),
-          normalize_conv_params=cfg.normalize_conv_params,
-          batch_stats=final_batch_stats,
-        )
-      else:
-        precond_grads = precond_apply_fn(precond_blocks, mean_grads)
-        new_state = state.apply_gradients(
-          grads=precond_grads,
-          normalize_conv_params=cfg.normalize_conv_params,
-          batch_stats=final_batch_stats,
-        )
-
       return new_state, mean_loss, key_out
+  elif cfg.sam_mode=='base_sam':
+    @jax.jit
+    def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+      """
+      Vanilla SAM two-pass step.
+      --------------------------
+      1) Compute the current gradient at θ.
+      2) Build perturbation from the current gradient.
+      3) Compute the gradient at θ + ε.
+      4) Apply the update using the perturbed gradient.
+
+      Notes:
+        - gbar and g_last remain dormant under base_sam.
+        - The current fresh-RNG-per-pass behavior is preserved.
+      """
+      mean_loss_center, mean_grads_center, _, key_after_center = accumulate_grads(
+        state.params, state.batch_stats, dropout_key, x_acc, y_acc
+      )
+
+      eps_tree = utl.make_perturbation_from_grad(
+        precond_blocks=precond_blocks,
+        grad=mean_grads_center,
+        precond_apply_fn=precond_apply_fn,
+        rho=cfg.perturbation_rho,
+        mode=cfg.perturb_mode,
+        eps=cfg.gbar_eps,
+      )
+
+      params_pert = utl.tree_add(state.params, eps_tree)
+      mean_loss_pert, mean_grads_pert, final_batch_stats, key_out = accumulate_grads(
+        params_pert, state.batch_stats, key_after_center, x_acc, y_acc
+      )
+
+      new_state = apply_training_update(
+        state, precond_blocks, mean_grads_pert, final_batch_stats
+      )
+      new_gbar, new_g_last = utl.resolve_sam_state_buffers(
+        sam_mode="base_sam",
+        g_bar=state.gbar,
+        g_last=state.g_last,
+        mean_grads_center=mean_grads_center,
+        mean_grads_pert=mean_grads_pert,
+        precond_blocks=precond_blocks,
+        precond_apply_fn=precond_apply_fn,
+        beta=cfg.gbar_beta,
+        mode=cfg.perturb_mode,
+        eps=cfg.gbar_eps,
+      )
+      new_state = new_state.replace(gbar=new_gbar, g_last=new_g_last)
+      return new_state, mean_loss_pert, key_out
   elif cfg.sam_mode=='past_fsam':
     @jax.jit
     def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
-      acc_steps = x_acc.shape[0]
-
       # -----------------------------
       # 0) Build perturbation epsilon
       #    (noise-aligned: g_last - g_bar)
@@ -380,73 +439,32 @@ def main(cfg: DictConfig):
       # --------------------------------------------
       # 1) Accumulate grads at the perturbed weights
       # --------------------------------------------
-      key, subkey0 = jax.random.split(dropout_key)
-      (loss0, new_model_state0), grads0 = compute_updates(
-        params_pert, state.batch_stats, x_acc[0], y_acc[0], subkey0
+      mean_loss, mean_grads, final_batch_stats, key_out = accumulate_grads(
+        params_pert, state.batch_stats, dropout_key, x_acc, y_acc
       )
-
-      def body(carry, inp):
-        sum_loss, sum_grads, batch_stats, key = carry
-        x, y = inp
-        key, subkey = jax.random.split(key)
-
-        (loss, new_model_state), grads = compute_updates(
-          params_pert, batch_stats, x, y, subkey
-        )
-
-        sum_loss = sum_loss + loss
-        sum_grads = jax.tree_map(jnp.add, sum_grads, grads)
-        batch_stats = new_model_state["batch_stats"]
-        return (sum_loss, sum_grads, batch_stats, key), None
-
-      init = (loss0, grads0, new_model_state0["batch_stats"], key)
-      (sum_loss, sum_grads, final_batch_stats, key_out), _ = jax.lax.scan(
-        body, init, (x_acc[1:], y_acc[1:])
-      )
-
-      mean_loss = sum_loss / acc_steps
-      mean_grads = jax.tree_map(lambda v: v / acc_steps, sum_grads)  # grads at θ+ε
 
       # --------------------------------
       # 2) Apply (preconditioned) update
       # --------------------------------
-      if cfg.precond_on_update:
-        new_state = state.apply_gradients_and_precond(
-          grads=mean_grads,
-          precond_apply=lambda g: precond_apply_fn(precond_blocks, g),
-          normalize_conv_params=cfg.normalize_conv_params,
-          batch_stats=final_batch_stats,
-        )
-      else:
-        precond_grads = precond_apply_fn(precond_blocks, mean_grads)
-        new_state = state.apply_gradients(
-          grads=precond_grads,
-          normalize_conv_params=cfg.normalize_conv_params,
-          batch_stats=final_batch_stats,
-        )
-
-      # --------------------------------------
-      # 3) Update EMA buffer g_bar (no extra bwd)
-      # --------------------------------------
-      new_gbar = utl.update_gbar(
+      new_state = apply_training_update(
+        state, precond_blocks, mean_grads, final_batch_stats
+      )
+      new_gbar, new_g_last = utl.resolve_sam_state_buffers(
+        sam_mode="past_fsam",
         g_bar=state.gbar,
-        mean_grads_pert=state.g_last, #mean_grads
+        g_last=state.g_last,
+        mean_grads_center=None,
+        mean_grads_pert=mean_grads,
         precond_blocks=precond_blocks,
         precond_apply_fn=precond_apply_fn,
         beta=cfg.gbar_beta,
         mode=cfg.perturb_mode,
         eps=cfg.gbar_eps,
       )
-
-      # --------------------------------------
-      # 4) Update last-gradient buffer g_last
-      #    (store what we actually computed)
-      # --------------------------------------
       new_state = new_state.replace(
         gbar=new_gbar,
-        g_last=jax.lax.stop_gradient(mean_grads),
+        g_last=new_g_last,
       )
-
       return new_state, mean_loss, key_out
   elif cfg.sam_mode=='base_fsam':
     @jax.jit
@@ -466,43 +484,11 @@ def main(cfg: DictConfig):
         - preconditioner is used for perturbation geometry (via make_perturbation_from_noise)
           and optionally for the descent update depending on cfg.precond_on_update.
       """
-      acc_steps = x_acc.shape[0]
-
-      def accumulate_grads(params_for_grad, batch_stats_init, key_in):
-        """Accumulate loss/grads over x_acc, y_acc at fixed params_for_grad."""
-        key, subkey0 = jax.random.split(key_in)
-        (loss0, new_model_state0), grads0 = compute_updates(
-          params_for_grad, batch_stats_init, x_acc[0], y_acc[0], subkey0
-        )
-
-        def body(carry, inp):
-          sum_loss, sum_grads, batch_stats, key = carry
-          x, y = inp
-          key, subkey = jax.random.split(key)
-
-          (loss, new_model_state), grads = compute_updates(
-            params_for_grad, batch_stats, x, y, subkey
-          )
-
-          sum_loss = sum_loss + loss
-          sum_grads = jax.tree_map(jnp.add, sum_grads, grads)
-          batch_stats = new_model_state["batch_stats"]
-          return (sum_loss, sum_grads, batch_stats, key), None
-
-        init = (loss0, grads0, new_model_state0["batch_stats"], key)
-        (sum_loss, sum_grads, final_batch_stats, key_out), _ = jax.lax.scan(
-          body, init, (x_acc[1:], y_acc[1:])
-        )
-
-        mean_loss = sum_loss / acc_steps
-        mean_grads = jax.tree_map(lambda v: v / acc_steps, sum_grads)
-        return mean_loss, mean_grads, final_batch_stats, key_out
-
       # ----------------------------------------------------------
       # 0) First pass @ θ : compute fresh current gradient g_current
       # ----------------------------------------------------------
-      mean_loss_center, mean_grads_center, batch_stats_center, key_after_center = accumulate_grads(
-        state.params, state.batch_stats, dropout_key
+      mean_loss_center, mean_grads_center, _, key_after_center = accumulate_grads(
+        state.params, state.batch_stats, dropout_key, x_acc, y_acc
       )
 
       # ----------------------------------------------------------
@@ -525,43 +511,28 @@ def main(cfg: DictConfig):
       # 2) Second pass @ θ + ε : perturbed gradient for the update
       # ----------------------------------------------------------
       mean_loss_pert, mean_grads_pert, final_batch_stats, key_out = accumulate_grads(
-        params_pert, state.batch_stats, key_after_center
+        params_pert, state.batch_stats, key_after_center, x_acc, y_acc
       )
 
       # --------------------------------
       # 3) Apply (preconditioned) update
       # --------------------------------
-      if cfg.precond_on_update:
-        new_state = state.apply_gradients_and_precond(
-          grads=mean_grads_pert,
-          precond_apply=lambda g: precond_apply_fn(precond_blocks, g),
-          normalize_conv_params=cfg.normalize_conv_params,
-          batch_stats=final_batch_stats,
-        )
-      else:
-        precond_grads = precond_apply_fn(precond_blocks, mean_grads_pert)
-        new_state = state.apply_gradients(
-          grads=precond_grads,
-          normalize_conv_params=cfg.normalize_conv_params,
-          batch_stats=final_batch_stats,
-        )
-
-      # ---------------------------------------------------------
-      # 4) Update EMA buffer g_bar using CURRENT (non-perturbed) g
-      #    (keeps g_current - g_bar interpretable as a noise proxy)
-      # ---------------------------------------------------------
-      new_gbar = utl.update_gbar(
+      new_state = apply_training_update(
+        state, precond_blocks, mean_grads_pert, final_batch_stats
+      )
+      new_gbar, new_g_last = utl.resolve_sam_state_buffers(
+        sam_mode="base_fsam",
         g_bar=state.gbar,
-        mean_grads_pert=mean_grads_center,  # intentionally use center gradient here
+        g_last=state.g_last,
+        mean_grads_center=mean_grads_center,
+        mean_grads_pert=mean_grads_pert,
         precond_blocks=precond_blocks,
         precond_apply_fn=precond_apply_fn,
         beta=cfg.gbar_beta,
         mode=cfg.perturb_mode,
         eps=cfg.gbar_eps,
       )
-
-      new_state = new_state.replace(gbar=new_gbar)
-
+      new_state = new_state.replace(gbar=new_gbar, g_last=new_g_last)
       # For logging, you can return either center or perturbed loss.
       # mean_loss_pert is usually the one aligned with the actual update.
       return new_state, mean_loss_pert, key_out

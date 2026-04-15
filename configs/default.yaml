@@ -56,7 +56,7 @@ preempt_handling: false
 jobid: null  # To manually restart a previous job
 
 # SAM / Friendly-SAM training options
-sam_mode: null # "base_fsam" | "past_fsam"
+sam_mode: null # "base_sam" | "base_fsam" | "past_fsam"
 perturbation_rho: 0.1
 perturb_mode: 'ema_grad' # "ema_grad" | "ema_precond_grad" | "ema_direction"
 gbar_beta: 0.9
