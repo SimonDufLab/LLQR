@@ -1,4 +1,5 @@
 """Grouped LLQR segment builders for split execution-stage models."""
+import numbers
 from typing import NamedTuple, Optional
 
 import jax
@@ -13,6 +14,13 @@ from lqr_optimizer._src.utils.build_lqr import (
   tree_vdot,
   zero_tangent_tree_like,
 )
+from lqr_optimizer._src.utils.sample_separable_second_order import (
+  build_sample_separable_second_order_actions,
+  build_sample_separable_state_only_action,
+)
+
+
+VALID_LQR_SEGMENT_SECOND_ORDER_MODES = ("batched_exact", "sample_separable_exact")
 
 
 class ActiveLqrSegmentOperator(NamedTuple):
@@ -47,6 +55,53 @@ def _add_damping_to_segment_controls(control_action, control_tangent, damping):
   return {
     name: jnp.ravel(jnp.atleast_1d(control_action[name])) + damping * jnp.ravel(control_tangent[name])
     for name in control_tangent
+  }
+
+
+def _add_segment_control_actions(lhs, rhs):
+  return {
+    name: jnp.ravel(jnp.atleast_1d(lhs[name])) + jnp.ravel(jnp.atleast_1d(rhs[name]))
+    for name in lhs
+  }
+
+
+def _validate_lqr_segment_second_order_options(second_order_mode, second_order_chunk_size, batch_axis):
+  if second_order_mode not in VALID_LQR_SEGMENT_SECOND_ORDER_MODES:
+    raise ValueError(
+      f"Unknown second_order_mode '{second_order_mode}'. "
+      f"Expected one of {VALID_LQR_SEGMENT_SECOND_ORDER_MODES}."
+    )
+  if second_order_mode == "batched_exact":
+    if second_order_chunk_size is not None:
+      raise ValueError("second_order_chunk_size must be None when second_order_mode='batched_exact'.")
+    return second_order_mode, None, None
+
+  if (
+      not isinstance(second_order_chunk_size, numbers.Integral)
+      or isinstance(second_order_chunk_size, bool)
+      or int(second_order_chunk_size) <= 0
+  ):
+    raise ValueError(
+      "second_order_chunk_size must be a positive integer when "
+      "second_order_mode='sample_separable_exact'."
+    )
+  if not isinstance(batch_axis, numbers.Integral) or isinstance(batch_axis, bool) or int(batch_axis) < 0:
+    raise ValueError("batch_axis must be a non-negative integer when second_order_mode='sample_separable_exact'.")
+  return second_order_mode, int(second_order_chunk_size), int(batch_axis)
+
+
+def describe_lqr_segment_second_order_route(lqr_segment_specs, *, second_order_mode="batched_exact",
+                                            second_order_chunk_size=None, batch_axis=None):
+  second_order_mode, second_order_chunk_size, batch_axis = _validate_lqr_segment_second_order_options(
+    second_order_mode, second_order_chunk_size, batch_axis
+  )
+  return {
+    "second_order_mode": second_order_mode,
+    "second_order_chunk_size": second_order_chunk_size,
+    "second_order_batch_axis": batch_axis,
+    "uses_sample_separable_second_order": second_order_mode == "sample_separable_exact",
+    "lqr_segment_count": len(lqr_segment_specs),
+    "controlled_param_count": sum(len(segment.controlled_param_names) for segment in lqr_segment_specs),
   }
 
 
@@ -321,9 +376,15 @@ def _lqr_active_segment_backward_hamiltonian_operators(params, states, final_adj
                                                        other_model_variables=FrozenDict({}),
                                                        prepared_stage_metadata=None,
                                                        checkpoint_policy="none",
-                                                       lowmem=False):
+                                                       lowmem=False,
+                                                       second_order_mode="batched_exact",
+                                                       second_order_chunk_size=None,
+                                                       batch_axis=None):
   if not lqr_segment_specs:
     raise ValueError("Grouped LLQR segment K builders expect at least one segment.")
+  second_order_mode, second_order_chunk_size, batch_axis = _validate_lqr_segment_second_order_options(
+    second_order_mode, second_order_chunk_size, batch_axis
+  )
   if prepared_stage_metadata is None:
     prepared_stage_metadata = prepare_active_execution_stage_metadata(
       params,
@@ -349,6 +410,17 @@ def _lqr_active_segment_backward_hamiltonian_operators(params, states, final_adj
       if all(stage.passive_state_hessian == "zero" for stage in segment_spec.execution_stage_descriptors):
         def k_i(state_tangent):
           return zero_tangent_tree_like(state_tangent)
+      elif second_order_mode == "sample_separable_exact":
+        sample_state_action = build_sample_separable_state_only_action(
+          simpler_apply,
+          segment_state,
+          p_i,
+          batch_axis=batch_axis,
+          second_order_chunk_size=second_order_chunk_size,
+        )
+
+        def k_i(state_tangent, sample_state_action=sample_state_action):
+          return sample_state_action(state_tangent)
       else:
         segment_state_primal = _state_primal_for_linearization(segment_state)
         if lowmem:
@@ -385,7 +457,31 @@ def _lqr_active_segment_backward_hamiltonian_operators(params, states, final_adj
         return _apply_segment(
           stages_apply, segment_metadata, fixed_input_state, parameters, segment_start_index)
 
-      if lowmem:
+      if second_order_mode == "sample_separable_exact":
+        def sample_apply(parameters, x, segment_metadata=segment_metadata,
+                         fixed_input_state=fixed_input_state,
+                         segment_start_index=segment_spec.start_index):
+          return _apply_segment(
+            stages_apply,
+            segment_metadata,
+            _cast_state_like(fixed_input_state, x),
+            parameters,
+            segment_start_index,
+          )
+
+        sample_actions = build_sample_separable_second_order_actions(
+          sample_apply,
+          segment_params,
+          fixed_input_state,
+          p_i,
+          batch_axis=batch_axis,
+          second_order_chunk_size=second_order_chunk_size,
+          damping=damping,
+        )
+
+        def k_i(control_tangent, sample_actions=sample_actions):
+          return sample_actions.r(control_tangent)
+      elif lowmem:
         checkpointed_apply = _maybe_checkpoint(simpler_apply, checkpoint_policy)
 
         def hamiltonian(parameters, checkpointed_apply=checkpointed_apply, p_i=p_i):
@@ -421,7 +517,29 @@ def _lqr_active_segment_backward_hamiltonian_operators(params, states, final_adj
         segment_start_index,
       )
 
-    if lowmem:
+    if second_order_mode == "sample_separable_exact":
+      sample_actions = build_sample_separable_second_order_actions(
+        simpler_apply,
+        segment_params,
+        segment_state,
+        p_i,
+        batch_axis=batch_axis,
+        second_order_chunk_size=second_order_chunk_size,
+        damping=damping,
+      )
+
+      def k_i(control_tangent, state_tangent, sample_actions=sample_actions):
+        control_action = _add_segment_control_actions(
+          sample_actions.r(control_tangent),
+          sample_actions.m(state_tangent),
+        )
+        state_action = jax.tree_util.tree_map(
+          jnp.add,
+          sample_actions.mt(control_tangent),
+          sample_actions.q(state_tangent),
+        )
+        return control_action, state_action
+    elif lowmem:
       checkpointed_apply = _maybe_checkpoint(simpler_apply, checkpoint_policy)
 
       def hamiltonian_joint(parameters, x, checkpointed_apply=checkpointed_apply, p_i=p_i):
@@ -460,7 +578,10 @@ def lqr_active_segment_backward_hamiltonian_operators(params, states, final_adjo
                                                       stages_apply, lqr_segment_specs, damping,
                                                       other_model_variables=FrozenDict({}),
                                                       prepared_stage_metadata=None,
-                                                      use_fast_paths=True):
+                                                      use_fast_paths=True,
+                                                      second_order_mode="batched_exact",
+                                                      second_order_chunk_size=None,
+                                                      batch_axis=None):
   del use_fast_paths
   return _lqr_active_segment_backward_hamiltonian_operators(
     params,
@@ -472,6 +593,9 @@ def lqr_active_segment_backward_hamiltonian_operators(params, states, final_adjo
     damping,
     other_model_variables,
     prepared_stage_metadata=prepared_stage_metadata,
+    second_order_mode=second_order_mode,
+    second_order_chunk_size=second_order_chunk_size,
+    batch_axis=batch_axis,
     lowmem=False,
   )
 
@@ -481,7 +605,10 @@ def lqr_active_segment_backward_hamiltonian_operators_lowmem(params, states, fin
                                                              other_model_variables=FrozenDict({}),
                                                              prepared_stage_metadata=None,
                                                              checkpoint_policy="none",
-                                                             use_fast_paths=True):
+                                                             use_fast_paths=True,
+                                                             second_order_mode="batched_exact",
+                                                             second_order_chunk_size=None,
+                                                             batch_axis=None):
   del use_fast_paths
   return _lqr_active_segment_backward_hamiltonian_operators(
     params,
@@ -494,5 +621,8 @@ def lqr_active_segment_backward_hamiltonian_operators_lowmem(params, states, fin
     other_model_variables,
     prepared_stage_metadata=prepared_stage_metadata,
     checkpoint_policy=checkpoint_policy,
+    second_order_mode=second_order_mode,
+    second_order_chunk_size=second_order_chunk_size,
+    batch_axis=batch_axis,
     lowmem=True,
   )
