@@ -32,9 +32,13 @@ Current runtime semantics:
 - `base_fsam` perturbs from `g_current - gbar`
 - `past_fsam` preserves the rolling-buffer variant used before the rename
 
-For the durable benchmark trail and bounded plain-optimizer comparison surface,
-use the workspace note:
+For the durable benchmark trail, bounded plain-optimizer comparison surface, and
+final closure rationale, use the workspace notes:
 - `../tmp/benchmarks/llqr-base-sam-wave3-comparison/README.md`
+- `../docs/reports/llqr-base-sam-support-final-report-2026-04-15.md`
+
+In this workspace, keep local training benchmarks on `agent-quick-local-test`.
+The `resnet18-cifar10` comparison remains an external-only higher-memory follow-up.
 
 ## Code layout
 
