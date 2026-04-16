@@ -45,9 +45,11 @@ Current runtime status for those ablation knobs:
 - `random_direction` uses one dedicated post-center-pass RNG split and samples a Gaussian pytree matching the center-gradient leaves
 - `sam_research_perturb_sign` is applied to the final perturbation tree, so `descent` is exactly the negated `ascent` perturbation
 
-For the durable benchmark trail, bounded plain-optimizer comparison surface, and
-final closure rationale, use the workspace notes:
+For the durable benchmark trail, bounded plain-optimizer comparison surface, the
+research-only perturbation-source ablation matrix, and final closure rationale,
+use the workspace notes:
 - `../tmp/benchmarks/llqr-base-sam-wave3-comparison/README.md`
+- `../tmp/benchmarks/llqr-sam-perturbation-ablation-wave3-local/README.md`
 - `../docs/reports/llqr-base-sam-support-final-report-2026-04-15.md`
 
 In this workspace, keep local training benchmarks on `agent-quick-local-test`.
