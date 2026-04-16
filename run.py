@@ -27,6 +27,15 @@ from lqr_optimizer._src.utils.dataloaders.hf_loaders import prepare_hf_dataset
 import lqr_optimizer._src.utils.utils as utl
 
 
+def should_run_periodic_event(*, step: int, total_steps: int, every: int) -> bool:
+  """Skip expensive step-0 periodic work on multi-step runs.
+
+  Single-step runs such as `total_epochs=0` still keep the step-0 report/eval
+  surface because there is no later step to observe.
+  """
+  return (step % every == 0) and ((step != 0) or (total_steps == 1))
+
+
 @hydra.main(config_path="configs", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
   assert 0.0 <= cfg.ema_decay <= 1.0, f"cfg.ema_decay ({cfg.ema_decay}) must be in [0, 1]"
@@ -649,7 +658,7 @@ def main(cfg: DictConfig):
     state, loss, x_batch, y_batch = train_step(state, preconditioner.expose_blocks(), dataloader, consumed_key)
 
     # Logging or testing every so often
-    if step % cfg.logging_freq == 0:
+    if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.logging_freq):
       # Simple logging
       # train_loss = loss_eval(state, x_batch, y_batch)
       train_loss = loss
@@ -660,11 +669,11 @@ def main(cfg: DictConfig):
       batch_accuracy, _ = compute_batch_accuracy(state, x_batch, y_batch)
       run.track(batch_accuracy, name="train accuracy", step=step)
       run.track(batch_accuracy, name="train accuracy|t", step=elapsed_time*100)
-      if step % cfg.report_freq == 0:
+      if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.report_freq):
         # Print info
         print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
-    if step % cfg.test_eval_freq == 0:
+    if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.test_eval_freq):
       test_time_start = time.time()
       if cfg.record_histograms:
         test_accuracy, test_loss = compute_accuracy_and_loss_with_hists(state, test_dataloader, test_ds_size, run,

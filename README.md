@@ -20,6 +20,22 @@ A typical Hydra invocation shape is:
 python run.py experiment=resnet18-cifar10
 ```
 
+## SAM surface
+
+The current public SAM configuration surface is:
+- `sam_mode`: perturbation source selector; current supported values are `null`, `base_sam`, `base_fsam`, and `past_fsam`
+- `perturbation_rho`: perturbation magnitude
+- `perturb_mode`: perturbation geometry selector
+
+Current runtime semantics:
+- `base_sam` perturbs from the current gradient and leaves `gbar` / `g_last` untouched
+- `base_fsam` perturbs from `g_current - gbar`
+- `past_fsam` preserves the rolling-buffer variant used before the rename
+
+For the durable benchmark trail and bounded plain-optimizer comparison surface,
+use the workspace note:
+- `../tmp/benchmarks/llqr-base-sam-wave3-comparison/README.md`
+
 ## Code layout
 
 - `lqr_optimizer/_src/preconditioner.py`: relaxed LLQR preconditioner logic
