@@ -36,12 +36,14 @@ There is also a research-only ablation surface:
 - `sam_research_base_vector_source`: `current_gradient | main_optimizer_momentum | random_direction`
 - `sam_research_perturb_sign`: `ascent | descent`
 
-Wave 1 status for those ablation knobs is intentionally narrow:
+Current runtime status for those ablation knobs:
 - the neutral defaults are `current_gradient` and `ascent`
 - non-default settings are allowed only when `sam_mode` is `base_sam` or `base_fsam`
 - `main_optimizer_momentum` is read from the actual Optax main-optimizer state, with current support for Polyak-like `TraceState.trace` and Adam-style `ScaleByAdamState.mu`
 - plain `sgd` is intentionally unsupported for `main_optimizer_momentum`
-- non-default source/sign semantics are not wired into epsilon construction yet; Wave 1 only locks the config and validation contract
+- `base_sam` uses the selected source directly, while `base_fsam` uses `selected_source - gbar`
+- `random_direction` uses one dedicated post-center-pass RNG split and samples a Gaussian pytree matching the center-gradient leaves
+- `sam_research_perturb_sign` is applied to the final perturbation tree, so `descent` is exactly the negated `ascent` perturbation
 
 For the durable benchmark trail, bounded plain-optimizer comparison surface, and
 final closure rationale, use the workspace notes:

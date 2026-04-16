@@ -1464,6 +1464,70 @@ def validate_sam_research_contract(cfg, opt_state):
   if source == "main_optimizer_momentum" and cfg.sam_mode in ("base_sam", "base_fsam"):
     extract_main_optimizer_momentum_vector(opt_state)
 
+
+def _sample_gaussian_tree_like(template_tree, rng_key):
+  """Sample a Gaussian pytree with the same structure, shape, and dtype as ``template_tree``."""
+  leaves, treedef = jax.tree_util.tree_flatten(template_tree)
+  if not leaves:
+    return template_tree
+
+  leaf_keys = jax.random.split(rng_key, len(leaves))
+  sampled_leaves = [
+    jax.random.normal(leaf_key, shape=leaf.shape, dtype=leaf.dtype)
+    for leaf_key, leaf in zip(leaf_keys, leaves)
+  ]
+  return jax.tree_util.tree_unflatten(treedef, sampled_leaves)
+
+
+def resolve_sam_ablation_perturbation_vector(
+    *,
+    sam_mode: str,
+    base_vector_source: str,
+    mean_grads_center,
+    g_bar,
+    opt_state,
+    rng_key,
+):
+  """Resolve the effective SAM perturbation vector and the RNG key for the perturbed pass."""
+  if sam_mode not in ("base_sam", "base_fsam"):
+    raise ValueError(
+      "SAM ablation perturbation vectors are only supported for "
+      f"'base_sam' or 'base_fsam'; got {sam_mode!r}."
+    )
+
+  if base_vector_source == "current_gradient":
+    selected_source = jax.lax.stop_gradient(mean_grads_center)
+    rng_out = rng_key
+  elif base_vector_source == "main_optimizer_momentum":
+    selected_source = extract_main_optimizer_momentum_vector(opt_state)
+    rng_out = rng_key
+  elif base_vector_source == "random_direction":
+    random_source_key, rng_out = jax.random.split(rng_key)
+    selected_source = _sample_gaussian_tree_like(mean_grads_center, random_source_key)
+    selected_source = jax.lax.stop_gradient(selected_source)
+  else:
+    raise ValueError(
+      "sam_research_base_vector_source must be one of "
+      f"{VALID_SAM_RESEARCH_BASE_VECTOR_SOURCES}; got {base_vector_source!r}."
+    )
+
+  if sam_mode == "base_fsam":
+    selected_source = tree_sub(selected_source, jax.lax.stop_gradient(g_bar))
+
+  return jax.lax.stop_gradient(selected_source), rng_out
+
+
+def apply_sam_perturb_sign(eps_tree, sign: str):
+  """Apply the research-only SAM ascent/descent sign gate to a perturbation tree."""
+  if sign == "ascent":
+    return jax.lax.stop_gradient(eps_tree)
+  if sign == "descent":
+    return jax.lax.stop_gradient(tree_mul_scalar(eps_tree, -1.0))
+  raise ValueError(
+    "sam_research_perturb_sign must be one of "
+    f"{VALID_SAM_RESEARCH_PERTURB_SIGNS}; got {sign!r}."
+  )
+
 def make_perturbation_from_vector(
     *,
     precond_blocks,

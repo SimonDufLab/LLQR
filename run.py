@@ -383,33 +383,49 @@ def main(cfg: DictConfig):
     @jax.jit
     def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
       """
-      Vanilla SAM two-pass step.
-      --------------------------
+      Vanilla SAM two-pass step with research-only source/sign ablations.
+      ------------------------------------------------------------------
       1) Compute the current gradient at θ.
-      2) Build perturbation from the current gradient.
-      3) Compute the gradient at θ + ε.
+      2) Resolve the research-only perturbation source.
+      3) Build perturbation ε from that source and apply the ascent/descent sign gate.
+      4) Compute the gradient at θ + ε.
       4) Apply the update using the perturbed gradient.
 
       Notes:
         - gbar and g_last remain dormant under base_sam.
-        - The current fresh-RNG-per-pass behavior is preserved.
+        - Non-random sources preserve the current fresh-RNG-per-pass behavior.
+        - random_direction consumes one dedicated post-center RNG split.
       """
       mean_loss_center, mean_grads_center, _, key_after_center = accumulate_grads(
         state.params, state.batch_stats, dropout_key, x_acc, y_acc
       )
 
-      eps_tree = utl.make_perturbation_from_grad(
+      perturbation_vector, key_for_perturbed_pass = (
+        utl.resolve_sam_ablation_perturbation_vector(
+          sam_mode="base_sam",
+          base_vector_source=cfg.sam_research_base_vector_source,
+          mean_grads_center=mean_grads_center,
+          g_bar=state.gbar,
+          opt_state=state.opt_state,
+          rng_key=key_after_center,
+        )
+      )
+      eps_tree = utl.make_perturbation_from_vector(
         precond_blocks=precond_blocks,
-        grad=mean_grads_center,
+        vector=perturbation_vector,
         precond_apply_fn=precond_apply_fn,
         rho=cfg.perturbation_rho,
         mode=cfg.perturb_mode,
         eps=cfg.gbar_eps,
       )
+      eps_tree = utl.apply_sam_perturb_sign(
+        eps_tree,
+        cfg.sam_research_perturb_sign,
+      )
 
       params_pert = utl.tree_add(state.params, eps_tree)
       mean_loss_pert, mean_grads_pert, final_batch_stats, key_out = accumulate_grads(
-        params_pert, state.batch_stats, key_after_center, x_acc, y_acc
+        params_pert, state.batch_stats, key_for_perturbed_pass, x_acc, y_acc
       )
 
       new_state = apply_training_update(
@@ -482,18 +498,19 @@ def main(cfg: DictConfig):
     @jax.jit
     def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
       """
-      Benchmarking variant: base F-SAM-style two-pass step
-      ----------------------------------------------------
+      Benchmarking variant: base F-SAM-style two-pass step with research-only source/sign ablations
+      ---------------------------------------------------------------------------------------------
       1) Compute current gradient at θ (fresh batch gradient)
-      2) Build perturbation from noise proxy v = g_current - g_bar
+      2) Resolve the selected source and apply the Friendly-SAM centering transform v = source - g_bar
+      3) Build perturbation ε from that vector and apply the ascent/descent sign gate
       3) Compute perturbed gradient at θ + ε
       4) Update params using perturbed gradient
       5) Update g_bar using the current (non-perturbed) gradient to keep the noise decomposition meaningful
 
       Notes:
         - state.g_last is not used here.
-        - g_bar is still used to isolate the noise component.
-        - preconditioner is used for perturbation geometry (via make_perturbation_from_noise)
+        - g_bar is still used only for the Friendly-SAM centering step.
+        - preconditioner is used only for perturbation geometry after the source is resolved.
           and optionally for the descent update depending on cfg.precond_on_update.
       """
       # ----------------------------------------------------------
@@ -503,18 +520,27 @@ def main(cfg: DictConfig):
         state.params, state.batch_stats, dropout_key, x_acc, y_acc
       )
 
-      # ----------------------------------------------------------
-      # 1) Build perturbation epsilon from current noise component
-      #    v = g_current - g_bar   (F-SAM-style noise isolation)
-      # ----------------------------------------------------------
-      eps_tree = utl.make_perturbation_from_noise(
+      perturbation_vector, key_for_perturbed_pass = (
+        utl.resolve_sam_ablation_perturbation_vector(
+          sam_mode="base_fsam",
+          base_vector_source=cfg.sam_research_base_vector_source,
+          mean_grads_center=mean_grads_center,
+          g_bar=state.gbar,
+          opt_state=state.opt_state,
+          rng_key=key_after_center,
+        )
+      )
+      eps_tree = utl.make_perturbation_from_vector(
         precond_blocks=precond_blocks,
-        g_last=mean_grads_center,  # reuse API: pass current gradient as "g_last"
-        g_bar=state.gbar,
+        vector=perturbation_vector,
         precond_apply_fn=precond_apply_fn,
         rho=cfg.perturbation_rho,
         mode=cfg.perturb_mode,
         eps=cfg.gbar_eps,
+      )
+      eps_tree = utl.apply_sam_perturb_sign(
+        eps_tree,
+        cfg.sam_research_perturb_sign,
       )
 
       params_pert = utl.tree_add(state.params, eps_tree)
@@ -523,7 +549,7 @@ def main(cfg: DictConfig):
       # 2) Second pass @ θ + ε : perturbed gradient for the update
       # ----------------------------------------------------------
       mean_loss_pert, mean_grads_pert, final_batch_stats, key_out = accumulate_grads(
-        params_pert, state.batch_stats, key_after_center, x_acc, y_acc
+        params_pert, state.batch_stats, key_for_perturbed_pass, x_acc, y_acc
       )
 
       # --------------------------------
