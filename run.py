@@ -195,6 +195,9 @@ def main(cfg: DictConfig):
       batch_stats=init_batch_stats
     )
 
+  # Lock the research-only SAM ablation contract before any heavy JIT or runtime setup.
+  utl.validate_sam_research_contract(cfg, state.opt_state)
+
   # 5) Create the BasePreconditioner
   if cfg.precond_lr_scheduler and cfg.precond_lr_scheduler.name != "constant":
     precond_lr_sched_kwargs = {_key:_value for _key, _value in cfg.precond_lr_scheduler.items() if _key!='name'}

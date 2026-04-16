@@ -1393,6 +1393,77 @@ def tree_normalize_per_layer(tree, eps=1e-12):
   norms = tree_l2_norm_per_layer(tree, eps)
   return jax.tree_map(lambda sub, n: jax.tree_map(lambda x: x / n, sub), tree, norms)
 
+VALID_SAM_RESEARCH_BASE_VECTOR_SOURCES = (
+  "current_gradient",
+  "main_optimizer_momentum",
+  "random_direction",
+)
+VALID_SAM_RESEARCH_PERTURB_SIGNS = ("ascent", "descent")
+
+
+def _collect_main_optimizer_momentum_candidates(opt_state, path="opt_state"):
+  candidates = []
+
+  if isinstance(opt_state, tuple) and hasattr(opt_state, "_fields"):
+    if "trace" in opt_state._fields:
+      candidates.append((f"{path}.trace", opt_state.trace))
+    if "mu" in opt_state._fields and "nu" in opt_state._fields:
+      candidates.append((f"{path}.mu", opt_state.mu))
+
+  if isinstance(opt_state, (tuple, list)):
+    for index, child_state in enumerate(opt_state):
+      candidates.extend(
+        _collect_main_optimizer_momentum_candidates(
+          child_state,
+          path=f"{path}[{index}]",
+        )
+      )
+
+  return candidates
+
+
+def extract_main_optimizer_momentum_vector(opt_state):
+  """Return the readable first-moment vector from a supported main optimizer state."""
+  candidates = _collect_main_optimizer_momentum_candidates(opt_state)
+  if len(candidates) != 1:
+    candidate_paths = [path for path, _ in candidates]
+    raise ValueError(
+      "sam_research_base_vector_source=main_optimizer_momentum requires exactly one "
+      "supported main-optimizer momentum state (TraceState.trace or ScaleByAdamState.mu); "
+      f"found {len(candidates)} candidates at {candidate_paths}."
+    )
+  _path, momentum_vector = candidates[0]
+  return jax.lax.stop_gradient(momentum_vector)
+
+
+def validate_sam_research_contract(cfg, opt_state):
+  """Validate the research-only SAM ablation surface before heavy runtime work."""
+  source = cfg.sam_research_base_vector_source
+  sign = cfg.sam_research_perturb_sign
+
+  if source not in VALID_SAM_RESEARCH_BASE_VECTOR_SOURCES:
+    raise ValueError(
+      "sam_research_base_vector_source must be one of "
+      f"{VALID_SAM_RESEARCH_BASE_VECTOR_SOURCES}; got {source!r}."
+    )
+  if sign not in VALID_SAM_RESEARCH_PERTURB_SIGNS:
+    raise ValueError(
+      "sam_research_perturb_sign must be one of "
+      f"{VALID_SAM_RESEARCH_PERTURB_SIGNS}; got {sign!r}."
+    )
+
+  uses_non_default_research_knob = (
+    source != "current_gradient" or sign != "ascent"
+  )
+  if uses_non_default_research_knob and cfg.sam_mode not in ("base_sam", "base_fsam"):
+    raise ValueError(
+      "Non-default SAM research ablation knobs are only supported when "
+      "sam_mode is 'base_sam' or 'base_fsam'."
+    )
+
+  if source == "main_optimizer_momentum" and cfg.sam_mode in ("base_sam", "base_fsam"):
+    extract_main_optimizer_momentum_vector(opt_state)
+
 def make_perturbation_from_vector(
     *,
     precond_blocks,

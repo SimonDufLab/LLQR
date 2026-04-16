@@ -32,6 +32,17 @@ Current runtime semantics:
 - `base_fsam` perturbs from `g_current - gbar`
 - `past_fsam` preserves the rolling-buffer variant used before the rename
 
+There is also a research-only ablation surface:
+- `sam_research_base_vector_source`: `current_gradient | main_optimizer_momentum | random_direction`
+- `sam_research_perturb_sign`: `ascent | descent`
+
+Wave 1 status for those ablation knobs is intentionally narrow:
+- the neutral defaults are `current_gradient` and `ascent`
+- non-default settings are allowed only when `sam_mode` is `base_sam` or `base_fsam`
+- `main_optimizer_momentum` is read from the actual Optax main-optimizer state, with current support for Polyak-like `TraceState.trace` and Adam-style `ScaleByAdamState.mu`
+- plain `sgd` is intentionally unsupported for `main_optimizer_momentum`
+- non-default source/sign semantics are not wired into epsilon construction yet; Wave 1 only locks the config and validation contract
+
 For the durable benchmark trail, bounded plain-optimizer comparison surface, and
 final closure rationale, use the workspace notes:
 - `../tmp/benchmarks/llqr-base-sam-wave3-comparison/README.md`
