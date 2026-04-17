@@ -50,6 +50,8 @@ research-only perturbation-source ablation matrix, and final closure rationale,
 use the workspace notes:
 - `../tmp/benchmarks/llqr-base-sam-wave3-comparison/README.md`
 - `../tmp/benchmarks/llqr-sam-perturbation-ablation-wave3-local/README.md`
+- `../docs/plans/completed/llqr-sam-perturbation-source-ablation-exec-plan.md`
+- `../docs/reports/llqr-sam-perturbation-source-ablation-final-report-2026-04-16.md`
 - `../docs/reports/llqr-base-sam-support-final-report-2026-04-15.md`
 
 In this workspace, keep local training benchmarks on `agent-quick-local-test`.
