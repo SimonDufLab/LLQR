@@ -20,6 +20,25 @@ A typical Hydra invocation shape is:
 python run.py experiment=resnet18-cifar10
 ```
 
+## LLQR large-batch route guidance
+
+For ResNet-50/ImageNet runs that need `precond_batch_size=256` on the validated
+A100 surface, prefer the exact mixed-term grouped chunked route when it fits:
+
+```bash
+python run.py experiment=resnet50-imagenet \
+  llqr_batch_experimental_mode=rm_param_only \
+  llqr_batch_chunk_size=128 \
+  llqr_use_fast_paths=true
+```
+
+Keep the default `llqr_second_order_mode=batched_exact` and
+`llqr_second_order_chunk_size=null` for this route. The opt-in
+`llqr_second_order_mode=sample_separable_exact` route is exact, but current A100
+evidence makes it a memory-safety fallback for eligible grouped LLQR segments,
+not the recommended compute path when grouped chunked `batched_exact` already
+fits.
+
 ## SAM surface
 
 The current public SAM configuration surface is:
