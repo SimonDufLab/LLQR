@@ -254,13 +254,13 @@ def main(cfg: DictConfig):
     llqr_operator_mode=cfg.llqr_operator_mode,
     llqr_checkpoint_policy=cfg.llqr_checkpoint_policy,
     llqr_use_fast_paths=cfg.llqr_use_fast_paths,
-    llqr_batch_experimental_mode=cfg.llqr_batch_experimental_mode,
-    llqr_batch_chunk_size=cfg.llqr_batch_chunk_size,
+    llqr_batch_update_mode=cfg.llqr_batch_update_mode,
+    llqr_batch_update_chunk_size=cfg.llqr_batch_update_chunk_size,
     llqr_second_order_mode=cfg.llqr_second_order_mode,
     llqr_second_order_chunk_size=cfg.llqr_second_order_chunk_size,
     optax_solver_requires_value_and_grad=utl.precond_solver_requires_value_and_grad(cfg.precond_solver),
   )
-  llqr_batch_update_gate = preconditioner.describe_batch_experimental_update_gate()
+  llqr_batch_update_gate = preconditioner.describe_llqr_batch_update_gate()
   print(f"LLQR batch update gate: {llqr_batch_update_gate}")
   run["llqr_batch_update_gate"] = llqr_batch_update_gate
   if load_from_preexisting_model_state and precond_blocks is not None:
@@ -621,7 +621,7 @@ def main(cfg: DictConfig):
       precond_lr = precond_lr_fn(step)
       preconditioner.compile_precond_updater(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size,
                                            other_model_variables={'batch_stats': state.batch_stats})
-      compile_route = preconditioner.describe_last_batch_experimental_update_route()
+      compile_route = preconditioner.describe_last_llqr_batch_update_route()
       print(f"Compiled LLQR preconditioner update route: {compile_route}")
       run["llqr_batch_compile_route"] = compile_route
       load_from_preexisting_model_state = False
@@ -633,7 +633,7 @@ def main(cfg: DictConfig):
       _ema_decay = ema_fn(step)
       preconditioner.update_preconditioner(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size, _ema_decay,
                                            other_model_variables={'batch_stats': state.batch_stats})
-      update_route = preconditioner.describe_last_batch_experimental_update_route()
+      update_route = preconditioner.describe_last_llqr_batch_update_route()
       if not logged_first_batch_update_route:
         print(f"LLQR preconditioner update route at step {step}: {update_route}")
         run["llqr_batch_first_update_route"] = update_route

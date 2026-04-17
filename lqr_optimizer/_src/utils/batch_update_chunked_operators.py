@@ -1,4 +1,4 @@
-"""Experimental chunked batch-structured Hamiltonian operators."""
+"""Chunked batch-update Hamiltonian operators."""
 
 import jax
 import jax.numpy as jnp
@@ -16,7 +16,7 @@ def _move_batch_axis_to_front(tree, batch_axis):
   def move_leaf(leaf):
     if leaf.ndim <= batch_axis:
       raise ValueError(
-        f"Experimental batch operator expected batch axis {batch_axis} to exist on every leaf, got shape {leaf.shape}"
+        f"Chunked batch update operator expected batch axis {batch_axis} to exist on every leaf, got shape {leaf.shape}"
       )
     return jnp.moveaxis(leaf, batch_axis, 0)
 
@@ -26,7 +26,7 @@ def _move_batch_axis_to_front(tree, batch_axis):
 def _pad_and_chunk_tree(tree, chunk_size):
   leaves = jax.tree_util.tree_leaves(tree)
   if not leaves:
-    raise ValueError("Expected a non-empty pytree for experimental batch chunking")
+    raise ValueError("Expected a non-empty pytree for chunked batch update")
   batch_size = int(leaves[0].shape[0])
   num_chunks = max(1, (batch_size + chunk_size - 1) // chunk_size)
   padded_batch_size = num_chunks * chunk_size
@@ -34,7 +34,7 @@ def _pad_and_chunk_tree(tree, chunk_size):
 
   def pad_and_chunk_leaf(leaf):
     if leaf.shape[0] != batch_size:
-      raise ValueError("Experimental batch operator expected a consistent leading batch dimension")
+      raise ValueError("Chunked batch update operator expected a consistent leading batch dimension")
     if pad:
       pad_width = [(0, pad)] + [(0, 0)] * (leaf.ndim - 1)
       leaf = jnp.pad(leaf, pad_width)
@@ -55,7 +55,7 @@ def _squeeze_single_sample_tree(tree, batch_axis):
   def squeeze_leaf(leaf):
     if leaf.ndim <= batch_axis:
       raise ValueError(
-        f"Experimental batch operator expected output batch axis {batch_axis} to exist on every leaf, got shape {leaf.shape}"
+        f"Chunked batch update operator expected output batch axis {batch_axis} to exist on every leaf, got shape {leaf.shape}"
       )
     return jnp.squeeze(leaf, axis=batch_axis)
 
@@ -113,7 +113,7 @@ def build_chunked_control_only_hessian_operator(apply_batched, layer_params, fix
                                                 damping):
   """Chunked cached exact operator for a control-only parameter Hessian action."""
   if batch_chunk_size is None:
-    raise ValueError("batch_chunk_size must be set for experimental chunked operators")
+    raise ValueError("batch_chunk_size must be set for chunked batch update operators")
 
   state_chunks, output_chunks, mask = _prepare_chunk_inputs(
     fixed_input_state, output_cotangent, batch_axis, batch_chunk_size
@@ -161,7 +161,7 @@ def build_chunked_joint_param_output_operator(apply_batched, layer_params, layer
                                               damping):
   """Chunked cached exact parameter-output action for R_i u + M_i x."""
   if batch_chunk_size is None:
-    raise ValueError("batch_chunk_size must be set for experimental chunked operators")
+    raise ValueError("batch_chunk_size must be set for chunked batch update operators")
 
   state_chunks, output_chunks, mask = _prepare_chunk_inputs(
     layer_state, output_cotangent, batch_axis, batch_chunk_size
@@ -228,7 +228,7 @@ def build_chunked_joint_state_output_operator(apply_batched, layer_params, layer
                                               output_cotangent, *, batch_axis, batch_chunk_size):
   """Chunked cached exact state-output action for M_i^T u + Q_i x."""
   if batch_chunk_size is None:
-    raise ValueError("batch_chunk_size must be set for experimental chunked operators")
+    raise ValueError("batch_chunk_size must be set for chunked batch update operators")
 
   batch_size = int(jax.tree_util.tree_leaves(_move_batch_axis_to_front(layer_state, batch_axis))[0].shape[0])
   state_chunks, output_chunks, mask = _prepare_chunk_inputs(
@@ -289,7 +289,7 @@ def build_chunked_state_only_hessian_operator(apply_batched, layer_state,
                                               output_cotangent, *, batch_axis, batch_chunk_size):
   """Chunked cached exact state-only action for passive Q_i x."""
   if batch_chunk_size is None:
-    raise ValueError("batch_chunk_size must be set for experimental chunked operators")
+    raise ValueError("batch_chunk_size must be set for chunked batch update operators")
 
   batch_size = int(jax.tree_util.tree_leaves(_move_batch_axis_to_front(layer_state, batch_axis))[0].shape[0])
   state_chunks, output_chunks, mask = _prepare_chunk_inputs(

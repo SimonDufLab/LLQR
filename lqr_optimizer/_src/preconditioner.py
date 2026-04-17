@@ -66,7 +66,7 @@ BLOCK_STRUCTURE_DICT = {
 
 VALID_LLQR_OPERATOR_MODES = ("cached_exact", "lowmem_exact_k", "lowmem_exact_full")
 VALID_LLQR_CHECKPOINT_POLICIES = ("none", "dots_no_batch_dims")
-VALID_LLQR_BATCH_EXPERIMENTAL_MODES = ("none", "rm_param_only")
+VALID_LLQR_BATCH_UPDATE_MODES = ("full_batch", "chunked_lqr_segment")
 VALID_LLQR_SECOND_ORDER_MODES = VALID_LQR_SEGMENT_SECOND_ORDER_MODES
 
 
@@ -841,8 +841,8 @@ class BasePreconditioner(abc.ABC):
                llqr_operator_mode: str = "cached_exact",
                llqr_checkpoint_policy: str = "none",
                llqr_use_fast_paths: bool = True,
-               llqr_batch_experimental_mode: str = "none",
-               llqr_batch_chunk_size = None,
+               llqr_batch_update_mode: str = "full_batch",
+               llqr_batch_update_chunk_size = None,
                llqr_second_order_mode: str = "batched_exact",
                llqr_second_order_chunk_size = None,
                use_spectral_norm: bool = False,
@@ -892,10 +892,10 @@ class BasePreconditioner(abc.ABC):
       raise ValueError(
         f"Unknown llqr_checkpoint_policy '{llqr_checkpoint_policy}'. Expected one of {VALID_LLQR_CHECKPOINT_POLICIES}."
       )
-    if llqr_batch_experimental_mode not in VALID_LLQR_BATCH_EXPERIMENTAL_MODES:
+    if llqr_batch_update_mode not in VALID_LLQR_BATCH_UPDATE_MODES:
       raise ValueError(
-        "Unknown llqr_batch_experimental_mode "
-        f"'{llqr_batch_experimental_mode}'. Expected one of {VALID_LLQR_BATCH_EXPERIMENTAL_MODES}."
+        "Unknown llqr_batch_update_mode "
+        f"'{llqr_batch_update_mode}'. Expected one of {VALID_LLQR_BATCH_UPDATE_MODES}."
       )
     if llqr_second_order_mode not in VALID_LLQR_SECOND_ORDER_MODES:
       raise ValueError(
@@ -933,34 +933,34 @@ class BasePreconditioner(abc.ABC):
           "llqr_second_order_mode='sample_separable_exact' requires sample-separable "
           f"LLQR segment metadata; unsupported segments: {unsupported}"
         )
-    if llqr_batch_experimental_mode == "none":
-      if llqr_batch_chunk_size is not None:
-        raise ValueError("llqr_batch_chunk_size must be null when llqr_batch_experimental_mode='none'.")
+    if llqr_batch_update_mode == "full_batch":
+      if llqr_batch_update_chunk_size is not None:
+        raise ValueError("llqr_batch_update_chunk_size must be null when llqr_batch_update_mode='full_batch'.")
     else:
       if not batch_solve_precond:
-        raise ValueError("llqr_batch_experimental_mode='rm_param_only' requires batch_solve_precond=True.")
+        raise ValueError("llqr_batch_update_mode='chunked_lqr_segment' requires batch_solve_precond=True.")
       if llqr_operator_mode != "cached_exact":
-        raise ValueError("llqr_batch_experimental_mode='rm_param_only' requires llqr_operator_mode='cached_exact'.")
-      if not isinstance(llqr_batch_chunk_size, numbers.Integral) or bool(llqr_batch_chunk_size) is False:
+        raise ValueError("llqr_batch_update_mode='chunked_lqr_segment' requires llqr_operator_mode='cached_exact'.")
+      if not isinstance(llqr_batch_update_chunk_size, numbers.Integral) or bool(llqr_batch_update_chunk_size) is False:
         raise ValueError(
-          "llqr_batch_chunk_size must be a positive integer when llqr_batch_experimental_mode='rm_param_only'."
+          "llqr_batch_update_chunk_size must be a positive integer when llqr_batch_update_mode='chunked_lqr_segment'."
         )
-      if int(llqr_batch_chunk_size) <= 0:
+      if int(llqr_batch_update_chunk_size) <= 0:
         raise ValueError(
-          "llqr_batch_chunk_size must be a positive integer when llqr_batch_experimental_mode='rm_param_only'."
+          "llqr_batch_update_chunk_size must be a positive integer when llqr_batch_update_mode='chunked_lqr_segment'."
         )
     self._llqr_operator_mode = llqr_operator_mode
     self._llqr_checkpoint_policy = llqr_checkpoint_policy
     self._llqr_use_fast_paths = bool(llqr_use_fast_paths)
     self._use_spectral_norm = bool(use_spectral_norm)
-    self._llqr_batch_experimental_mode = llqr_batch_experimental_mode
-    self._llqr_batch_chunk_size = None if llqr_batch_chunk_size is None else int(llqr_batch_chunk_size)
+    self._llqr_batch_update_mode = llqr_batch_update_mode
+    self._llqr_batch_update_chunk_size = None if llqr_batch_update_chunk_size is None else int(llqr_batch_update_chunk_size)
     self._llqr_second_order_mode = llqr_second_order_mode
     self._llqr_second_order_chunk_size = (
       None if llqr_second_order_chunk_size is None else int(llqr_second_order_chunk_size)
     )
     if (
-      self._llqr_batch_experimental_mode == "rm_param_only"
+      self._llqr_batch_update_mode == "chunked_lqr_segment"
       and self._use_execution_stage_active_path
       and not self._lqr_segment_specs
     ):
@@ -976,15 +976,15 @@ class BasePreconditioner(abc.ABC):
                                                             batch_solve_precond=self._batch_solve_precond,
                                                             multibatch=self._multibatch,
                                                             precond_on_update=self._precond_on_update)
-    self._batch_experimental_update_gate = self._batch_experimental_execution_stage_update_gate_details()
-    self._last_batch_experimental_update_route = None
-    self._experimental_grouped_chunk_loss_gradients_fn = None
-    self._experimental_grouped_chunk_grad_only_fn = None
-    self._experimental_grouped_chunk_value_and_grad_fn = None
-    if self._uses_batch_experimental_execution_stage_update_path():
-      (self._experimental_grouped_chunk_loss_gradients_fn,
-       self._experimental_grouped_chunk_grad_only_fn,
-       self._experimental_grouped_chunk_value_and_grad_fn) = self._get_grouped_chunked_update_helpers(
+    self._llqr_batch_update_gate = self._llqr_batch_update_gate_details()
+    self._last_llqr_batch_update_route = None
+    self._grouped_chunked_update_loss_gradients_fn = None
+    self._grouped_chunked_update_grad_only_fn = None
+    self._grouped_chunked_update_value_and_grad_fn = None
+    if self._uses_chunked_lqr_segment_update_path():
+      (self._grouped_chunked_update_loss_gradients_fn,
+       self._grouped_chunked_update_grad_only_fn,
+       self._grouped_chunked_update_value_and_grad_fn) = self._get_grouped_chunked_update_helpers(
          precond_on_update=self._precond_on_update
        )
     # self._jit_apply_fn = jax.jit(
@@ -1030,12 +1030,12 @@ class BasePreconditioner(abc.ABC):
   def _uses_grouped_full_batch_execution_stage_path(self):
     return (
       self._uses_grouped_execution_stage_operator_path()
-      and self._resolved_batch_experimental_mode() == "none"
+      and self._resolved_llqr_batch_update_mode() == "full_batch"
     )
 
   def _uses_grouped_chunked_execution_stage_path(self):
     return (
-      self._uses_batch_experimental_execution_stage_update_path()
+      self._uses_chunked_lqr_segment_update_path()
       and self._uses_grouped_execution_stage_operator_path()
     )
 
@@ -1059,14 +1059,14 @@ class BasePreconditioner(abc.ABC):
     route.update(self._second_order_route_details())
     return route
 
-  def _uses_batch_experimental_rm_param_only_mode(self):
-    return self._llqr_batch_experimental_mode == "rm_param_only"
+  def _uses_chunked_lqr_segment_update_mode(self):
+    return self._llqr_batch_update_mode == "chunked_lqr_segment"
 
-  def _resolved_batch_experimental_mode(self):
-    return self._llqr_batch_experimental_mode
+  def _resolved_llqr_batch_update_mode(self):
+    return self._llqr_batch_update_mode
 
-  def _resolved_batch_chunk_size(self):
-    return self._llqr_batch_chunk_size
+  def _resolved_llqr_batch_update_chunk_size(self):
+    return self._llqr_batch_update_chunk_size
 
   def _uses_sample_separable_second_order(self):
     return self._llqr_second_order_mode == "sample_separable_exact"
@@ -1133,10 +1133,10 @@ class BasePreconditioner(abc.ABC):
     })
     return details
 
-  def _batch_experimental_execution_stage_update_gate_details(self):
+  def _llqr_batch_update_gate_details(self):
     blocked_by = []
-    if not self._uses_batch_experimental_rm_param_only_mode():
-      blocked_by.append("mode_not_rm_param_only")
+    if not self._uses_chunked_lqr_segment_update_mode():
+      blocked_by.append("mode_not_chunked_lqr_segment")
     if not self._use_execution_stage_active_path:
       blocked_by.append("no_execution_stage_active_path")
     if not self._batch_solve_precond:
@@ -1144,8 +1144,8 @@ class BasePreconditioner(abc.ABC):
     if self._multibatch:
       blocked_by.append("multibatch_enabled")
     gate_details = {
-      "batch_experimental_mode": self._resolved_batch_experimental_mode(),
-      "batch_chunk_size": self._resolved_batch_chunk_size(),
+      "batch_update_mode": self._resolved_llqr_batch_update_mode(),
+      "batch_update_chunk_size": self._resolved_llqr_batch_update_chunk_size(),
       "use_execution_stage_active_path": bool(self._use_execution_stage_active_path),
       "batch_solve_precond": bool(self._batch_solve_precond),
       "multibatch": bool(self._multibatch),
@@ -1158,8 +1158,8 @@ class BasePreconditioner(abc.ABC):
     gate_details.update(self._second_order_route_details())
     return gate_details
 
-  def describe_batch_experimental_update_gate(self):
-    return dict(self._batch_experimental_update_gate)
+  def describe_llqr_batch_update_gate(self):
+    return dict(self._llqr_batch_update_gate)
 
   def _serialize_batch_layout(self, layout):
     if layout is None:
@@ -1175,11 +1175,11 @@ class BasePreconditioner(abc.ABC):
         serialized[key] = value
     return serialized
 
-  def _record_batch_experimental_update_route(self, *, operation, route, precond_batch_size,
+  def _record_llqr_batch_update_route(self, *, operation, route, precond_batch_size,
                                               layout=None, normalized_layout=None,
                                               chunk_datapoints=None, chunk_weights=None,
                                               fallback_reason=None):
-    route_info = self.describe_batch_experimental_update_gate()
+    route_info = self.describe_llqr_batch_update_gate()
     route_info.update({
       "operation": operation,
       "route": route,
@@ -1199,7 +1199,7 @@ class BasePreconditioner(abc.ABC):
         for chunk_datapoint in chunk_datapoints
       )
     elif chunk_datapoints is not None:
-      fallback_chunk_size = self._resolved_batch_chunk_size()
+      fallback_chunk_size = self._resolved_llqr_batch_update_chunk_size()
     route_info.update(self._second_order_route_details(
       precond_batch_size=precond_batch_size,
       batch_axis=route_batch_axis,
@@ -1217,17 +1217,17 @@ class BasePreconditioner(abc.ABC):
       route_info["chunk_weights"] = [int(weight) for weight in chunk_weights]
     if fallback_reason is not None:
       route_info["fallback_reason"] = fallback_reason
-    self._last_batch_experimental_update_route = route_info
+    self._last_llqr_batch_update_route = route_info
     return route_info
 
-  def describe_last_batch_experimental_update_route(self):
-    if self._last_batch_experimental_update_route is None:
+  def describe_last_llqr_batch_update_route(self):
+    if self._last_llqr_batch_update_route is None:
       return None
-    return dict(self._last_batch_experimental_update_route)
+    return dict(self._last_llqr_batch_update_route)
 
-  def _uses_batch_experimental_execution_stage_update_path(self):
+  def _uses_chunked_lqr_segment_update_path(self):
     return (
-      self._uses_batch_experimental_rm_param_only_mode()
+      self._uses_chunked_lqr_segment_update_mode()
       and self._use_execution_stage_active_path
       and self._batch_solve_precond
       and not self._multibatch
@@ -1282,7 +1282,7 @@ class BasePreconditioner(abc.ABC):
         use_lowmem_active_k_mode = self._uses_lowmem_active_k_mode()
         resolved_checkpoint_policy = self._resolved_llqr_checkpoint_policy()
         batch_axis = None
-        if self._uses_batch_experimental_rm_param_only_mode():
+        if self._uses_chunked_lqr_segment_update_mode():
           batch_axis = infer_batch_layout(datapoint)["batch_axis"]
         if self._use_execution_stage_active_path:
           prepared_stage_metadata = prepare_active_execution_stage_metadata(
@@ -1376,8 +1376,8 @@ class BasePreconditioner(abc.ABC):
               self._execution_stage_specs, self._damping, other_model_variables, layer_modules=self._layer_modules,
               prepared_stage_metadata=prepared_stage_metadata,
               use_fast_paths=self._uses_active_fast_paths(),
-              batch_experimental_mode=self._resolved_batch_experimental_mode(),
-              batch_chunk_size=self._resolved_batch_chunk_size(),
+              batch_update_mode=self._resolved_llqr_batch_update_mode(),
+              batch_chunk_size=self._resolved_llqr_batch_update_chunk_size(),
               batch_axis=batch_axis,
             )
           if not use_grouped_execution_stage_operator_path:
@@ -1397,8 +1397,8 @@ class BasePreconditioner(abc.ABC):
               params, states, final_p, transition_transposes, self._layer_apply, self._layer_names,
               self._damping, other_model_variables, layer_modules=self._layer_modules,
               use_fast_paths=self._uses_active_fast_paths(),
-              batch_experimental_mode=self._resolved_batch_experimental_mode(),
-              batch_chunk_size=self._resolved_batch_chunk_size(),
+              batch_update_mode=self._resolved_llqr_batch_update_mode(),
+              batch_chunk_size=self._resolved_llqr_batch_update_chunk_size(),
               batch_axis=batch_axis)
           gradients = _recover_loss_gradients_from_transition_transposes(
             self._layer_names, transition_transposes, final_lin_cost,
@@ -1814,7 +1814,7 @@ class BasePreconditioner(abc.ABC):
 
     accumulated_gradients = None
     for chunk_datapoint, chunk_weight in zip(chunk_datapoints, chunk_weights):
-      gradients = self._experimental_grouped_chunk_loss_gradients_fn(
+      gradients = self._grouped_chunked_update_loss_gradients_fn(
         params,
         other_model_variables,
         chunk_datapoint,
@@ -1829,13 +1829,13 @@ class BasePreconditioner(abc.ABC):
 
     return self._block_structure.prepare_train_vectors(accumulated_gradients)
 
-  def _experimental_grouped_chunked_grad_only(self, preconditioner, params, other_model_variables,
+  def _grouped_chunked_update_grad_only(self, preconditioner, params, other_model_variables,
                                               chunk_datapoints, chunk_weights, batch_axis, trainstate_opt_state,
                                               prepared_gradients):
     total_weight = float(sum(chunk_weights))
     accumulated_grads = None
     for chunk_datapoint, chunk_weight in zip(chunk_datapoints, chunk_weights):
-      grads = self._experimental_grouped_chunk_grad_only_fn(
+      grads = self._grouped_chunked_update_grad_only_fn(
         preconditioner,
         params,
         other_model_variables,
@@ -1851,14 +1851,14 @@ class BasePreconditioner(abc.ABC):
         accumulated_grads = _tree_add(accumulated_grads, grads)
     return accumulated_grads
 
-  def _experimental_grouped_chunked_value_and_grad(self, preconditioner, params, other_model_variables,
+  def _grouped_chunked_update_value_and_grad(self, preconditioner, params, other_model_variables,
                                                    chunk_datapoints, chunk_weights, batch_axis, trainstate_opt_state,
                                                    prepared_gradients):
     total_weight = float(sum(chunk_weights))
     accumulated_value = 0.0
     accumulated_grads = None
     for chunk_datapoint, chunk_weight in zip(chunk_datapoints, chunk_weights):
-      value, grads = self._experimental_grouped_chunk_value_and_grad_fn(
+      value, grads = self._grouped_chunked_update_value_and_grad_fn(
         preconditioner,
         params,
         other_model_variables,
@@ -1896,7 +1896,7 @@ class BasePreconditioner(abc.ABC):
     for _ in range(self._preconditioner_update_steps):
       if self._optax_solver_requires_value_and_grad:
         def chunked_value_and_grad_fn(local_preconditioner):
-          return self._experimental_grouped_chunked_value_and_grad(
+          return self._grouped_chunked_update_value_and_grad(
             local_preconditioner,
             params,
             other_model_variables,
@@ -1915,7 +1915,7 @@ class BasePreconditioner(abc.ABC):
           value_and_grad_fn=chunked_value_and_grad_fn,
         )
       else:
-        preconditioner_grad = self._experimental_grouped_chunked_grad_only(
+        preconditioner_grad = self._grouped_chunked_update_grad_only(
           current_preconditioner,
           params,
           other_model_variables,
@@ -1938,7 +1938,7 @@ class BasePreconditioner(abc.ABC):
   def update_preconditioner(self, params, dataloader, precond_lr, opt_state, precond_batch_size, ema_decay=0, other_model_variables=FrozenDict({})):
     """params is the current weights of the NN"""
     if self._multibatch:
-      self._record_batch_experimental_update_route(
+      self._record_llqr_batch_update_route(
         operation="update",
         route="multibatch",
         precond_batch_size=precond_batch_size,
@@ -1952,18 +1952,18 @@ class BasePreconditioner(abc.ABC):
       else:
         _blocks = self._block_structure.reinit_blocks()
       should_snapshot = self._should_snapshot_preconditioner_for_update(ema_decay)
-      if self._uses_batch_experimental_execution_stage_update_path():
+      if self._uses_chunked_lqr_segment_update_path():
         layout, chunk_datapoints, chunk_weights = _take_preconditioner_chunk_datapoints(
           dataloader,
           precond_batch_size,
-          self._resolved_batch_chunk_size(),
+          self._resolved_llqr_batch_update_chunk_size(),
         )
         if _supports_chunked_execution_stage_update_layout(layout):
           normalized_layout, normalized_chunk_datapoints = _normalize_execution_stage_update_chunks(
             chunk_datapoints,
             layout,
           )
-          self._record_batch_experimental_update_route(
+          self._record_llqr_batch_update_route(
             operation="update",
             route="chunked_lqr_segment",
             precond_batch_size=precond_batch_size,
@@ -1985,7 +1985,7 @@ class BasePreconditioner(abc.ABC):
           )
         else:
           acc_batches = _concat_preconditioner_batches(chunk_datapoints, layout, precond_batch_size)
-          self._record_batch_experimental_update_route(
+          self._record_llqr_batch_update_route(
             operation="update",
             route="chunked_lqr_segment_layout_fallback",
             precond_batch_size=precond_batch_size,
@@ -2008,7 +2008,7 @@ class BasePreconditioner(abc.ABC):
         normalized_layout = layout
         if self._use_execution_stage_active_path:
           normalized_layout, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
-        self._record_batch_experimental_update_route(
+        self._record_llqr_batch_update_route(
           operation="update",
           route="full_batch",
           precond_batch_size=precond_batch_size,
@@ -2043,7 +2043,7 @@ class BasePreconditioner(abc.ABC):
   def compile_precond_updater(self, params, dataloader, precond_lr, opt_state, precond_batch_size, other_model_variables=FrozenDict({})):
     """For when we want to trigger jax compilation of _update_preconditioner_fn without applying the update"""
     if self._multibatch:
-        self._record_batch_experimental_update_route(
+        self._record_llqr_batch_update_route(
           operation="compile",
           route="multibatch",
           precond_batch_size=precond_batch_size,
@@ -2051,18 +2051,18 @@ class BasePreconditioner(abc.ABC):
         blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables, dataloader,
                                        opt_state)
     else:
-      if self._uses_batch_experimental_execution_stage_update_path():
+      if self._uses_chunked_lqr_segment_update_path():
         layout, chunk_datapoints, chunk_weights = _take_preconditioner_chunk_datapoints(
           dataloader,
           precond_batch_size,
-          self._resolved_batch_chunk_size(),
+          self._resolved_llqr_batch_update_chunk_size(),
         )
         if _supports_chunked_execution_stage_update_layout(layout):
           normalized_layout, normalized_chunk_datapoints = _normalize_execution_stage_update_chunks(
             chunk_datapoints,
             layout,
           )
-          self._record_batch_experimental_update_route(
+          self._record_llqr_batch_update_route(
             operation="compile",
             route="chunked_lqr_segment",
             precond_batch_size=precond_batch_size,
@@ -2084,7 +2084,7 @@ class BasePreconditioner(abc.ABC):
           )
         else:
           acc_batches = _concat_preconditioner_batches(chunk_datapoints, layout, precond_batch_size)
-          self._record_batch_experimental_update_route(
+          self._record_llqr_batch_update_route(
             operation="compile",
             route="chunked_lqr_segment_layout_fallback",
             precond_batch_size=precond_batch_size,
@@ -2100,7 +2100,7 @@ class BasePreconditioner(abc.ABC):
         normalized_layout = layout
         if self._use_execution_stage_active_path:
           normalized_layout, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
-        self._record_batch_experimental_update_route(
+        self._record_llqr_batch_update_route(
           operation="compile",
           route="full_batch",
           precond_batch_size=precond_batch_size,

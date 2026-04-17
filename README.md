@@ -27,8 +27,8 @@ A100 surface, prefer the exact mixed-term grouped chunked route when it fits:
 
 ```bash
 python run.py experiment=resnet50-imagenet \
-  llqr_batch_experimental_mode=rm_param_only \
-  llqr_batch_chunk_size=128 \
+  llqr_batch_update_mode=chunked_lqr_segment \
+  llqr_batch_update_chunk_size=128 \
   llqr_use_fast_paths=true
 ```
 
