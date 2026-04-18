@@ -3,6 +3,7 @@ from jax.tree_util import Partial
 from lqr_optimizer._src.models.mlp import create_mlp, create_mlp_legacy
 from lqr_optimizer._src.models.resnet import create_resnet18, create_resnet50
 from lqr_optimizer._src.models.vgg import create_vgg16bn
+from lqr_optimizer._src.models.wide_resnet import create_wide_resnet28x10
 from lqr_optimizer._src.models.grok_model import create_grok_model
 from lqr_optimizer._src.models.gpt import create_gpt_model
 from lqr_optimizer._src.utils import divergence
@@ -17,6 +18,7 @@ model_choice = {
   "resnet-18": create_resnet18,
   "resnet-50": create_resnet50,
   "vgg16-bn": create_vgg16bn,
+  "wide-resnet-28-10": create_wide_resnet28x10,
   "grok-transformer": create_grok_model,
   "gpt2-small": create_gpt_model,
 }
