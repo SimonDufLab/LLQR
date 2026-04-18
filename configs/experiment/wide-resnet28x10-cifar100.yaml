@@ -1,0 +1,29 @@
+# @package _global_
+defaults:
+  - /default
+  - /architecture: wide_resnet28x10
+  - /dataset: cifar100
+  - /lr_scheduler: cosine_annealing
+  - /precond_lr_scheduler: constant
+  - /ema_scheduler: constant
+  - /precond_update_scheduler: constant
+
+batch_size: 128
+learning_rate: 0.05
+momentum: 0.9
+main_optimizer: polyak
+weight_decay: 1e-3
+total_epochs: 200
+test_eval_freq: 2000
+checkpoint_freq: 1000
+init_key: 42
+rng_seed: 123
+
+precond_batch_size: 128
+sam_mode: base_fsam
+perturbation_rho: 0.2
+perturb_mode: ema_grad
+gbar_beta: 0.6
+use_preconditioner: false
+batch_solve_precond: false
+update_preconditioner_every: 999999
