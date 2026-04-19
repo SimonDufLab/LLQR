@@ -38,6 +38,8 @@ For the bounded local smoke posture and the exact direct-preset `run.py`
 commands used in this workspace, use:
 
 - `../tmp/benchmarks/llqr-vgg16bn-wrn28x10-architecture-smokes/README.md`
+- `../docs/plans/completed/llqr-vgg16bn-wrn28x10-architecture-support-exec-plan.md`
+- `../docs/reports/llqr-vgg16bn-wrn28x10-architecture-support-final-report-2026-04-18.md`
 
 ## LLQR large-batch route guidance
 
@@ -115,4 +117,6 @@ Then use:
 - `../docs/lqr-simplified-architecture-stage-contract.md`
 - `../docs/lqr-simplified-methodology.md`
 - `../docs/lqr-simplified-agent-notes.md`
+- `../docs/plans/completed/llqr-vgg16bn-wrn28x10-architecture-support-exec-plan.md`
+- `../docs/reports/llqr-vgg16bn-wrn28x10-architecture-support-final-report-2026-04-18.md`
 - `../tmp/benchmarks/llqr-vgg16bn-wrn28x10-architecture-smokes/README.md`
