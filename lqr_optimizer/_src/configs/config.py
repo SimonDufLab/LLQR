@@ -2,6 +2,7 @@
 from jax.tree_util import Partial
 from lqr_optimizer._src.models.mlp import create_mlp, create_mlp_legacy
 from lqr_optimizer._src.models.resnet import create_resnet18, create_resnet50
+from lqr_optimizer._src.models.pyramidnet import create_pyramidnet110
 from lqr_optimizer._src.models.vgg import create_vgg16bn
 from lqr_optimizer._src.models.wide_resnet import create_wide_resnet28x10
 from lqr_optimizer._src.models.grok_model import create_grok_model
@@ -17,6 +18,7 @@ model_choice = {
   "mlp-legacy": create_mlp_legacy,
   "resnet-18": create_resnet18,
   "resnet-50": create_resnet50,
+  "pyramidnet-110": create_pyramidnet110,
   "vgg16-bn": create_vgg16bn,
   "wide-resnet-28-10": create_wide_resnet28x10,
   "grok-transformer": create_grok_model,
