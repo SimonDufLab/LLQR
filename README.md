@@ -83,6 +83,11 @@ Current runtime semantics:
 - canonical `fisher_sam` requires the same neutral legacy defaults and intentionally treats `sam_use_preconditioner_on_update` as inert in favor of the vanilla optimizer update
 - `run.py` now delegates mode-specific train-step orchestration to `lqr_optimizer/_src/utils/sam_mode_handlers.py`, while `lqr_optimizer/_src/utils/utils.py` keeps the generic perturbation, canonical ASAM, canonical Fisher-SAM, and buffer helpers
 
+The durable benchmark trail for SAM remains intentionally narrower than the full
+public mode set. Use the benchmark notes below for timing or comparison claims,
+and use the final correctness-only mode matrix note for the exact current smoke
+commands across all public modes.
+
 There is also a research-only ablation surface:
 - `sam_research_base_vector_source`: `current_gradient | main_optimizer_momentum | random_direction`
 - `sam_research_perturb_sign`: `ascent | descent`
@@ -101,6 +106,7 @@ research-only perturbation-source ablation matrix, and final closure rationale,
 use the workspace notes:
 - `../tmp/benchmarks/llqr-base-sam-wave3-comparison/README.md`
 - `../tmp/benchmarks/llqr-sam-perturbation-ablation-wave3-local/README.md`
+- `../tmp/llqr-sam-handler-and-new-modes-2026-04-20/wave_4/README.md`
 - `../docs/plans/completed/llqr-sam-perturbation-source-ablation-exec-plan.md`
 - `../docs/reports/llqr-sam-perturbation-source-ablation-final-report-2026-04-16.md`
 - `../docs/reports/llqr-base-sam-support-final-report-2026-04-15.md`
