@@ -107,6 +107,8 @@ use the workspace notes:
 - `../tmp/benchmarks/llqr-base-sam-wave3-comparison/README.md`
 - `../tmp/benchmarks/llqr-sam-perturbation-ablation-wave3-local/README.md`
 - `../tmp/llqr-sam-handler-and-new-modes-2026-04-20/wave_4/README.md`
+- `../docs/plans/completed/llqr-sam-handler-and-new-modes-exec-plan.md`
+- `../docs/reports/llqr-sam-handler-and-new-modes-final-report-2026-04-20.md`
 - `../docs/plans/completed/llqr-sam-perturbation-source-ablation-exec-plan.md`
 - `../docs/reports/llqr-sam-perturbation-source-ablation-final-report-2026-04-16.md`
 - `../docs/reports/llqr-base-sam-support-final-report-2026-04-15.md`
