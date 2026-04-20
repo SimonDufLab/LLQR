@@ -72,6 +72,7 @@ Current runtime semantics:
 - `base_sam` perturbs from the current gradient and leaves `gbar` / `g_last` untouched
 - `base_fsam` perturbs from `g_current - gbar`
 - `past_fsam` preserves the rolling-buffer variant used before the rename
+- `run.py` now delegates mode-specific train-step orchestration to `lqr_optimizer/_src/utils/sam_mode_handlers.py`, while `lqr_optimizer/_src/utils/utils.py` keeps the generic perturbation and buffer helpers
 
 There is also a research-only ablation surface:
 - `sam_research_base_vector_source`: `current_gradient | main_optimizer_momentum | random_direction`
@@ -104,6 +105,7 @@ The `resnet18-cifar10` comparison remains an external-only higher-memory follow-
 - `lqr_optimizer/_src/exact_methods.py`: exact or benchmark-style second-order helpers
 - `lqr_optimizer/_src/utils/build_lqr.py`: LQR object construction from model linearization
 - `lqr_optimizer/_src/utils/build_lqr_segments.py`: grouped LLQR segment builders used by full-batch and chunked split execution-stage updates
+- `lqr_optimizer/_src/utils/sam_mode_handlers.py`: SAM-family train-step dispatcher for the current legacy mode family
 - `lqr_optimizer/_src/models/`: architecture definitions
 - `lqr_optimizer/_src/block_matrices_approx/`: structured inverse-preconditioner parameterizations
 
