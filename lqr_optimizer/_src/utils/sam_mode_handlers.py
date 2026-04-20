@@ -18,6 +18,30 @@ def _normalize_sam_mode(sam_mode):
   return None if not sam_mode else sam_mode
 
 
+def _sam_outer_update_uses_preconditioner(cfg):
+  return getattr(cfg, "sam_use_preconditioner_on_update", True)
+
+
+def _llqr_outer_update_toggle_is_active(sam_mode):
+  return sam_mode in ("base_sam", "base_fsam", "past_fsam", "asam")
+
+
+def _resolve_sam_outer_update_apply_fn(
+    cfg,
+    *,
+    sam_mode,
+    apply_training_update,
+    apply_vanilla_training_update,
+):
+  if sam_mode is None:
+    return apply_training_update
+  if sam_mode == "fisher_sam":
+    return apply_vanilla_training_update
+  if _sam_outer_update_uses_preconditioner(cfg):
+    return apply_training_update
+  return apply_vanilla_training_update
+
+
 def _validate_mode_uses_neutral_legacy_defaults(cfg, *, sam_mode):
   for field_name, expected_value in _LEGACY_SAM_NEUTRAL_DEFAULTS:
     actual_value = getattr(cfg, field_name)
@@ -51,6 +75,15 @@ def validate_sam_mode_contract(cfg, opt_state):
     _validate_asam_mode_contract(cfg)
   if sam_mode == "fisher_sam":
     _validate_fisher_sam_mode_contract(cfg)
+  if (
+      _llqr_outer_update_toggle_is_active(sam_mode)
+      and _sam_outer_update_uses_preconditioner(cfg)
+      and not getattr(cfg, "use_preconditioner", True)
+  ):
+    raise ValueError(
+      f"sam_mode={sam_mode!r} requires use_preconditioner=true when "
+      "sam_use_preconditioner_on_update=true."
+    )
   utl.validate_sam_research_contract(cfg, opt_state)
 
 
@@ -115,7 +148,12 @@ def _build_base_sam_train_step(
     apply_vanilla_training_update,
     precond_apply_fn,
 ):
-  del apply_vanilla_training_update
+  apply_outer_update = _resolve_sam_outer_update_apply_fn(
+    cfg,
+    sam_mode="base_sam",
+    apply_training_update=apply_training_update,
+    apply_vanilla_training_update=apply_vanilla_training_update,
+  )
 
   @jax.jit
   def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
@@ -152,7 +190,7 @@ def _build_base_sam_train_step(
       params_pert, state.batch_stats, key_for_perturbed_pass, x_acc, y_acc
     )
 
-    new_state = apply_training_update(
+    new_state = apply_outer_update(
       state, precond_blocks, mean_grads_pert, final_batch_stats
     )
     new_gbar, new_g_last = utl.resolve_sam_state_buffers(
@@ -181,7 +219,13 @@ def _build_asam_train_step(
     apply_vanilla_training_update,
     precond_apply_fn,
 ):
-  del apply_vanilla_training_update, precond_apply_fn
+  del precond_apply_fn
+  apply_outer_update = _resolve_sam_outer_update_apply_fn(
+    cfg,
+    sam_mode="asam",
+    apply_training_update=apply_training_update,
+    apply_vanilla_training_update=apply_vanilla_training_update,
+  )
 
   @jax.jit
   def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
@@ -201,7 +245,7 @@ def _build_asam_train_step(
       params_pert, state.batch_stats, key_after_center, x_acc, y_acc
     )
 
-    new_state = apply_training_update(
+    new_state = apply_outer_update(
       state, precond_blocks, mean_grads_pert, final_batch_stats
     )
     new_gbar, new_g_last = utl.resolve_sam_state_buffers(
@@ -278,7 +322,12 @@ def _build_past_fsam_train_step(
     apply_vanilla_training_update,
     precond_apply_fn,
 ):
-  del apply_vanilla_training_update
+  apply_outer_update = _resolve_sam_outer_update_apply_fn(
+    cfg,
+    sam_mode="past_fsam",
+    apply_training_update=apply_training_update,
+    apply_vanilla_training_update=apply_vanilla_training_update,
+  )
 
   @jax.jit
   def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
@@ -298,7 +347,7 @@ def _build_past_fsam_train_step(
       params_pert, state.batch_stats, dropout_key, x_acc, y_acc
     )
 
-    new_state = apply_training_update(
+    new_state = apply_outer_update(
       state, precond_blocks, mean_grads, final_batch_stats
     )
     new_gbar, new_g_last = utl.resolve_sam_state_buffers(
@@ -330,7 +379,12 @@ def _build_base_fsam_train_step(
     apply_vanilla_training_update,
     precond_apply_fn,
 ):
-  del apply_vanilla_training_update
+  apply_outer_update = _resolve_sam_outer_update_apply_fn(
+    cfg,
+    sam_mode="base_fsam",
+    apply_training_update=apply_training_update,
+    apply_vanilla_training_update=apply_vanilla_training_update,
+  )
 
   @jax.jit
   def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
@@ -367,7 +421,7 @@ def _build_base_fsam_train_step(
       params_pert, state.batch_stats, key_for_perturbed_pass, x_acc, y_acc
     )
 
-    new_state = apply_training_update(
+    new_state = apply_outer_update(
       state, precond_blocks, mean_grads_pert, final_batch_stats
     )
     new_gbar, new_g_last = utl.resolve_sam_state_buffers(
