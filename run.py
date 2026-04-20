@@ -416,6 +416,7 @@ def main(cfg: DictConfig):
         precond_apply_fn=precond_apply_fn,
         rho=cfg.perturbation_rho,
         mode=cfg.perturb_mode,
+        norm_mode=cfg.norm_mode,
         eps=cfg.gbar_eps,
       )
       eps_tree = utl.apply_sam_perturb_sign(
@@ -459,6 +460,7 @@ def main(cfg: DictConfig):
         precond_apply_fn=precond_apply_fn,
         rho=cfg.perturbation_rho,
         mode=cfg.perturb_mode,
+        norm_mode=cfg.norm_mode,
         eps=cfg.gbar_eps,
       )
 
@@ -536,6 +538,7 @@ def main(cfg: DictConfig):
         precond_apply_fn=precond_apply_fn,
         rho=cfg.perturbation_rho,
         mode=cfg.perturb_mode,
+        norm_mode=cfg.norm_mode,
         eps=cfg.gbar_eps,
       )
       eps_tree = utl.apply_sam_perturb_sign(

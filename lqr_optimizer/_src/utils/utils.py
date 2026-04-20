@@ -1362,6 +1362,9 @@ def tree_add(a, b):
 def tree_sub(a, b):
   return jax.tree_map(jnp.subtract, a, b)
 
+def tree_add_scalar(tree, s):
+  return jax.tree_map(lambda x: x + s, tree)
+
 def tree_mul_scalar(tree, s):
   return jax.tree_map(lambda x: x * s, tree)
 
@@ -1383,15 +1386,38 @@ def tree_dot_subtree(x_sub, y_sub):
   )
   return jnp.sum(jnp.stack(leaves)) if leaves else jnp.array(0.0, dtype=jnp.float32)
 
+def _from_top_level_items_like(template_tree, items):
+  if isinstance(template_tree, FrozenDict):
+    return FrozenDict(items)
+  return type(template_tree)(items)
+
 def tree_dot_per_layer(a, b):
-  return jax.tree_map(tree_dot_subtree, a, b)
+  return _from_top_level_items_like(
+    a,
+    {
+      layer_name: tree_dot_subtree(a[layer_name], b[layer_name])
+      for layer_name in a.keys()
+    },
+  )
 
 def tree_l2_norm_per_layer(tree, eps=1e-12):
   return jax.tree_map(lambda d: jnp.sqrt(d + eps), tree_dot_per_layer(tree, tree))
 
 def tree_normalize_per_layer(tree, eps=1e-12):
   norms = tree_l2_norm_per_layer(tree, eps)
-  return jax.tree_map(lambda sub, n: jax.tree_map(lambda x: x / n, sub), tree, norms)
+  return tree_divide_by_layer_scalars(tree, norms)
+
+def tree_divide_by_layer_scalars(tree, scalars):
+  return _from_top_level_items_like(
+    tree,
+    {
+      layer_name: jax.tree_map(
+        lambda value, denom=scalars[layer_name]: value / denom,
+        layer_tree,
+      )
+      for layer_name, layer_tree in tree.items()
+    },
+  )
 
 VALID_SAM_RESEARCH_BASE_VECTOR_SOURCES = (
   "current_gradient",
@@ -1535,25 +1561,41 @@ def make_perturbation_from_vector(
     precond_apply_fn,
     rho: float,
     mode: str,
+    norm_mode: str = "euclidean",
     eps: float = 1e-12,
 ):
   """Build a perturbation tree from an already chosen perturbation vector."""
   vector = jax.lax.stop_gradient(vector)
+  n_layers = len(vector)
 
   if mode == "ema_grad":
     transformed = vector
   elif mode == "ema_precond_grad":
     transformed = precond_apply_fn(precond_blocks, vector)
-  elif mode == "ema_direction":
+  elif mode == "ema_direction": # TODO: now redundant with the added various norm_mode below. Remove
     transformed = precond_apply_fn(precond_blocks, vector)
     transformed = tree_normalize(transformed, eps)
   else:
     raise ValueError(f"Unknown perturb_mode: {mode}")
 
-  # sqrt(v^T P^T P v). Less principled than sqrt(v^T P v), but more stable.
-  denom = jnp.sqrt(tree_dot(transformed, transformed) + eps)
-  direction = tree_mul_scalar(transformed, 1.0 / denom)
-  return tree_mul_scalar(direction, rho)
+  if norm_mode == "euclidean": # sqrt(v^T P^T P v). Less principled than sqrt(v^T P v), but more stable.
+    denom = jnp.sqrt(tree_dot(transformed, transformed) + eps)
+    direction = tree_mul_scalar(transformed, 1.0 / denom)
+  elif norm_mode == "matrix_norm":# sqrt(v^T P v)
+    denom = jnp.sqrt(tree_dot(vector, transformed) + eps)
+    direction = tree_mul_scalar(transformed, 1.0 / denom)
+  elif norm_mode == "layer_matrix_norm":
+    denom = jax.tree_map(jnp.sqrt, tree_add_scalar(tree_dot_per_layer(vector, transformed), eps))
+    direction = tree_divide_by_layer_scalars(transformed, denom)
+    direction = tree_mul_scalar(direction, 1.0 / jnp.sqrt(n_layers))
+  elif norm_mode == "layer_euclidean":
+    denom = jax.tree_map(jnp.sqrt, tree_add_scalar(tree_dot_per_layer(transformed, transformed), eps))
+    direction = tree_divide_by_layer_scalars(transformed, denom)
+    direction = tree_mul_scalar(direction, 1.0 / jnp.sqrt(n_layers))
+  else:
+    raise ValueError(f"Unknown norm_mode: {norm_mode}")
+
+  return tree_mul_scalar(direction, rho) # Rho for final scaling
 
 
 def make_perturbation_from_grad(
@@ -1563,6 +1605,7 @@ def make_perturbation_from_grad(
     precond_apply_fn,
     rho: float,
     mode: str,
+    norm_mode: str = "euclidean",
     eps: float = 1e-12,
 ):
   """Thin wrapper for SAM-style perturbations built directly from a gradient."""
@@ -1572,6 +1615,7 @@ def make_perturbation_from_grad(
     precond_apply_fn=precond_apply_fn,
     rho=rho,
     mode=mode,
+    norm_mode=norm_mode,
     eps=eps,
   )
 
@@ -1583,6 +1627,7 @@ def make_perturbation_from_noise(
     precond_apply_fn,
     rho: float,
     mode: str,
+    norm_mode: str = "euclidean",
     eps: float = 1e-12,
 ):
   """
@@ -1598,6 +1643,7 @@ def make_perturbation_from_noise(
     precond_apply_fn=precond_apply_fn,
     rho=rho,
     mode=mode,
+    norm_mode=norm_mode,
     eps=eps,
   )
 

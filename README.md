@@ -66,6 +66,7 @@ The current public SAM configuration surface is:
 - `sam_mode`: perturbation source selector; current supported values are `null`, `base_sam`, `base_fsam`, and `past_fsam`
 - `perturbation_rho`: perturbation magnitude
 - `perturb_mode`: perturbation geometry selector
+- `norm_mode`: perturbation normalization selector; current supported values are `euclidean`, `matrix_norm`, `layer_matrix_norm`, and `layer_euclidean`
 
 Current runtime semantics:
 - `base_sam` perturbs from the current gradient and leaves `gbar` / `g_last` untouched
