@@ -3,17 +3,39 @@ import jax
 import lqr_optimizer._src.utils.utils as utl
 
 
-SUPPORTED_SAM_MODES = (None, "base_sam", "base_fsam", "past_fsam")
+SUPPORTED_SAM_MODES = (None, "base_sam", "base_fsam", "past_fsam", "asam")
+_CANONICAL_ASAM_DEFAULTS = (
+  ("perturb_mode", "ema_grad"),
+  ("norm_mode", "euclidean"),
+  ("sam_research_base_vector_source", "current_gradient"),
+  ("sam_research_perturb_sign", "ascent"),
+  ("gbar_beta", 0.9),
+  ("gbar_eps", 1e-12),
+)
 
 
 def _normalize_sam_mode(sam_mode):
   return None if not sam_mode else sam_mode
 
 
+def _validate_asam_mode_contract(cfg):
+  if cfg.asam_eta < 0:
+    raise ValueError(f"sam_mode='asam' requires asam_eta >= 0; got {cfg.asam_eta!r}.")
+
+  for field_name, expected_value in _CANONICAL_ASAM_DEFAULTS:
+    actual_value = getattr(cfg, field_name)
+    if actual_value != expected_value:
+      raise ValueError(
+        f"sam_mode='asam' requires {field_name}={expected_value!r}; got {actual_value!r}."
+      )
+
+
 def validate_sam_mode_contract(cfg, opt_state):
   sam_mode = _normalize_sam_mode(cfg.sam_mode)
   if sam_mode not in SUPPORTED_SAM_MODES:
     raise ValueError(f"Unsupported sam_mode: {cfg.sam_mode}")
+  if sam_mode == "asam":
+    _validate_asam_mode_contract(cfg)
   utl.validate_sam_research_contract(cfg, opt_state)
 
 
@@ -30,6 +52,7 @@ def build_train_step_jit(
     "base_sam": _build_base_sam_train_step,
     "past_fsam": _build_past_fsam_train_step,
     "base_fsam": _build_base_fsam_train_step,
+    "asam": _build_asam_train_step,
   }
   try:
     builder = builders[sam_mode]
@@ -118,6 +141,54 @@ def _build_base_sam_train_step(
       mean_grads_pert=mean_grads_pert,
       precond_blocks=precond_blocks,
       precond_apply_fn=precond_apply_fn,
+      beta=cfg.gbar_beta,
+      mode=cfg.perturb_mode,
+      eps=cfg.gbar_eps,
+    )
+    new_state = new_state.replace(gbar=new_gbar, g_last=new_g_last)
+    return new_state, mean_loss_pert, key_out
+
+  return train_step_jit
+
+
+def _build_asam_train_step(
+    cfg,
+    *,
+    accumulate_grads,
+    apply_training_update,
+    precond_apply_fn,
+):
+  del precond_apply_fn
+
+  @jax.jit
+  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+    mean_loss_center, mean_grads_center, _, key_after_center = accumulate_grads(
+      state.params, state.batch_stats, dropout_key, x_acc, y_acc
+    )
+
+    eps_tree = utl.make_asam_perturbation_from_grad(
+      params=state.params,
+      grad=mean_grads_center,
+      rho=cfg.perturbation_rho,
+      eta=cfg.asam_eta,
+    )
+
+    params_pert = utl.tree_add(state.params, eps_tree)
+    mean_loss_pert, mean_grads_pert, final_batch_stats, key_out = accumulate_grads(
+      params_pert, state.batch_stats, key_after_center, x_acc, y_acc
+    )
+
+    new_state = apply_training_update(
+      state, precond_blocks, mean_grads_pert, final_batch_stats
+    )
+    new_gbar, new_g_last = utl.resolve_sam_state_buffers(
+      sam_mode="asam",
+      g_bar=state.gbar,
+      g_last=state.g_last,
+      mean_grads_center=mean_grads_center,
+      mean_grads_pert=mean_grads_pert,
+      precond_blocks=precond_blocks,
+      precond_apply_fn=lambda *_args, **_kwargs: None,
       beta=cfg.gbar_beta,
       mode=cfg.perturb_mode,
       eps=cfg.gbar_eps,

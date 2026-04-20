@@ -15,6 +15,7 @@ from aim import Distribution
 
 import flax.linen as nn
 from flax.linen import Sequential
+from flax.core import freeze
 from flax.core.frozen_dict import FrozenDict
 from flax import struct
 from flax.training import train_state
@@ -1554,6 +1555,54 @@ def apply_sam_perturb_sign(eps_tree, sign: str):
     f"{VALID_SAM_RESEARCH_PERTURB_SIGNS}; got {sign!r}."
   )
 
+
+def _restore_tree_container_like(template_tree, tree):
+  if isinstance(template_tree, FrozenDict):
+    return freeze(tree)
+  return tree
+
+
+def _build_asam_scale_tree(params, *, eta: float):
+  flat_params = flatten_dict(params)
+  scale_flat = {}
+  for path, leaf_value in flat_params.items():
+    leaf_name = path[-1] if path else None
+    if leaf_name == "bias":
+      scale_flat[path] = jnp.ones_like(leaf_value)
+    else:
+      scale_flat[path] = jnp.abs(leaf_value) + eta
+
+  return _restore_tree_container_like(params, unflatten_dict(scale_flat))
+
+
+def make_asam_perturbation_from_grad(
+    *,
+    params,
+    grad,
+    rho: float,
+    eta: float,
+    eps: float = 1e-12,
+):
+  """Build the canonical ASAM perturbation from params and the center gradient."""
+  if eta < 0:
+    raise ValueError(f"asam_eta must be non-negative; got {eta!r}.")
+
+  params = jax.lax.stop_gradient(params)
+  grad = jax.lax.stop_gradient(grad)
+  scale_tree = _build_asam_scale_tree(params, eta=eta)
+  weighted_grad = jax.tree_util.tree_map(
+    lambda scale, grad_leaf: scale * grad_leaf,
+    scale_tree,
+    grad,
+  )
+  denom = jnp.sqrt(tree_dot(weighted_grad, weighted_grad) + eps)
+  return jax.tree_util.tree_map(
+    lambda scale, grad_leaf: rho * scale * scale * grad_leaf / denom,
+    scale_tree,
+    grad,
+  )
+
+
 def make_perturbation_from_vector(
     *,
     precond_blocks,
@@ -1703,7 +1752,7 @@ def resolve_sam_state_buffers(
     eps: float = 1e-12,
 ):
   """Return the post-step ``(gbar, g_last)`` pair for a SAM-family mode."""
-  if sam_mode == "base_sam":
+  if sam_mode in ("base_sam", "asam"):
     return (
       jax.lax.stop_gradient(g_bar),
       jax.lax.stop_gradient(g_last),

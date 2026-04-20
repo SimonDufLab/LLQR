@@ -63,8 +63,9 @@ fits.
 ## SAM surface
 
 The current public SAM configuration surface is:
-- `sam_mode`: perturbation source selector; current supported values are `null`, `base_sam`, `base_fsam`, and `past_fsam`
+- `sam_mode`: perturbation source selector; current supported values are `null`, `base_sam`, `base_fsam`, `past_fsam`, and `asam`
 - `perturbation_rho`: perturbation magnitude
+- `asam_eta`: canonical ASAM stability offset on non-bias parameters; default `0.01`
 - `perturb_mode`: perturbation geometry selector
 - `norm_mode`: perturbation normalization selector; current supported values are `euclidean`, `matrix_norm`, `layer_matrix_norm`, and `layer_euclidean`
 
@@ -72,7 +73,9 @@ Current runtime semantics:
 - `base_sam` perturbs from the current gradient and leaves `gbar` / `g_last` untouched
 - `base_fsam` perturbs from `g_current - gbar`
 - `past_fsam` preserves the rolling-buffer variant used before the rename
-- `run.py` now delegates mode-specific train-step orchestration to `lqr_optimizer/_src/utils/sam_mode_handlers.py`, while `lqr_optimizer/_src/utils/utils.py` keeps the generic perturbation and buffer helpers
+- `asam` applies the canonical ASAM perturbation from the current gradient using element-wise non-bias parameter scaling and leaves `gbar` / `g_last` untouched
+- canonical `asam` requires the neutral legacy defaults for `perturb_mode`, `norm_mode`, `sam_research_*`, `gbar_beta`, and `gbar_eps`; those knobs remain part of the legacy SAM / Friendly-SAM surface rather than the ASAM contract
+- `run.py` now delegates mode-specific train-step orchestration to `lqr_optimizer/_src/utils/sam_mode_handlers.py`, while `lqr_optimizer/_src/utils/utils.py` keeps the generic perturbation, canonical ASAM, and buffer helpers
 
 There is also a research-only ablation surface:
 - `sam_research_base_vector_source`: `current_gradient | main_optimizer_momentum | random_direction`
@@ -105,7 +108,7 @@ The `resnet18-cifar10` comparison remains an external-only higher-memory follow-
 - `lqr_optimizer/_src/exact_methods.py`: exact or benchmark-style second-order helpers
 - `lqr_optimizer/_src/utils/build_lqr.py`: LQR object construction from model linearization
 - `lqr_optimizer/_src/utils/build_lqr_segments.py`: grouped LLQR segment builders used by full-batch and chunked split execution-stage updates
-- `lqr_optimizer/_src/utils/sam_mode_handlers.py`: SAM-family train-step dispatcher for the current legacy mode family
+- `lqr_optimizer/_src/utils/sam_mode_handlers.py`: SAM-family train-step dispatcher for `null`, `base_sam`, `base_fsam`, `past_fsam`, and `asam`
 - `lqr_optimizer/_src/models/`: architecture definitions
 - `lqr_optimizer/_src/block_matrices_approx/`: structured inverse-preconditioner parameterizations
 
