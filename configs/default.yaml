@@ -56,9 +56,10 @@ preempt_handling: false
 jobid: null  # To manually restart a previous job
 
 # SAM / Friendly-SAM training options
-sam_mode: null # "base_sam" | "base_fsam" | "past_fsam" | "asam"
+sam_mode: null # "base_sam" | "base_fsam" | "past_fsam" | "asam" | "fisher_sam"
 perturbation_rho: 0.1
 asam_eta: 0.01 # Canonical ASAM stability offset on non-bias parameters.
+fisher_sam_eta: 0.1 # Canonical Fisher-SAM additive inverse-Fisher diagonal regularizer.
 perturb_mode: 'ema_grad' # "ema_grad" | "ema_precond_grad" | "ema_direction"
 norm_mode: euclidean # "euclidean" | "matrix_norm" | "layer_matrix_norm" | "layer_euclidean"
 sam_research_base_vector_source: current_gradient # Research/ablation only; "current_gradient" | "main_optimizer_momentum" | "random_direction". Neutral default preserves current training behavior.

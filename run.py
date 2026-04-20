@@ -354,7 +354,7 @@ def main(cfg: DictConfig):
     mean_grads = jax.tree_map(lambda v: v / acc_steps, sum_grads)
     return mean_loss, mean_grads, final_batch_stats, key_out
 
-  def apply_training_update(state, precond_blocks, grads, batch_stats):
+  def apply_configured_training_update(state, precond_blocks, grads, batch_stats):
     if cfg.precond_on_update:
       return state.apply_gradients_and_precond(
         grads=grads,
@@ -370,10 +370,19 @@ def main(cfg: DictConfig):
       batch_stats=batch_stats,
     )
 
+  def apply_vanilla_training_update(state, precond_blocks, grads, batch_stats):
+    del precond_blocks
+    return state.apply_gradients(
+      grads=grads,
+      normalize_conv_params=cfg.normalize_conv_params,
+      batch_stats=batch_stats,
+    )
+
   train_step_jit = sam_mode_handlers.build_train_step_jit(
     cfg,
     accumulate_grads=accumulate_grads,
-    apply_training_update=apply_training_update,
+    apply_training_update=apply_configured_training_update,
+    apply_vanilla_training_update=apply_vanilla_training_update,
     precond_apply_fn=precond_apply_fn,
   )
 

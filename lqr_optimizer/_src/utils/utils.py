@@ -1603,6 +1603,30 @@ def make_asam_perturbation_from_grad(
   )
 
 
+def make_fisher_sam_perturbation_from_grad(
+    *,
+    grad,
+    rho: float,
+    eta: float,
+    eps: float = 1e-12,
+):
+  """Build the canonical Fisher-SAM perturbation from the center gradient."""
+  if eta < 0:
+    raise ValueError(f"fisher_sam_eta must be non-negative; got {eta!r}.")
+
+  grad = jax.lax.stop_gradient(grad)
+  inv_fisher_grad = jax.tree_util.tree_map(
+    lambda grad_leaf: grad_leaf / (jnp.square(grad_leaf) + eta),
+    grad,
+  )
+  denom = jnp.sqrt(tree_dot(grad, inv_fisher_grad) + eps)
+  perturbation = jax.tree_util.tree_map(
+    lambda leaf: rho * leaf / denom,
+    inv_fisher_grad,
+  )
+  return _restore_tree_container_like(grad, perturbation)
+
+
 def make_perturbation_from_vector(
     *,
     precond_blocks,
@@ -1752,7 +1776,7 @@ def resolve_sam_state_buffers(
     eps: float = 1e-12,
 ):
   """Return the post-step ``(gbar, g_last)`` pair for a SAM-family mode."""
-  if sam_mode in ("base_sam", "asam"):
+  if sam_mode in ("base_sam", "asam", "fisher_sam"):
     return (
       jax.lax.stop_gradient(g_bar),
       jax.lax.stop_gradient(g_last),
