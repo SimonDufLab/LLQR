@@ -59,6 +59,7 @@ jobid: null  # To manually restart a previous job
 sam_mode: null # "base_sam" | "base_fsam" | "past_fsam"
 perturbation_rho: 0.1
 perturb_mode: 'ema_grad' # "ema_grad" | "ema_precond_grad" | "ema_direction"
+norm_mode: euclidean # "euclidean" | "matrix_norm" | "layer_matrix_norm" | "layer_euclidean"
 sam_research_base_vector_source: current_gradient # Research/ablation only; "current_gradient" | "main_optimizer_momentum" | "random_direction". Neutral default preserves current training behavior.
 sam_research_perturb_sign: ascent # Research/ablation only; "ascent" | "descent". Not part of the final training pipeline.
 gbar_beta: 0.9
