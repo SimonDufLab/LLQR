@@ -12,7 +12,7 @@ It contains the main training entrypoint, config-driven experiment definitions, 
 
 Experiments are composed from `configs/`.
 The main user-facing group is `configs/experiment/`, which selects a dataset, architecture, and schedule bundle.
-Representative experiments currently include ResNet/CIFAR, ResNet/ImageNet, GPT/WikiText-103, grokking-style transformer runs, and the CIFAR architecture-support presets `vgg16bn-cifar10`, `vgg16bn-cifar100`, `wide-resnet28x10-cifar10`, and `wide-resnet28x10-cifar100`.
+Representative experiments currently include ResNet/CIFAR, ResNet/ImageNet, GPT/WikiText-103, grokking-style transformer runs, and the CIFAR architecture-support presets `vgg16bn-cifar10`, `vgg16bn-cifar100`, `wide-resnet28x10-cifar10`, `wide-resnet28x10-cifar100`, `pyramidnet110-cifar10`, and `pyramidnet110-cifar100`.
 
 A typical Hydra invocation shape is:
 
@@ -26,6 +26,7 @@ The current dedicated CIFAR architecture additions are:
 
 - `vgg16-bn`, implemented in `lqr_optimizer/_src/models/vgg.py`
 - `wide-resnet-28-10`, implemented in `lqr_optimizer/_src/models/wide_resnet.py`
+- `pyramidnet-110`, implemented in `lqr_optimizer/_src/models/pyramidnet.py`
 
 The maintained Friendly-SAM-aligned CIFAR presets for those models are:
 
@@ -33,11 +34,14 @@ The maintained Friendly-SAM-aligned CIFAR presets for those models are:
 - `vgg16bn-cifar100`
 - `wide-resnet28x10-cifar10`
 - `wide-resnet28x10-cifar100`
+- `pyramidnet110-cifar10`
+- `pyramidnet110-cifar100`
 
-For the bounded local smoke posture and the exact direct-preset `run.py`
-commands used in this workspace, use:
+For the maintained CIFAR validation posture in this workspace, use:
 
 - `../tmp/benchmarks/llqr-vgg16bn-wrn28x10-architecture-smokes/README.md`
+- `../tmp/benchmarks/llqr-pyramidnet110-architecture-smokes/README.md`
+- `../docs/plans/in_progress/llqr-pyramidnet110-architecture-support-exec-plan.md`
 - `../docs/plans/completed/llqr-vgg16bn-wrn28x10-architecture-support-exec-plan.md`
 - `../docs/reports/llqr-vgg16bn-wrn28x10-architecture-support-final-report-2026-04-18.md`
 
@@ -137,6 +141,8 @@ Then use:
 - `../docs/lqr-simplified-architecture-stage-contract.md`
 - `../docs/lqr-simplified-methodology.md`
 - `../docs/lqr-simplified-agent-notes.md`
+- `../docs/plans/in_progress/llqr-pyramidnet110-architecture-support-exec-plan.md`
 - `../docs/plans/completed/llqr-vgg16bn-wrn28x10-architecture-support-exec-plan.md`
 - `../docs/reports/llqr-vgg16bn-wrn28x10-architecture-support-final-report-2026-04-18.md`
+- `../tmp/benchmarks/llqr-pyramidnet110-architecture-smokes/README.md`
 - `../tmp/benchmarks/llqr-vgg16bn-wrn28x10-architecture-smokes/README.md`
