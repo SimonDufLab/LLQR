@@ -1,0 +1,4 @@
+name: vit-s-16
+
+activation: gelu
+size: null

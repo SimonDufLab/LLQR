@@ -20,15 +20,17 @@ A typical Hydra invocation shape is:
 python run.py experiment=resnet18-cifar10
 ```
 
-## CIFAR architecture surfaces
+## Architecture surfaces
 
-The current dedicated CIFAR architecture additions are:
+The current dedicated architecture additions are:
 
 - `vgg16-bn`, implemented in `lqr_optimizer/_src/models/vgg.py`
 - `wide-resnet-28-10`, implemented in `lqr_optimizer/_src/models/wide_resnet.py`
 - `pyramidnet-110`, implemented in `lqr_optimizer/_src/models/pyramidnet.py`
+- `vit-ti-16`, implemented in `lqr_optimizer/_src/models/vit.py`
+- `vit-s-16`, implemented in `lqr_optimizer/_src/models/vit.py`
 
-The maintained Friendly-SAM-aligned CIFAR presets for those models are:
+The maintained Friendly-SAM-aligned CIFAR presets currently exist for:
 
 - `vgg16bn-cifar10`
 - `vgg16bn-cifar100`
@@ -36,6 +38,10 @@ The maintained Friendly-SAM-aligned CIFAR presets for those models are:
 - `wide-resnet28x10-cifar100`
 - `pyramidnet110-cifar10`
 - `pyramidnet110-cifar100`
+
+The newly added ViT family currently lands only the architecture-routing and
+execution-stage / LLQR-segment surface. Its first public experiment preset is a
+later wave.
 
 For the maintained CIFAR validation posture in this workspace, use:
 
