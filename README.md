@@ -39,14 +39,18 @@ The maintained Friendly-SAM-aligned CIFAR presets currently exist for:
 - `pyramidnet110-cifar10`
 - `pyramidnet110-cifar100`
 
-The newly added ViT family currently lands only the architecture-routing and
-execution-stage / LLQR-segment surface. Its first public experiment preset is a
-later wave.
+The current public ViT surface is intentionally narrower:
+
+- routed architectures: `vit-ti-16` and `vit-s-16`
+- single public preset: `vit-ti16-cifar100-adamw`
+- public optimizer addition used by that preset: `main_optimizer=adamw`
+- intentional boundary: `vit-s-16` is routed but still has no public preset
 
 For the maintained CIFAR validation posture in this workspace, use:
 
 - `../tmp/benchmarks/llqr-vgg16bn-wrn28x10-architecture-smokes/README.md`
 - `../tmp/benchmarks/llqr-pyramidnet110-architecture-smokes/README.md`
+- `../tmp/benchmarks/llqr-vit-ti16-vit-s16-architecture-smokes/README.md`
 - `../docs/plans/completed/llqr-pyramidnet110-architecture-support-exec-plan.md`
 - `../docs/reports/llqr-pyramidnet110-architecture-support-final-report-2026-04-21.md`
 - `../docs/plans/completed/llqr-vgg16bn-wrn28x10-architecture-support-exec-plan.md`
