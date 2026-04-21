@@ -468,13 +468,19 @@ def timed_jit(f):
 ##################################
 # Loading utils
 ##################################
-def load_main_optimizer(cfg, lr_or_sched):
+def load_main_optimizer(cfg, lr_or_sched, mask=None):
   if cfg.main_optimizer == "polyak":
     model_optimizer = optax.sgd(learning_rate=lr_or_sched, momentum=cfg.momentum)
   elif cfg.main_optimizer == "adam":
     model_optimizer = optax.adam(learning_rate=lr_or_sched)
   elif cfg.main_optimizer == "sgd":
     model_optimizer = optax.sgd(learning_rate=lr_or_sched)
+  elif cfg.main_optimizer == "adamw":
+    model_optimizer = optax.adamw(
+      learning_rate=lr_or_sched,
+      weight_decay=cfg.weight_decay,
+      mask=mask,
+    )
   elif cfg.main_optimizer == "adamw_b2-98": # Grokking exps #TODO: move to config files...
     model_optimizer = optax.adamw(learning_rate=lr_or_sched, b2=0.98, weight_decay=cfg.weight_decay)
   elif cfg.main_optimizer == "adamw_b2-95": # GPT experiments

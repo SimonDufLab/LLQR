@@ -152,7 +152,7 @@ def main(cfg: DictConfig):
     lr_sched_kwargs = {_key:_value for _key, _value in cfg.lr_scheduler.items() if _key!='name'}
     lr_or_sched = lr_schedule_choice[cfg.lr_scheduler.name](base_lr=cfg.learning_rate, total_epochs=cfg.total_epochs ,steps_per_epoch=steps_per_epoch, **lr_sched_kwargs)
   else: lr_or_sched = cfg.learning_rate
-  opt_chain.append(utl.load_main_optimizer(cfg, lr_or_sched))
+  opt_chain.append(utl.load_main_optimizer(cfg, lr_or_sched, mask=mask))
   model_optimizer = optax.chain(*opt_chain)
 
   migrated_checkpoint_layout = False
