@@ -41,7 +41,8 @@ For the maintained CIFAR validation posture in this workspace, use:
 
 - `../tmp/benchmarks/llqr-vgg16bn-wrn28x10-architecture-smokes/README.md`
 - `../tmp/benchmarks/llqr-pyramidnet110-architecture-smokes/README.md`
-- `../docs/plans/in_progress/llqr-pyramidnet110-architecture-support-exec-plan.md`
+- `../docs/plans/completed/llqr-pyramidnet110-architecture-support-exec-plan.md`
+- `../docs/reports/llqr-pyramidnet110-architecture-support-final-report-2026-04-21.md`
 - `../docs/plans/completed/llqr-vgg16bn-wrn28x10-architecture-support-exec-plan.md`
 - `../docs/reports/llqr-vgg16bn-wrn28x10-architecture-support-final-report-2026-04-18.md`
 
@@ -141,7 +142,8 @@ Then use:
 - `../docs/lqr-simplified-architecture-stage-contract.md`
 - `../docs/lqr-simplified-methodology.md`
 - `../docs/lqr-simplified-agent-notes.md`
-- `../docs/plans/in_progress/llqr-pyramidnet110-architecture-support-exec-plan.md`
+- `../docs/plans/completed/llqr-pyramidnet110-architecture-support-exec-plan.md`
+- `../docs/reports/llqr-pyramidnet110-architecture-support-final-report-2026-04-21.md`
 - `../docs/plans/completed/llqr-vgg16bn-wrn28x10-architecture-support-exec-plan.md`
 - `../docs/reports/llqr-vgg16bn-wrn28x10-architecture-support-final-report-2026-04-18.md`
 - `../tmp/benchmarks/llqr-pyramidnet110-architecture-smokes/README.md`
