@@ -37,6 +37,15 @@ def should_run_periodic_event(*, step: int, total_steps: int, every: int) -> boo
   return (step % every == 0) and ((step != 0) or (total_steps == 1))
 
 
+def build_model_pair_from_dataset_info(*, architecture_name: str, num_classes: int, ds_info):
+  """Build `(train_model, inf_model, model_kwargs)` from dataset metadata."""
+  model_kwargs = utl.resolve_model_init_kwargs(architecture_name, ds_info)
+  model, inf_model = model_choice[architecture_name](num_classes=num_classes, **model_kwargs)
+  if inf_model is None:
+    inf_model = model
+  return model, inf_model, model_kwargs
+
+
 @hydra.main(config_path="configs", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
   assert 0.0 <= cfg.ema_decay <= 1.0, f"cfg.ema_decay ({cfg.ema_decay}) must be in [0, 1]"
@@ -99,7 +108,8 @@ def main(cfg: DictConfig):
       )
     # precond_dataloader, _ = prepare_dataloader(batch_size=cfg.precond_batch_size, train=True, dataset=cfg.dataset.name, augment_dataset=cfg.dataset.augment_dataset, lt_config=cfg.dataset.lt_config, dataset_dir=cfg.dataset.dataset_dir)
     test_dataloader, test_ds_info = prepare_dataloader(batch_size=cfg.eval_batch_size, train=False, dataset=cfg.dataset.name, dataset_dir=cfg.dataset.dataset_dir)
-    test_ds_size = test_ds_info['ds_size']
+    ds_info = dict(ds_info)
+    ds_info.setdefault("test_ds_size", test_ds_info["ds_size"])
   elif cfg.dataset.loader == "hf":
     dataloader, test_dataloader, ds_info = prepare_hf_dataset(cfg.dataset.name)(
       save_path = Path(cfg.dataset.dataset_dir),
@@ -108,13 +118,23 @@ def main(cfg: DictConfig):
       bptt = cfg.dataset.target_len,
       eval_batch_size = cfg.eval_batch_size,
       )
-    test_ds_size = ds_info['test_ds_size']
+    ds_info = dict(ds_info)
   else:
     raise ValueError(f"Loader missing or not supported for {cfg.dataset.name}")
-  num_classes, train_ds_size = ds_info['num_classes'], ds_info['ds_size']
-  steps_per_epoch_rounded = train_ds_size // (cfg.batch_size * cfg.grad_acc_steps)
-  steps_per_epoch = train_ds_size / (cfg.batch_size * cfg.grad_acc_steps)
-  total_steps = ((train_ds_size * cfg.total_epochs) // (cfg.batch_size * cfg.grad_acc_steps)) + 1
+  num_classes = ds_info['num_classes']
+  accounting = utl.resolve_runner_accounting(
+    ds_info,
+    batch_size=cfg.batch_size,
+    grad_acc_steps=cfg.grad_acc_steps,
+    total_epochs=cfg.total_epochs,
+  )
+  train_ds_size = accounting["train_ds_size"]
+  test_ds_size = accounting["test_ds_size"]
+  train_eval_target_count = accounting["train_eval_target_count"]
+  test_eval_target_count = accounting["test_eval_target_count"]
+  steps_per_epoch_rounded = accounting["steps_per_epoch_rounded"]
+  steps_per_epoch = accounting["steps_per_epoch"]
+  total_steps = accounting["total_steps"]
   if not cfg.update_preconditioner_until:
     cfg.update_preconditioner_until = total_steps + 1
 
@@ -125,16 +145,16 @@ def main(cfg: DictConfig):
     run_state["aim_hash"] = run.hash
 
   # 2) Define model
-  model_kwargs = {}
-  if "grok" in cfg.architecture.name:
-    model_kwargs["vocab_size"] = ds_info["vocab_size"]
-  model, inf_model = model_choice[cfg.architecture.name](num_classes=num_classes, **model_kwargs)
-  if inf_model is None:
-    inf_model = model
+  model, inf_model, model_kwargs = build_model_pair_from_dataset_info(
+    architecture_name=cfg.architecture.name,
+    num_classes=num_classes,
+    ds_info=ds_info,
+  )
 
   # 3) Initialize model parameters
   rng = jax.random.PRNGKey(cfg.init_key)
-  variables = model.init(rng, next(dataloader)[0])
+  init_x, _ = utl.split_supervised_batch(next(dataloader))
+  variables = model.init(rng, init_x)
   params = variables['params']
   init_batch_stats = variables.get('batch_stats', {})
   print(jax.tree_util.tree_map(jnp.shape, params))
@@ -325,10 +345,10 @@ def main(cfg: DictConfig):
 
   def accumulate_grads(params_for_grad, batch_stats_init, key_in, x_acc, y_acc):
     """Accumulate loss/grads over x_acc, y_acc at fixed params_for_grad."""
-    acc_steps = x_acc.shape[0]
+    acc_steps = utl.tree_axis0_size(x_acc)
     key, subkey0 = jax.random.split(key_in)
     (loss0, new_model_state0), grads0 = compute_updates(
-      params_for_grad, batch_stats_init, x_acc[0], y_acc[0], subkey0
+      params_for_grad, batch_stats_init, utl.tree_axis0_take(x_acc, 0), utl.tree_axis0_take(y_acc, 0), subkey0
     )
 
     def body(carry, inp):
@@ -347,7 +367,7 @@ def main(cfg: DictConfig):
 
     init = (loss0, grads0, new_model_state0["batch_stats"], key)
     (sum_loss, sum_grads, final_batch_stats, key_out), _ = jax.lax.scan(
-      body, init, (x_acc[1:], y_acc[1:])
+      body, init, (utl.tree_axis0_slice(x_acc, 1), utl.tree_axis0_slice(y_acc, 1))
     )
 
     mean_loss = sum_loss / acc_steps
@@ -393,7 +413,7 @@ def main(cfg: DictConfig):
       state, precond_blocks, x_acc, y_acc, dropout_key
     )
 
-    return new_state, mean_loss, x_acc[-1], y_acc[-1]
+    return new_state, mean_loss, utl.tree_axis0_take(x_acc, -1), utl.tree_axis0_take(y_acc, -1)
 
   # Start timer
   start_time = time.time()
@@ -514,12 +534,12 @@ def main(cfg: DictConfig):
     if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.test_eval_freq):
       test_time_start = time.time()
       if cfg.record_histograms:
-        test_accuracy, test_loss = compute_accuracy_and_loss_with_hists(state, test_dataloader, test_ds_size, run,
+        test_accuracy, test_loss = compute_accuracy_and_loss_with_hists(state, test_dataloader, test_eval_target_count, run,
                                                                         step=step, prefix='test')
-        _, _ = compute_accuracy_and_loss_with_hists(state, dataloader, train_ds_size, run,
+        _, _ = compute_accuracy_and_loss_with_hists(state, dataloader, train_eval_target_count, run,
                                                                         step=step, prefix='train')
       else:
-        test_accuracy, test_loss = compute_accuracy_and_loss(state, test_dataloader, test_ds_size)
+        test_accuracy, test_loss = compute_accuracy_and_loss(state, test_dataloader, test_eval_target_count)
       elapsed_time = time.time() - start_time + prev_elapsed_time
       run.track(test_accuracy, name="test accuracy", step=step)
       run.track(test_loss, name="test loss", step=step)
@@ -528,12 +548,12 @@ def main(cfg: DictConfig):
       if cfg.add_train_eval:
         if cfg.record_histograms:
           train_eval_accuracy, train_eval_loss = compute_accuracy_and_loss_with_hists(state, train_eval_dataloader,
-                                                                                      num_samples=train_ds_size,
+                                                                                      num_samples=train_eval_target_count,
                                                                                       run=run,
                                                                                       step=step, prefix='train_eval')
         else:
           train_eval_accuracy, train_eval_loss = compute_accuracy_and_loss(state, train_eval_dataloader,
-                                                                           num_samples=train_ds_size)
+                                                                           num_samples=train_eval_target_count)
         run.track(train_eval_accuracy, name="train_eval accuracy", step=step)
         run.track(train_eval_loss, name="train_eval loss", step=step)
       print("============================")

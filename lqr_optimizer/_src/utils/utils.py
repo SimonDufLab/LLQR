@@ -24,12 +24,16 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable, NamedTuple
 from types import FrameType
 from pathlib import Path
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from jax.tree_util import Partial
 
 from lqr_optimizer._src.utils.grokking_dataset import ModSumDataset, ModDivisionDataset, ModSubtractDataset, ModMulDataset, ModExpDataset, PermutationGroup, load_grok_ds
 from lqr_optimizer._src.utils.precond_optimizers import nonlinear_cg
+from lqr_optimizer._src.utils.seq2seq_utils import (
+  SEQ2SEQ_TASK_KIND,
+  validate_seq2seq_dataset_info,
+)
 
 def vjp_f(f, x):
   """ Return the vjp in a form that can be applied directly over a vector
@@ -599,6 +603,102 @@ def loss_eval(state, x, y):
   # We expect the final layer to produce log-softmax output (as defined in MLP),
 
   return cross_entropy_loss(log_probs, y)
+
+
+def split_supervised_batch(batch):
+  """Return `(x, y)` from a supervised batch without flattening nested inputs."""
+  if not isinstance(batch, Sequence) or isinstance(batch, (str, bytes)):
+    raise ValueError("Expected a supervised batch shaped like `(x, y)`.")
+  if len(batch) != 2:
+    raise ValueError(f"Expected a supervised batch with exactly 2 items, got {len(batch)}.")
+  return batch[0], batch[1]
+
+
+def stack_tree_batches(batches):
+  """Stack a list of identically structured batches along a new leading axis."""
+  return jax.tree_util.tree_map(
+    lambda *leaves: jnp.stack([jnp.asarray(leaf) for leaf in leaves], axis=0),
+    *batches,
+  )
+
+
+def tree_axis0_size(tree):
+  leaves = jax.tree_util.tree_leaves(tree)
+  if not leaves:
+    raise ValueError("Expected a non-empty pytree with array leaves.")
+  first_leaf = jnp.asarray(leaves[0])
+  if first_leaf.ndim < 1:
+    raise ValueError("Expected accumulated batch leaves to have a leading axis.")
+  return int(first_leaf.shape[0])
+
+
+def tree_axis0_take(tree, index):
+  return jax.tree_util.tree_map(lambda leaf: jnp.asarray(leaf)[index], tree)
+
+
+def tree_axis0_slice(tree, start, stop=None):
+  return jax.tree_util.tree_map(lambda leaf: jnp.asarray(leaf)[start:stop], tree)
+
+
+def resolve_model_init_kwargs(architecture_name: str, ds_info: Mapping[str, Any]) -> Dict[str, Any]:
+  """Resolve dataset-derived model kwargs while preserving legacy routes."""
+  if not isinstance(ds_info, Mapping):
+    raise ValueError("`ds_info` must be a mapping.")
+
+  model_kwargs = {}
+  raw_model_init_kwargs = ds_info.get("model_init_kwargs", {})
+  if raw_model_init_kwargs and not isinstance(raw_model_init_kwargs, Mapping):
+    raise ValueError("`model_init_kwargs` must be mapping-valued when provided.")
+
+  if ds_info.get("task_kind") == SEQ2SEQ_TASK_KIND:
+    model_kwargs.update(validate_seq2seq_dataset_info(ds_info))
+  else:
+    model_kwargs.update(dict(raw_model_init_kwargs))
+
+  if "grok" in architecture_name and "vocab_size" not in model_kwargs:
+    vocab_size = ds_info.get("vocab_size")
+    if vocab_size is not None:
+      model_kwargs["vocab_size"] = int(vocab_size)
+
+  return model_kwargs
+
+
+def resolve_runner_accounting(ds_info: Mapping[str, Any], *, batch_size: int,
+                              grad_acc_steps: int, total_epochs: int) -> Dict[str, Any]:
+  """Resolve train/eval counts and epoch-step accounting from loader metadata."""
+  if not isinstance(ds_info, Mapping):
+    raise ValueError("`ds_info` must be a mapping.")
+  if batch_size <= 0:
+    raise ValueError(f"`batch_size` must be positive, got {batch_size}.")
+  if grad_acc_steps <= 0:
+    raise ValueError(f"`grad_acc_steps` must be positive, got {grad_acc_steps}.")
+  if total_epochs < 0:
+    raise ValueError(f"`total_epochs` must be non-negative, got {total_epochs}.")
+
+  train_ds_size = int(ds_info["ds_size"])
+  test_ds_size = int(ds_info.get("test_ds_size", train_ds_size))
+  runner_contract = ds_info.get("runner_contract", {})
+  if runner_contract and not isinstance(runner_contract, Mapping):
+    raise ValueError("`runner_contract` must be mapping-valued when provided.")
+
+  train_microbatches_per_epoch = runner_contract.get("train_microbatches_per_epoch")
+  if train_microbatches_per_epoch is None:
+    train_microbatches_per_epoch = train_ds_size / batch_size
+  train_microbatches_per_epoch = float(train_microbatches_per_epoch)
+  if train_microbatches_per_epoch <= 0:
+    raise ValueError("`train_microbatches_per_epoch` must be positive.")
+
+  steps_per_epoch = train_microbatches_per_epoch / grad_acc_steps
+  return {
+    "train_ds_size": train_ds_size,
+    "test_ds_size": test_ds_size,
+    "train_eval_target_count": int(runner_contract.get("train_eval_target_count", train_ds_size)),
+    "test_eval_target_count": int(runner_contract.get("test_eval_target_count", test_ds_size)),
+    "train_microbatches_per_epoch": train_microbatches_per_epoch,
+    "steps_per_epoch": steps_per_epoch,
+    "steps_per_epoch_rounded": int(train_microbatches_per_epoch // grad_acc_steps),
+    "total_steps": int((train_microbatches_per_epoch * total_epochs) // grad_acc_steps) + 1,
+  }
 
 
 def apply_cutout(image, size=16, p=0.5):
@@ -1303,7 +1403,7 @@ def infer_batch_layout(batch): # TODO: potentially not robust, might be preferab
     """
     Infer where the batch dimension lives and how to treat targets.
 
-    Assumes `batch` is (x, y) or a pytree whose first two leaves are (x, y)
+    Assumes `batch` is structurally `(x, y)` where `x` is a single array.
     with either:
       - CV-style:   x: [B, ...], y: [B] or [B, ...]
       - Text-style: x: [T, B],   y: [T*B]
@@ -1315,9 +1415,14 @@ def infer_batch_layout(batch): # TODO: potentially not robust, might be preferab
         "T": int | None,            # sequence length for text mode
       }
     """
-    leaves = jax.tree_util.tree_leaves(batch)
-    assert len(leaves) >= 2, "Expected at least (x, y) in batch pytree"
-    x, y = leaves[0], leaves[1]
+    x, y = split_supervised_batch(batch)
+
+    if isinstance(x, Sequence) and not isinstance(x, (str, bytes)):
+        raise ValueError(
+          "infer_batch_layout does not support tuple-valued x batches yet; "
+          "seq2seq translation batches should bypass this path until the "
+          "dedicated update-boundary support lands."
+        )
 
     if not isinstance(x, jnp.ndarray):
         x = jnp.asarray(x)
@@ -1346,14 +1451,12 @@ def infer_batch_layout(batch): # TODO: potentially not robust, might be preferab
 def next_accumulated_batches(train_dataloader, acc_steps):
   xs, ys = [], []
   for _ in range(acc_steps):
-    x, y = next(train_dataloader)
+    x, y = split_supervised_batch(next(train_dataloader))
     xs.append(x)
     ys.append(y)
 
-  # If x,y are already jax arrays, jnp.stack is fine.
-  # If they're numpy, jnp.asarray will transfer to device once (good).
-  x_acc = jnp.stack([jnp.asarray(x) for x in xs], axis=0)
-  y_acc = jnp.stack([jnp.asarray(y) for y in ys], axis=0)
+  x_acc = stack_tree_batches(xs)
+  y_acc = stack_tree_batches(ys)
   return x_acc, y_acc
 
 

@@ -140,6 +140,7 @@ The `resnet18-cifar10` comparison remains an external-only higher-memory follow-
 - `lqr_optimizer/_src/utils/build_lqr.py`: LQR object construction from model linearization
 - `lqr_optimizer/_src/utils/build_lqr_segments.py`: grouped LLQR segment builders used by full-batch and chunked split execution-stage updates
 - `lqr_optimizer/_src/utils/sam_mode_handlers.py`: SAM-family train-step dispatcher for `null`, `base_sam`, `base_fsam`, `past_fsam`, `asam`, and `fisher_sam`
+- `lqr_optimizer/_src/utils/seq2seq_utils.py`: seq2seq-specific runtime helpers kept separate from generic `utils.py` while the IWSLT14 translation surface is landing
 - `lqr_optimizer/_src/models/`: architecture definitions
 - `lqr_optimizer/_src/block_matrices_approx/`: structured inverse-preconditioner parameterizations
 
