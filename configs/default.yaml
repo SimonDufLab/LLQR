@@ -18,6 +18,17 @@ report_freq: 200 # Frequency (in steps) at which current training progress is re
 init_key: 42
 rng_seed: 123 # For dropout, etc.
 
+translation_eval:
+  enabled: false
+  beam_size: 5
+  max_len_a: 1.2
+  max_len_b: 10
+  remove_bpe: "@@ "
+  detok: moses
+  print_samples: false
+  checkpoint_metric: bleu
+  maximize_checkpoint_metric: true
+
 update_preconditioner_every: 1000
 update_preconditioner_until: null
 precond_rank: null

@@ -22,7 +22,7 @@ from flax import struct
 from flax.training import train_state
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
 from flax.traverse_util import flatten_dict, unflatten_dict
-from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable, NamedTuple
+from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable, NamedTuple, NotRequired
 from types import FrameType
 from pathlib import Path
 from collections.abc import Mapping, Sequence
@@ -1964,8 +1964,49 @@ class RunState(TypedDict):  # Taken from https://docs.mila.quebec/examples/good_
   slurm_jobid: str  # Unique experiment identifier attributed by SLURM
   exp_name: str
   dropout_key: Optional[jax.random.PRNGKey]
-  best_accuracy: float  # Best accuracy so far
+  best_metric_name: str  # Best tracked metric so far
+  best_metric_value: float
+  best_metric_step: int
+  best_accuracy: NotRequired[float]  # Legacy field kept for checkpoint compatibility
   training_time: Optional[Any]  # Total training time for the run
+
+
+def metric_improved(metric_value: float, best_metric_value: float, *, maximize: bool) -> bool:
+  if maximize:
+    return float(metric_value) > float(best_metric_value)
+  return float(metric_value) < float(best_metric_value)
+
+
+def update_run_state_best_metric(run_state: RunState, *, metric_name: str, metric_value: float, step: int) -> None:
+  run_state["best_metric_name"] = str(metric_name)
+  run_state["best_metric_value"] = float(metric_value)
+  run_state["best_metric_step"] = int(step)
+  run_state["best_accuracy"] = float(metric_value) if metric_name == "accuracy" else 0.0
+
+
+def save_run_state(run_state: RunState, *, target_dir: str | Path | None = None) -> None:
+  resolved_dir = Path(target_dir) if target_dir is not None else Path(run_state["model_dir"])
+  os.makedirs(resolved_dir, exist_ok=True)
+  payload = dict(run_state)
+  payload["model_dir"] = str(resolved_dir)
+  with open(resolved_dir / "checkpoint_run_state.pkl", "wb") as f:
+    pickle.dump(payload, f)
+
+
+def _normalize_loaded_run_state(checkpoint_state, checkpoint_dir: Path) -> RunState:
+  state = dict(checkpoint_state)
+  if "best_metric_name" not in state:
+    legacy_best_accuracy = float(state.get("best_accuracy", 0.0))
+    state["best_metric_name"] = "accuracy"
+    state["best_metric_value"] = legacy_best_accuracy
+    state["best_metric_step"] = int(state.get("training_step", 0))
+  if "best_accuracy" not in state:
+    state["best_accuracy"] = (
+      float(state["best_metric_value"]) if state["best_metric_name"] == "accuracy" else 0.0
+    )
+  if "model_dir" not in state:
+    state["model_dir"] = str(checkpoint_dir)
+  return state  # type: ignore[return-value]
 
 
 def load_run_state(checkpoint_dir: Path) -> Optional[
@@ -1993,7 +2034,7 @@ def load_run_state(checkpoint_dir: Path) -> Optional[
   print(f"Resuming from the checkpoint file at {checkpoint_file}:")
   print(checkpoint_state)
   print()
-  state: RunState = checkpoint_state  # type: ignore
+  state = _normalize_loaded_run_state(checkpoint_state, checkpoint_dir)
   return state
 
 
@@ -2104,18 +2145,30 @@ def restore_trainstate_and_precond(parent_dir: str):
   return {"params": restored_params, "gbar":restored_gbar, "g_last":restored_g_last, "opt_state": restored_opt_state, "batch_stats":restored_batch_stats}, restored_preconditioner_blocks
 
 def checkpoint_exp(run_state: RunState, trainstate, precond_blocks, curr_epoch: int, curr_step: int,
-                   dropout_key, best_acc, training_time):
+                   dropout_key, training_time, *, best_metric_name: str | None = None,
+                   best_metric_value: float | None = None, best_metric_step: int | None = None,
+                   target_dir: str | Path | None = None):
   run_state["epoch"] = curr_epoch
   run_state["training_step"] = curr_step
   run_state["dropout_key"] = dropout_key
-  run_state["best_accuracy"] = best_acc
   run_state["training_time"] = training_time
+  if best_metric_name is not None or best_metric_value is not None or best_metric_step is not None:
+    if best_metric_name is None or best_metric_value is None or best_metric_step is None:
+      raise ValueError(
+        "checkpoint_exp requires best_metric_name, best_metric_value, and best_metric_step together."
+      )
+    update_run_state_best_metric(
+      run_state,
+      metric_name=best_metric_name,
+      metric_value=best_metric_value,
+      step=best_metric_step,
+    )
 
-  with open(os.path.join(run_state["model_dir"], "checkpoint_run_state.pkl"), "wb") as f:
-    pickle.dump(run_state, f)
+  resolved_dir = Path(target_dir) if target_dir is not None else Path(run_state["model_dir"])
+  save_run_state(run_state, target_dir=resolved_dir)
 
   # Update weights
-  save_trainstate_and_precond(run_state["model_dir"], trainstate, precond_blocks)
+  save_trainstate_and_precond(str(resolved_dir), trainstate, precond_blocks)
 
 
 def signal_handler(signum: int, frame: Optional[

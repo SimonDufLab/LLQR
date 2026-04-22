@@ -24,7 +24,11 @@ from lqr_optimizer._src.configs.config import model_choice, divergence_choice, l
 from lqr_optimizer._src.preconditioner import BasePreconditioner
 from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, compute_accuracy_and_loss, compute_batch_accuracy, compute_accuracy_and_loss_with_hists
 from lqr_optimizer._src.utils.dataloaders.hf_loaders import prepare_hf_dataset
-from lqr_optimizer._src.utils.dataloaders.iwslt14_de_en import prepare_local_seq2seq_dataset
+from lqr_optimizer._src.utils.dataloaders.iwslt14_de_en import (
+  load_iwslt14_de_en_dictionaries,
+  prepare_local_seq2seq_dataset,
+)
+from lqr_optimizer._src.utils.seq2seq_utils import SEQ2SEQ_TASK_KIND, evaluate_translation_generation
 import lqr_optimizer._src.utils.sam_mode_handlers as sam_mode_handlers
 import lqr_optimizer._src.utils.utils as utl
 
@@ -45,6 +49,19 @@ def build_model_pair_from_dataset_info(*, architecture_name: str, num_classes: i
   if inf_model is None:
     inf_model = model
   return model, inf_model, model_kwargs
+
+
+def build_translation_next_log_probs_fn(*, model, state):
+  def next_log_probs(src_tokens, prev_output_tokens):
+    variables = {'params': state.params, 'batch_stats': state.batch_stats}
+    return model.apply(
+      variables,
+      (src_tokens, prev_output_tokens),
+      method=model.next_log_probs,
+      mutable=False,
+    )
+
+  return next_log_probs
 
 
 @hydra.main(config_path="configs", config_name="config", version_base="1.3")
@@ -77,7 +94,8 @@ def main(cfg: DictConfig):
       run_state = utl.RunState(epoch=0, training_step=0, model_dir=saving_dir,
                                aim_hash=None, slurm_jobid=SLURM_JOBID, exp_name=experiment_name,
                                dropout_key=jax.random.PRNGKey(cfg.rng_seed),
-                               best_accuracy=0.0, training_time=0.0)
+                               best_metric_name="accuracy", best_metric_value=0.0,
+                               best_metric_step=-1, best_accuracy=0.0, training_time=0.0)
 
     aim_hash = run_state["aim_hash"]
   else:
@@ -139,6 +157,8 @@ def main(cfg: DictConfig):
     ds_info = dict(ds_info)
   else:
     raise ValueError(f"Loader missing or not supported for {cfg.dataset.name}")
+  task_kind = ds_info.get("task_kind")
+  is_translation_task = task_kind == SEQ2SEQ_TASK_KIND
   num_classes = ds_info['num_classes']
   accounting = utl.resolve_runner_accounting(
     ds_info,
@@ -155,6 +175,20 @@ def main(cfg: DictConfig):
   total_steps = accounting["total_steps"]
   if not cfg.update_preconditioner_until:
     cfg.update_preconditioner_until = total_steps + 1
+
+  translation_eval_assets = None
+  if is_translation_task and cfg.translation_eval.enabled:
+    if cfg.dataset.name != "iwslt14_de_en":
+      raise ValueError(
+        "Wave 5 translation evaluation is only implemented for dataset=iwslt14_de_en."
+      )
+    translation_eval_assets = load_iwslt14_de_en_dictionaries(
+      dataset_dir=Path(cfg.dataset.dataset_dir),
+      numeric_cache_dir=Path(cfg.dataset.numeric_cache_dir) if cfg.dataset.numeric_cache_dir else None,
+      source_lang=cfg.dataset.source_lang,
+      target_lang=cfg.dataset.target_lang,
+      padding_factor=cfg.dataset.padding_factor,
+    )
 
   # 1b) Initialize aim for logging
   run = Run(repo=cfg.logging.aim_repo, experiment=experiment_name, run_hash=aim_hash, force_resume=True)
@@ -441,12 +475,27 @@ def main(cfg: DictConfig):
   if load_from_preexisting_model_state:
     dropout_key = run_state["dropout_key"]
     starting_step = run_state["training_step"]
-    best_acc = run_state["best_accuracy"]
+    best_metric_name = run_state["best_metric_name"]
+    best_metric_value = run_state["best_metric_value"]
+    best_metric_step = run_state["best_metric_step"]
     prev_elapsed_time = run_state["training_time"]
   else:
     starting_step = 0
-    best_acc = 0
+    best_metric_name = "accuracy"
+    best_metric_value = 0.0
+    best_metric_step = -1
     prev_elapsed_time = 0
+  if is_translation_task and cfg.translation_eval.enabled and best_metric_name == "accuracy" and best_metric_value == 0.0:
+    best_metric_name = cfg.translation_eval.checkpoint_metric
+    best_metric_value = float("-inf") if cfg.translation_eval.maximize_checkpoint_metric else float("inf")
+    best_metric_step = -1
+    if cfg.preempt_handling:
+      utl.update_run_state_best_metric(
+        run_state,
+        metric_name=best_metric_name,
+        metric_value=best_metric_value,
+        step=best_metric_step,
+      )
   logged_first_batch_update_route = False
   last_logged_batch_update_route = None
 
@@ -456,9 +505,18 @@ def main(cfg: DictConfig):
     if (step > 0) and cfg.preempt_handling and (step % cfg.checkpoint_freq == 0) and not load_from_preexisting_model_state:
       chckpt_init_time = time.time()
       elapsed_time = time.time() - start_time + prev_elapsed_time
-      utl.checkpoint_exp(run_state, state, preconditioner.expose_blocks(), curr_epoch=step // steps_per_epoch_rounded,
-                         curr_step=step, dropout_key=dropout_key, best_acc=best_acc,
-                         training_time=elapsed_time)
+      utl.checkpoint_exp(
+        run_state,
+        state,
+        preconditioner.expose_blocks(),
+        curr_epoch=step // steps_per_epoch_rounded,
+        curr_step=step,
+        dropout_key=dropout_key,
+        training_time=elapsed_time,
+        best_metric_name=best_metric_name,
+        best_metric_value=best_metric_value,
+        best_metric_step=best_metric_step,
+      )
       print(
         f"Checkpointing performed in: {timedelta(seconds=time.time() - chckpt_init_time)}")
     # Possibly update the preconditioner every `update_preconditioner_every` steps
@@ -543,42 +601,123 @@ def main(cfg: DictConfig):
       run.track(train_loss, name="train loss|t", step=elapsed_time*100)
       # Compute batch accuracy
       batch_accuracy, _ = compute_batch_accuracy(state, x_batch, y_batch)
-      run.track(batch_accuracy, name="train accuracy", step=step)
-      run.track(batch_accuracy, name="train accuracy|t", step=elapsed_time*100)
+      train_accuracy_name = "train token_accuracy" if is_translation_task else "train accuracy"
+      run.track(batch_accuracy, name=train_accuracy_name, step=step)
+      run.track(batch_accuracy, name=f"{train_accuracy_name}|t", step=elapsed_time*100)
       if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.report_freq):
         # Print info
         print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
     if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.test_eval_freq):
       test_time_start = time.time()
-      if cfg.record_histograms:
-        test_accuracy, test_loss = compute_accuracy_and_loss_with_hists(state, test_dataloader, test_eval_target_count, run,
-                                                                        step=step, prefix='test')
-        _, _ = compute_accuracy_and_loss_with_hists(state, dataloader, train_eval_target_count, run,
-                                                                        step=step, prefix='train')
-      else:
-        test_accuracy, test_loss = compute_accuracy_and_loss(state, test_dataloader, test_eval_target_count)
       elapsed_time = time.time() - start_time + prev_elapsed_time
-      run.track(test_accuracy, name="test accuracy", step=step)
-      run.track(test_loss, name="test loss", step=step)
-      run.track(test_accuracy, name="test accuracy|t", step=elapsed_time*100)
-      run.track(test_loss, name="test loss|t", step=elapsed_time*100)
-      if cfg.add_train_eval:
+      if is_translation_task:
         if cfg.record_histograms:
-          train_eval_accuracy, train_eval_loss = compute_accuracy_and_loss_with_hists(state, train_eval_dataloader,
-                                                                                      num_samples=train_eval_target_count,
-                                                                                      run=run,
-                                                                                      step=step, prefix='train_eval')
+          valid_accuracy, valid_loss = compute_accuracy_and_loss_with_hists(
+            state, test_dataloader, test_eval_target_count, run, step=step, prefix='valid'
+          )
         else:
-          train_eval_accuracy, train_eval_loss = compute_accuracy_and_loss(state, train_eval_dataloader,
-                                                                           num_samples=train_eval_target_count)
-        run.track(train_eval_accuracy, name="train_eval accuracy", step=step)
-        run.track(train_eval_loss, name="train_eval loss", step=step)
-      print("============================")
-      print(f"Step {step} | Test Loss: {test_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
-      print(f"Step {step} | Test Accuracy: {test_accuracy:.2f}%")
-      print(f"Test accuracy across entire dataset computed in {time.time() - test_time_start:.2f} seconds")
-      print("============================")
+          valid_accuracy, valid_loss = compute_accuracy_and_loss(state, test_dataloader, test_eval_target_count)
+        run.track(valid_accuracy, name="valid token_accuracy", step=step)
+        run.track(valid_loss, name="valid loss", step=step)
+        run.track(valid_accuracy, name="valid token_accuracy|t", step=elapsed_time*100)
+        run.track(valid_loss, name="valid loss|t", step=elapsed_time*100)
+
+        if cfg.translation_eval.enabled:
+          translation_metrics = evaluate_translation_generation(
+            dataloader=test_dataloader,
+            next_log_probs_fn=build_translation_next_log_probs_fn(model=inf_model, state=state),
+            target_dictionary=translation_eval_assets["target_dictionary"],
+            target_lang=cfg.dataset.target_lang,
+            beam_size=cfg.translation_eval.beam_size,
+            max_len_a=cfg.translation_eval.max_len_a,
+            max_len_b=cfg.translation_eval.max_len_b,
+            pad_id=int(ds_info["model_init_kwargs"]["pad_id"]),
+            bos_id=int(ds_info["model_init_kwargs"]["bos_id"]),
+            eos_id=int(ds_info["model_init_kwargs"]["eos_id"]),
+            max_target_positions=int(model_kwargs.get("max_target_positions", 1024)),
+            remove_bpe=cfg.translation_eval.remove_bpe,
+            detok=cfg.translation_eval.detok,
+          )
+          valid_bleu = translation_metrics["bleu"]
+          run.track(valid_bleu, name="valid bleu", step=step)
+          run.track(valid_bleu, name="valid bleu|t", step=elapsed_time*100)
+          improved = utl.metric_improved(
+            valid_bleu,
+            best_metric_value,
+            maximize=cfg.translation_eval.maximize_checkpoint_metric,
+          )
+          if improved:
+            best_metric_name = cfg.translation_eval.checkpoint_metric
+            best_metric_value = valid_bleu
+            best_metric_step = step
+            if cfg.preempt_handling:
+              utl.update_run_state_best_metric(
+                run_state,
+                metric_name=best_metric_name,
+                metric_value=best_metric_value,
+                step=best_metric_step,
+              )
+              utl.save_run_state(run_state)
+              utl.checkpoint_exp(
+                run_state,
+                state,
+                preconditioner.expose_blocks(),
+                curr_epoch=step // steps_per_epoch_rounded,
+                curr_step=step,
+                dropout_key=dropout_key,
+                training_time=elapsed_time,
+                target_dir=Path(run_state["model_dir"]) / "checkpoint_best",
+              )
+          run.track(best_metric_value, name="best valid bleu", step=step)
+          run.track(best_metric_step, name="best valid bleu step", step=step)
+          print("============================")
+          print(f"Step {step} | Valid Loss: {valid_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
+          print(f"Step {step} | Valid Token Accuracy: {valid_accuracy:.2f}%")
+          print(f"Step {step} | Valid BLEU: {valid_bleu:.2f}")
+          if cfg.translation_eval.print_samples and translation_metrics["sample_hypothesis"] is not None:
+            print(f"Sample Hypothesis: {translation_metrics['sample_hypothesis']}")
+            print(f"Sample Reference: {translation_metrics['sample_reference']}")
+          print(
+            f"{best_metric_name} best checkpoint metric after step {step}: "
+            f"{best_metric_value:.2f} (step {best_metric_step})"
+          )
+          print(f"Valid translation evaluation computed in {time.time() - test_time_start:.2f} seconds")
+          print("============================")
+        else:
+          print("============================")
+          print(f"Step {step} | Valid Loss: {valid_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
+          print(f"Step {step} | Valid Token Accuracy: {valid_accuracy:.2f}%")
+          print(f"Valid token evaluation computed in {time.time() - test_time_start:.2f} seconds")
+          print("============================")
+      else:
+        if cfg.record_histograms:
+          test_accuracy, test_loss = compute_accuracy_and_loss_with_hists(state, test_dataloader, test_eval_target_count, run,
+                                                                          step=step, prefix='test')
+          _, _ = compute_accuracy_and_loss_with_hists(state, dataloader, train_eval_target_count, run,
+                                                                          step=step, prefix='train')
+        else:
+          test_accuracy, test_loss = compute_accuracy_and_loss(state, test_dataloader, test_eval_target_count)
+        run.track(test_accuracy, name="test accuracy", step=step)
+        run.track(test_loss, name="test loss", step=step)
+        run.track(test_accuracy, name="test accuracy|t", step=elapsed_time*100)
+        run.track(test_loss, name="test loss|t", step=elapsed_time*100)
+        if cfg.add_train_eval:
+          if cfg.record_histograms:
+            train_eval_accuracy, train_eval_loss = compute_accuracy_and_loss_with_hists(state, train_eval_dataloader,
+                                                                                        num_samples=train_eval_target_count,
+                                                                                        run=run,
+                                                                                        step=step, prefix='train_eval')
+          else:
+            train_eval_accuracy, train_eval_loss = compute_accuracy_and_loss(state, train_eval_dataloader,
+                                                                             num_samples=train_eval_target_count)
+          run.track(train_eval_accuracy, name="train_eval accuracy", step=step)
+          run.track(train_eval_loss, name="train_eval loss", step=step)
+        print("============================")
+        print(f"Step {step} | Test Loss: {test_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
+        print(f"Step {step} | Test Accuracy: {test_accuracy:.2f}%")
+        print(f"Test accuracy across entire dataset computed in {time.time() - test_time_start:.2f} seconds")
+        print("============================")
 
 
   print("Training complete!")

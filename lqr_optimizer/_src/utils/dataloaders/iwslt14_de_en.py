@@ -65,6 +65,27 @@ class FairseqStyleDictionary:
   def index(self, token: str) -> int:
     return self.indices.get(token, self.unk_index)
 
+  def string(self, token_ids, *, remove_bpe=None, unk_string: str = "<unk>") -> str:
+    words = []
+    for token_id in np.asarray(token_ids, dtype=np.int32).tolist():
+      token_id = int(token_id)
+      if token_id == self.pad_index or token_id == self.bos_index:
+        continue
+      if token_id == self.eos_index:
+        break
+      if token_id == self.unk_index:
+        token = unk_string
+      elif 0 <= token_id < len(self.symbols):
+        token = self.symbols[token_id]
+      else:
+        raise ValueError(f"Token id {token_id} is out of range for this dictionary.")
+      words.append(token)
+    sentence = " ".join(words)
+    if remove_bpe:
+      marker = "@@ " if remove_bpe is True else str(remove_bpe)
+      sentence = sentence.replace(marker, "")
+    return sentence
+
   def encode_line(self, line: str) -> np.ndarray:
     tokens = line.strip().split()
     ids = np.empty(len(tokens) + 1, dtype=np.int32)
@@ -290,6 +311,32 @@ def _load_storage(cache_dir: Path, split: str, lang: str) -> IndexedTokenStorage
   return IndexedTokenStorage(tokens=np.asarray(tokens, dtype=np.int32), offsets=np.asarray(offsets, dtype=np.int64))
 
 
+def load_iwslt14_de_en_dictionaries(
+    *,
+    dataset_dir: Path,
+    numeric_cache_dir: Optional[Path] = None,
+    source_lang: str = "de",
+    target_lang: str = "en",
+    padding_factor: int = 8,
+):
+  dataset_dir = Path(dataset_dir)
+  cache_dir = Path(numeric_cache_dir) if numeric_cache_dir is not None else dataset_dir / ".llqr_numeric_cache"
+  _require_extracted_dataset(dataset_dir, source_lang=source_lang, target_lang=target_lang)
+  metadata = _load_numeric_cache(
+    dataset_dir,
+    cache_dir,
+    source_lang=source_lang,
+    target_lang=target_lang,
+    padding_factor=padding_factor,
+  )
+  return {
+    "metadata": metadata,
+    "cache_dir": cache_dir,
+    "source_dictionary": FairseqStyleDictionary.load(cache_dir / f"dict.{source_lang}.txt"),
+    "target_dictionary": FairseqStyleDictionary.load(cache_dir / f"dict.{target_lang}.txt"),
+  }
+
+
 def _ordered_indices(
     src_sizes: np.ndarray,
     tgt_sizes: np.ndarray,
@@ -485,3 +532,56 @@ def load_iwslt14_de_en(
     "target_lang": target_lang,
   }
   return train_loader, valid_loader, ds_info
+
+
+def load_iwslt14_de_en_eval_split(
+    *,
+    dataset_dir: Path,
+    split: str,
+    numeric_cache_dir: Optional[Path] = None,
+    eval_batch_size: int,
+    eval_prefetch: int = 2,
+    source_lang: str = "de",
+    target_lang: str = "en",
+    padding_factor: int = 8,
+):
+  if split not in ("valid", "test"):
+    raise ValueError(f"Expected split='valid' or split='test', got {split!r}.")
+
+  dictionary_bundle = load_iwslt14_de_en_dictionaries(
+    dataset_dir=dataset_dir,
+    numeric_cache_dir=numeric_cache_dir,
+    source_lang=source_lang,
+    target_lang=target_lang,
+    padding_factor=padding_factor,
+  )
+  cache_dir = dictionary_bundle["cache_dir"]
+  metadata = dictionary_bundle["metadata"]
+
+  dataset = ParallelTextDataset(
+    _load_storage(cache_dir, split, source_lang),
+    _load_storage(cache_dir, split, target_lang),
+  )
+  pad_id = int(metadata["special_tokens"]["pad_id"])
+  eos_id = int(metadata["special_tokens"]["eos_id"])
+  epoch_factory = _make_epoch_factory(
+    dataset,
+    pad_id=pad_id,
+    eos_id=eos_id,
+    batch_size=int(eval_batch_size),
+    shuffle=False,
+    rng=None,
+  )
+  loader = LoaderAsJaxIterator(epoch_factory, prefetch=int(eval_prefetch), repeat=False)
+  split_info = {
+    "split": split,
+    "num_examples": int(metadata["splits"][split]["num_examples"]),
+    "source_lang": source_lang,
+    "target_lang": target_lang,
+    "pad_id": pad_id,
+    "bos_id": int(metadata["special_tokens"]["bos_id"]),
+    "eos_id": eos_id,
+    "source_dictionary": dictionary_bundle["source_dictionary"],
+    "target_dictionary": dictionary_bundle["target_dictionary"],
+  }
+  return loader, split_info

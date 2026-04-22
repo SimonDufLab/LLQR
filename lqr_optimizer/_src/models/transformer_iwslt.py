@@ -314,6 +314,36 @@ class TranslationFinalLogSoftmaxStage(nn.Module):
     return nn.log_softmax(logits, axis=-1)
 
 
+class TranslationEnhancedSequential(EnhancedSequential):
+  pad_id: int = 1
+  bos_id: int = 0
+  eos_id: int = 2
+  max_source_positions: int = 1024
+  max_target_positions: int = 1024
+
+  def _translation_state_before_readout(self, x) -> TranslationState:
+    state = x
+    for block, stage in zip(self.layers, self.execution_stage_descriptors):
+      if stage.name == "translation_logits":
+        break
+      state = block(state)
+    if not isinstance(state, TranslationState):
+      raise ValueError(
+        "Translation decode helpers expected a TranslationState before readout."
+      )
+    return state
+
+  def next_log_probs(self, x) -> jnp.ndarray:
+    """Return log-probabilities for the final non-pad decoder position."""
+    state = self._translation_state_before_readout(x)
+    batch_size = state.tgt_h.shape[0]
+    target_lengths = jnp.sum(state.tgt_nonpad_mask > 0, axis=1).astype(jnp.int32)
+    last_indices = jnp.maximum(target_lengths - 1, 0)
+    last_hidden = state.tgt_h[jnp.arange(batch_size), last_indices]
+    logits = jnp.einsum("bd,vd->bv", last_hidden, state.tgt_embed_matrix)
+    return nn.log_softmax(logits, axis=-1)
+
+
 def _append_controlled(layers, stage_descriptors, stage_name, module):
   layer_index = len(layers)
   layers.append(module)
@@ -526,7 +556,6 @@ def create_transformer_iwslt_model(
     eos_id: int = 2,
     tie_output_to_target_embedding: bool = True,
 ) -> Tuple[EnhancedSequential, EnhancedSequential]:
-  del bos_id, eos_id
   if tgt_vocab_size is None:
     tgt_vocab_size = num_classes
   if int(tgt_vocab_size) != int(num_classes):
@@ -636,10 +665,15 @@ def create_transformer_iwslt_model(
       )
     )
 
-    model = EnhancedSequential(
+    model = TranslationEnhancedSequential(
       layers,
       stage_descriptors=tuple(stage_descriptors),
       lqr_segment_descriptors=tuple(lqr_segment_descriptors),
+      pad_id=pad_id,
+      bos_id=bos_id,
+      eos_id=eos_id,
+      max_source_positions=max_source_positions,
+      max_target_positions=max_target_positions,
     )
     model.validate_stage_descriptors()
     model.validate_lqr_segment_descriptors()

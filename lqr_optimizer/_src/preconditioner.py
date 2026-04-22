@@ -13,6 +13,7 @@ from flax.core.frozen_dict import FrozenDict, freeze
 from lqr_optimizer._src.utils.utils import (normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm,
                                             get_per_layer_norm, _deep_copy_pytree, infer_batch_layout, get_per_layer_skews)
 from lqr_optimizer._src.utils.seq2seq_utils import (
+  pad_and_concatenate_seq2seq_input_batches,
   SEQ2SEQ_TASK_KIND,
   seq2seq_target_count,
   slice_seq2seq_flat_targets,
@@ -165,9 +166,9 @@ def _concat_preconditioner_batches(batches, layout, precond_batch_size):
       target_batches.append(jnp.asarray(targets))
       target_lengths.extend(batch_layout["target_lengths"])
 
-    accumulated_inputs = jax.tree_util.tree_map(
-      lambda *xs: jnp.concatenate([jnp.asarray(x) for x in xs], axis=batch_axis),
-      *input_batches,
+    accumulated_inputs = pad_and_concatenate_seq2seq_input_batches(
+      input_batches,
+      pad_id=int(layout["pad_id"]),
     )
     accumulated_targets = jnp.concatenate(target_batches, axis=0)
     accumulated_layout = dict(layout)

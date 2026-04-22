@@ -13,7 +13,7 @@ It contains the main training entrypoint, config-driven experiment definitions, 
 Experiments are composed from `configs/`.
 The main user-facing group is `configs/experiment/`, which selects a dataset, architecture, and schedule bundle.
 Representative experiments currently include ResNet/CIFAR, ResNet/ImageNet, GPT/WikiText-103, grokking-style transformer runs, and the CIFAR architecture-support presets `vgg16bn-cifar10`, `vgg16bn-cifar100`, `wide-resnet28x10-cifar10`, `wide-resnet28x10-cifar100`, `pyramidnet110-cifar10`, and `pyramidnet110-cifar100`.
-The dataset surface now also includes the fairseq-faithful local `iwslt14_de_en` text contract under `configs/dataset/iwslt14_de_en.yaml`; it expects an extracted `iwslt14.tokenized.de-en/` directory, writes a local `.llqr_numeric_cache/`, and maps the current `run.py` held-out eval path to `valid` while keeping `test` cached for later generation work.
+The dataset surface now also includes the fairseq-faithful local `iwslt14_de_en` text contract under `configs/dataset/iwslt14_de_en.yaml`; it expects an extracted `iwslt14.tokenized.de-en/` directory, writes a local `.llqr_numeric_cache/`, maps the current `run.py` held-out eval path to `valid`, and exposes deterministic `valid` and `test` split helpers for bounded generation and BLEU checks.
 
 A typical Hydra invocation shape is:
 
@@ -32,7 +32,7 @@ The current dedicated architecture additions are:
 - `vit-ti-16`, implemented in `lqr_optimizer/_src/models/vit.py`
 - `vit-s-16`, implemented in `lqr_optimizer/_src/models/vit.py`
 
-The translation train-path surface is now intentionally narrow but public:
+The translation surface is now intentionally narrow but public:
 
 - routed architecture: `transformer-iwslt-de-en`
 - public experiment preset: `transformer-iwslt14-de-en`
@@ -40,7 +40,8 @@ The translation train-path surface is now intentionally narrow but public:
 - batch contract: `x=(src_tokens, prev_output_tokens)` and `y=target_tokens_flat`
 - model defaults: fairseq-style 6 encoder layers, 6 decoder layers, embed dim `512`, FFN dim `1024`, heads `4`, `relu`, sinusoidal positions, and tied decoder input/output embeddings
 - public recipe surface: `main_optimizer=adam`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=1e-4`, `label_smoothing=0.1`, `dataset.max_tokens=4096`, and LLQR `full_batch` seq2seq updates
-- current boundary: generation, BLEU, and checkpoint-metric wiring still land in later waves, and `llqr_batch_update_mode=chunked_lqr_segment` remains intentionally unsupported for seq2seq translation batches
+- public eval surface: beam-search generation with `beam_size=5`, fairseq-style `max_len=1.2*src_len+10`, `@@ ` BPE removal, Moses detokenization, sacreBLEU scoring, and BLEU-routed best-checkpoint snapshots when `preempt_handling=true`
+- current boundary: generation recomputes full decoder prefixes without an incremental cache, and `llqr_batch_update_mode=chunked_lqr_segment` remains intentionally unsupported for seq2seq translation batches
 
 The maintained Friendly-SAM-aligned CIFAR presets currently exist for:
 

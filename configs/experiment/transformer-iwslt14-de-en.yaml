@@ -29,3 +29,13 @@ update_preconditioner_every: 1000
 use_preconditioner: true
 batch_solve_precond: true
 llqr_batch_update_mode: full_batch
+
+translation_eval.enabled: true
+translation_eval.beam_size: 5
+translation_eval.max_len_a: 1.2
+translation_eval.max_len_b: 10
+translation_eval.remove_bpe: "@@ "
+translation_eval.detok: moses
+translation_eval.print_samples: true
+translation_eval.checkpoint_metric: bleu
+translation_eval.maximize_checkpoint_metric: true
