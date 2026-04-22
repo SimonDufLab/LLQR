@@ -13,6 +13,7 @@ It contains the main training entrypoint, config-driven experiment definitions, 
 Experiments are composed from `configs/`.
 The main user-facing group is `configs/experiment/`, which selects a dataset, architecture, and schedule bundle.
 Representative experiments currently include ResNet/CIFAR, ResNet/ImageNet, GPT/WikiText-103, grokking-style transformer runs, and the CIFAR architecture-support presets `vgg16bn-cifar10`, `vgg16bn-cifar100`, `wide-resnet28x10-cifar10`, `wide-resnet28x10-cifar100`, `pyramidnet110-cifar10`, and `pyramidnet110-cifar100`.
+The dataset surface now also includes the fairseq-faithful local `iwslt14_de_en` text contract under `configs/dataset/iwslt14_de_en.yaml`; it expects an extracted `iwslt14.tokenized.de-en/` directory, writes a local `.llqr_numeric_cache/`, and maps the current `run.py` held-out eval path to `valid` while keeping `test` cached for later generation work.
 
 A typical Hydra invocation shape is:
 
@@ -141,6 +142,7 @@ The `resnet18-cifar10` comparison remains an external-only higher-memory follow-
 - `lqr_optimizer/_src/utils/build_lqr_segments.py`: grouped LLQR segment builders used by full-batch and chunked split execution-stage updates
 - `lqr_optimizer/_src/utils/sam_mode_handlers.py`: SAM-family train-step dispatcher for `null`, `base_sam`, `base_fsam`, `past_fsam`, `asam`, and `fisher_sam`
 - `lqr_optimizer/_src/utils/seq2seq_utils.py`: seq2seq-specific runtime helpers kept separate from generic `utils.py` while the IWSLT14 translation surface is landing
+- `lqr_optimizer/_src/utils/dataloaders/iwslt14_de_en.py`: fairseq-faithful local IWSLT14 text loader with separate source and target dictionaries, flat numeric caches, and token-budget training batches
 - `lqr_optimizer/_src/models/`: architecture definitions
 - `lqr_optimizer/_src/block_matrices_approx/`: structured inverse-preconditioner parameterizations
 

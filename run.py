@@ -24,6 +24,7 @@ from lqr_optimizer._src.configs.config import model_choice, divergence_choice, l
 from lqr_optimizer._src.preconditioner import BasePreconditioner
 from lqr_optimizer._src.utils.utils import cross_entropy_loss, prepare_dataloader, compute_accuracy_and_loss, compute_batch_accuracy, compute_accuracy_and_loss_with_hists
 from lqr_optimizer._src.utils.dataloaders.hf_loaders import prepare_hf_dataset
+from lqr_optimizer._src.utils.dataloaders.iwslt14_de_en import prepare_local_seq2seq_dataset
 import lqr_optimizer._src.utils.sam_mode_handlers as sam_mode_handlers
 import lqr_optimizer._src.utils.utils as utl
 
@@ -83,6 +84,7 @@ def main(cfg: DictConfig):
     aim_hash = None
 
   # 1a) Create the data generators
+  train_eval_dataloader = None
   if not cfg.eval_batch_size:
     cfg.eval_batch_size = cfg.batch_size
   if cfg.dataset.loader == "tfds":
@@ -118,6 +120,22 @@ def main(cfg: DictConfig):
       bptt = cfg.dataset.target_len,
       eval_batch_size = cfg.eval_batch_size,
       )
+    ds_info = dict(ds_info)
+  elif cfg.dataset.loader == "local_seq2seq_text":
+    if cfg.add_train_eval:
+      raise ValueError("`add_train_eval` is not yet supported for local_seq2seq_text datasets.")
+    numeric_cache_dir = cfg.dataset.numeric_cache_dir
+    dataloader, test_dataloader, ds_info = prepare_local_seq2seq_dataset(cfg.dataset.name)(
+      dataset_dir=Path(cfg.dataset.dataset_dir),
+      numeric_cache_dir=Path(numeric_cache_dir) if numeric_cache_dir else None,
+      max_tokens=cfg.dataset.max_tokens,
+      eval_batch_size=cfg.eval_batch_size,
+      prefetch=cfg.dataset.prefetch,
+      eval_prefetch=cfg.dataset.eval_prefetch,
+      source_lang=cfg.dataset.source_lang,
+      target_lang=cfg.dataset.target_lang,
+      padding_factor=cfg.dataset.padding_factor,
+    )
     ds_info = dict(ds_info)
   else:
     raise ValueError(f"Loader missing or not supported for {cfg.dataset.name}")
