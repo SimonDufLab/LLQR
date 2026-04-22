@@ -32,13 +32,15 @@ The current dedicated architecture additions are:
 - `vit-ti-16`, implemented in `lqr_optimizer/_src/models/vit.py`
 - `vit-s-16`, implemented in `lqr_optimizer/_src/models/vit.py`
 
-The translation architecture surface is intentionally narrow in Wave 3:
+The translation train-path surface is now intentionally narrow but public:
 
 - routed architecture: `transformer-iwslt-de-en`
+- public experiment preset: `transformer-iwslt14-de-en`
 - expected loader contract: `dataset.loader=local_seq2seq_text`
 - batch contract: `x=(src_tokens, prev_output_tokens)` and `y=target_tokens_flat`
 - model defaults: fairseq-style 6 encoder layers, 6 decoder layers, embed dim `512`, FFN dim `1024`, heads `4`, `relu`, sinusoidal positions, and tied decoder input/output embeddings
-- current boundary: Wave 3 lands the architecture and explicit `EnhancedSequential` stage/segment metadata only; the public recipe preset, generation, BLEU, and checkpoint-metric wiring land in later waves
+- public recipe surface: `main_optimizer=adam`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=1e-4`, `label_smoothing=0.1`, `dataset.max_tokens=4096`, and LLQR `full_batch` seq2seq updates
+- current boundary: generation, BLEU, and checkpoint-metric wiring still land in later waves, and `llqr_batch_update_mode=chunked_lqr_segment` remains intentionally unsupported for seq2seq translation batches
 
 The maintained Friendly-SAM-aligned CIFAR presets currently exist for:
 

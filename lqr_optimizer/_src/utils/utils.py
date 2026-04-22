@@ -1,4 +1,5 @@
 """ Various utilities functions for LQR optimization"""
+import math
 import time
 import os
 import pickle
@@ -32,6 +33,7 @@ from lqr_optimizer._src.utils.grokking_dataset import ModSumDataset, ModDivision
 from lqr_optimizer._src.utils.precond_optimizers import nonlinear_cg
 from lqr_optimizer._src.utils.seq2seq_utils import (
   SEQ2SEQ_TASK_KIND,
+  infer_seq2seq_batch_layout,
   validate_seq2seq_dataset_info,
 )
 
@@ -473,15 +475,22 @@ def timed_jit(f):
 # Loading utils
 ##################################
 def load_main_optimizer(cfg, lr_or_sched, mask=None):
+  adam_betas = getattr(cfg, "adam_betas", (0.9, 0.999))
+  if len(adam_betas) != 2:
+    raise ValueError("`adam_betas` must contain exactly two entries.")
+  adam_b1 = float(adam_betas[0])
+  adam_b2 = float(adam_betas[1])
   if cfg.main_optimizer == "polyak":
     model_optimizer = optax.sgd(learning_rate=lr_or_sched, momentum=cfg.momentum)
   elif cfg.main_optimizer == "adam":
-    model_optimizer = optax.adam(learning_rate=lr_or_sched)
+    model_optimizer = optax.adam(learning_rate=lr_or_sched, b1=adam_b1, b2=adam_b2)
   elif cfg.main_optimizer == "sgd":
     model_optimizer = optax.sgd(learning_rate=lr_or_sched)
   elif cfg.main_optimizer == "adamw":
     model_optimizer = optax.adamw(
       learning_rate=lr_or_sched,
+      b1=adam_b1,
+      b2=adam_b2,
       weight_decay=cfg.weight_decay,
       mask=mask,
     )
@@ -566,6 +575,18 @@ def clip_by_group_norm(max_norm: float) -> optax.GradientTransformation:
 ##################################
 # Training utils
 ##################################
+def align_log_probs_with_targets(log_probs, y):
+  """Keep the leading logits rows that correspond to the flattened targets."""
+  flat_targets = jnp.ravel(y)
+  if log_probs.shape[0] < flat_targets.shape[0]:
+    raise ValueError(
+      f"log_probs has fewer rows ({log_probs.shape[0]}) than targets ({flat_targets.shape[0]})."
+    )
+  if log_probs.shape[0] == flat_targets.shape[0]:
+    return log_probs
+  return log_probs[: flat_targets.shape[0]]
+
+
 # Simple cross-entropy loss for classification
 def cross_entropy_loss(log_probs, y, label_smoothing=0.0):
   """
@@ -576,6 +597,7 @@ def cross_entropy_loss(log_probs, y, label_smoothing=0.0):
       y: [batch,] integer class labels
       label_smoothing: float in [0, 1]. 0 = no smoothing (standard CE)
   """
+  log_probs = align_log_probs_with_targets(log_probs, y)
   num_classes = log_probs.shape[-1]
   one_hot = jax.nn.one_hot(y, num_classes)
 
@@ -1073,6 +1095,7 @@ def compute_batch_accuracy(state, x_batch, y_batch):
   # Forward pass to compute logits
   variables = {'params': state.params, 'batch_stats': state.batch_stats}
   log_probs = state.apply_inf_fn(variables, x_batch, mutable=False)  # shape [batch_size, num_classes]
+  log_probs = align_log_probs_with_targets(log_probs, y_batch)
 
   # Predicted class (argmax of logits)
   predictions = jnp.argmax(jnp.exp(log_probs), axis=1)
@@ -1403,14 +1426,15 @@ def infer_batch_layout(batch): # TODO: potentially not robust, might be preferab
     """
     Infer where the batch dimension lives and how to treat targets.
 
-    Assumes `batch` is structurally `(x, y)` where `x` is a single array.
+    Assumes `batch` is structurally `(x, y)`.
     with either:
       - CV-style:   x: [B, ...], y: [B] or [B, ...]
       - Text-style: x: [T, B],   y: [T*B]
+      - Seq2seq-style: x: (src_tokens, prev_output_tokens), y: [sum(target_lengths)]
 
     Returns:
       layout = {
-        "mode": "cv" or "text",
+        "mode": "cv", "text", or "seq2seq_translation",
         "batch_axis": int,          # axis of batch dim in x
         "T": int | None,            # sequence length for text mode
       }
@@ -1418,11 +1442,7 @@ def infer_batch_layout(batch): # TODO: potentially not robust, might be preferab
     x, y = split_supervised_batch(batch)
 
     if isinstance(x, Sequence) and not isinstance(x, (str, bytes)):
-        raise ValueError(
-          "infer_batch_layout does not support tuple-valued x batches yet; "
-          "seq2seq translation batches should bypass this path until the "
-          "dedicated update-boundary support lands."
-        )
+        return infer_seq2seq_batch_layout((x, y))
 
     if not isinstance(x, jnp.ndarray):
         x = jnp.asarray(x)
@@ -2232,6 +2252,29 @@ def warmup_piecewise_decay_schedule(
       init_value=base_lr,
       boundaries_and_scales=bound_dict)]
   return optax.join_schedules(schedules, [warmup_steps])
+
+
+def inverse_sqrt_schedule(
+        base_lr: float,
+        total_epochs: int,
+        steps_per_epoch: float,
+        warmup_updates: int,
+        warmup_init_lr: float = 0.0,
+) -> optax.Schedule:
+  del total_epochs, steps_per_epoch
+  if warmup_updates <= 0:
+    raise ValueError(f"warmup_updates must be positive, got {warmup_updates}")
+
+  warmup_updates = float(warmup_updates)
+  decay_factor = float(base_lr) * math.sqrt(warmup_updates)
+
+  def schedule(step):
+    step = jnp.asarray(step, dtype=jnp.float32)
+    warmup_lr = warmup_init_lr + ((base_lr - warmup_init_lr) * (step / warmup_updates))
+    decay_lr = decay_factor / jnp.sqrt(jnp.maximum(step, warmup_updates))
+    return jnp.where(step < warmup_updates, warmup_lr, decay_lr)
+
+  return schedule
 
 
 ##################################

@@ -12,6 +12,11 @@ from flax.core.frozen_dict import FrozenDict, freeze
 
 from lqr_optimizer._src.utils.utils import (normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm,
                                             get_per_layer_norm, _deep_copy_pytree, infer_batch_layout, get_per_layer_skews)
+from lqr_optimizer._src.utils.seq2seq_utils import (
+  SEQ2SEQ_TASK_KIND,
+  seq2seq_target_count,
+  slice_seq2seq_flat_targets,
+)
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
                              lqr_active_controllable_forward_operators_and_states,
@@ -85,9 +90,11 @@ def _batch_size_from_datapoint(datapoint, batch_axis):
   return int(first_x.shape[batch_axis])
 
 
-def _effective_loss_count(layout, batch_size):
+def _effective_loss_count(layout, batch_size, *, start=0):
   if layout["mode"] == "text":
     return int(layout["T"] * batch_size)
+  if layout["mode"] == SEQ2SEQ_TASK_KIND:
+    return seq2seq_target_count(layout["target_lengths"], start=int(start), size=int(batch_size))
   return int(batch_size)
 
 
@@ -102,6 +109,20 @@ def _slice_batch_datapoint(datapoint, layout, start, size):
   batch_axis = layout["batch_axis"]
   batch_size = _batch_size_from_datapoint(datapoint, batch_axis)
   token_batch_size = None if layout["T"] is None else int(layout["T"] * batch_size)
+
+  if mode == SEQ2SEQ_TASK_KIND:
+    inputs, targets = datapoint
+    sliced_inputs = jax.tree_util.tree_map(
+      lambda leaf: jnp.asarray(leaf)[start:start + size],
+      inputs,
+    )
+    sliced_targets = slice_seq2seq_flat_targets(
+      targets,
+      layout["target_lengths"],
+      start=int(start),
+      size=int(size),
+    )
+    return sliced_inputs, sliced_targets
 
   def slice_leaf(x):
     if not isinstance(x, jnp.ndarray):
@@ -132,6 +153,31 @@ def _slice_batch_datapoint(datapoint, layout, start, size):
 def _concat_preconditioner_batches(batches, layout, precond_batch_size):
   mode = layout["mode"]
   batch_axis = layout["batch_axis"]
+
+  if mode == SEQ2SEQ_TASK_KIND:
+    input_batches = []
+    target_batches = []
+    target_lengths = []
+    for batch in batches:
+      batch_layout = infer_batch_layout(batch)
+      inputs, targets = batch
+      input_batches.append(inputs)
+      target_batches.append(jnp.asarray(targets))
+      target_lengths.extend(batch_layout["target_lengths"])
+
+    accumulated_inputs = jax.tree_util.tree_map(
+      lambda *xs: jnp.concatenate([jnp.asarray(x) for x in xs], axis=batch_axis),
+      *input_batches,
+    )
+    accumulated_targets = jnp.concatenate(target_batches, axis=0)
+    accumulated_layout = dict(layout)
+    accumulated_layout["target_lengths"] = tuple(int(length) for length in target_lengths)
+    return _slice_batch_datapoint(
+      (accumulated_inputs, accumulated_targets),
+      accumulated_layout,
+      0,
+      precond_batch_size,
+    )
 
   def concat_fn(*xs):
     x0 = xs[0]
@@ -182,6 +228,11 @@ def _take_preconditioner_chunk_datapoints(dataloader, precond_batch_size, batch_
 
   current_batch = next(dataloader)
   layout = infer_batch_layout(current_batch)
+  if layout["mode"] == SEQ2SEQ_TASK_KIND:
+    raise ValueError(
+      "llqr_batch_update_mode='chunked_lqr_segment' does not support "
+      "seq2seq_translation batches yet; use full_batch for translation."
+    )
   batch_axis = layout["batch_axis"]
   current_batch_size = _batch_size_from_datapoint(current_batch, batch_axis)
   current_offset = 0
@@ -190,11 +241,12 @@ def _take_preconditioner_chunk_datapoints(dataloader, precond_batch_size, batch_
   chunk_weights = []
 
   while accumulated_size < precond_batch_size:
+    current_layout = infer_batch_layout(current_batch)
     available = current_batch_size - current_offset
     remaining_total = precond_batch_size - accumulated_size
     take_size = min(batch_chunk_size, available, remaining_total)
-    chunk_datapoints.append(_slice_batch_datapoint(current_batch, layout, current_offset, take_size))
-    chunk_weights.append(_effective_loss_count(layout, take_size))
+    chunk_datapoints.append(_slice_batch_datapoint(current_batch, current_layout, current_offset, take_size))
+    chunk_weights.append(_effective_loss_count(current_layout, take_size, start=current_offset))
     accumulated_size += take_size
     current_offset += take_size
 

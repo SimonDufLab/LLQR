@@ -14,18 +14,18 @@ from lqr_optimizer._src.utils.utils import (
 
 
 def make_padding_mask(tokens: jnp.ndarray, pad_id: int) -> jnp.ndarray:
-  return (tokens != pad_id)[:, None, None, :]
+  return (tokens != pad_id).astype(jnp.float32)[:, None, None, :]
 
 
 def make_causal_mask(seq_len: int, batch_size: int) -> jnp.ndarray:
-  mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))
+  mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.float32))
   return jnp.broadcast_to(mask[None, None, :, :], (batch_size, 1, seq_len, seq_len))
 
 
 def combine_masks(*masks: jnp.ndarray) -> jnp.ndarray:
   result = masks[0]
   for mask in masks[1:]:
-    result = jnp.logical_and(result, mask)
+    result = result * mask
   return result
 
 
@@ -60,6 +60,8 @@ def _validate_tokens(tokens: jnp.ndarray, *, expected_rank: int, max_positions: 
 class TranslationState(NamedTuple):
   src_h: jnp.ndarray
   tgt_h: jnp.ndarray
+  tgt_embed_matrix: jnp.ndarray
+  tgt_nonpad_mask: jnp.ndarray
   src_pad_mask: jnp.ndarray
   tgt_self_mask: jnp.ndarray
   src_residual: Optional[jnp.ndarray]
@@ -95,6 +97,7 @@ class TranslationInitStage(nn.Module):
     embed_scale = math.sqrt(self.emb_dim)
     src_h = embed_scale * self.src_embedding(src_tokens)
     tgt_h = embed_scale * self.tgt_embedding(prev_output_tokens)
+    tgt_embed_matrix = self.tgt_embedding.embedding
 
     src_h = src_h + _sinusoidal_position_encoding(src_tokens.shape[1], self.emb_dim, src_h.dtype)
     tgt_h = tgt_h + _sinusoidal_position_encoding(prev_output_tokens.shape[1], self.emb_dim, tgt_h.dtype)
@@ -102,12 +105,22 @@ class TranslationInitStage(nn.Module):
     src_h = nn.Dropout(rate=self.dropout_rate)(src_h, deterministic=self.deterministic)
     tgt_h = nn.Dropout(rate=self.dropout_rate)(tgt_h, deterministic=self.deterministic)
 
+    tgt_nonpad_mask = (prev_output_tokens != self.pad_id).astype(jnp.float32)
     src_pad_mask = make_padding_mask(src_tokens, self.pad_id)
     tgt_self_mask = combine_masks(
       make_padding_mask(prev_output_tokens, self.pad_id),
       make_causal_mask(prev_output_tokens.shape[1], prev_output_tokens.shape[0]),
     )
-    return TranslationState(src_h, tgt_h, src_pad_mask, tgt_self_mask, None, None)
+    return TranslationState(
+      src_h,
+      tgt_h,
+      tgt_embed_matrix,
+      tgt_nonpad_mask,
+      src_pad_mask,
+      tgt_self_mask,
+      None,
+      None,
+    )
 
 
 class EncoderSelfAttentionStage(nn.Module):
@@ -129,7 +142,7 @@ class EncoderSelfAttentionStage(nn.Module):
       kernel_init=nn.initializers.xavier_uniform(),
       bias_init=nn.initializers.zeros,
       name="MultiHeadDotProductAttention_0",
-    )(residual, residual, mask=state.src_pad_mask)
+    )(residual, residual, mask=state.src_pad_mask > 0)
     return state._replace(src_h=attended, src_residual=residual)
 
 
@@ -152,7 +165,7 @@ class DecoderSelfAttentionStage(nn.Module):
       kernel_init=nn.initializers.xavier_uniform(),
       bias_init=nn.initializers.zeros,
       name="MultiHeadDotProductAttention_0",
-    )(residual, residual, mask=state.tgt_self_mask)
+    )(residual, residual, mask=state.tgt_self_mask > 0)
     return state._replace(tgt_h=attended, tgt_residual=residual)
 
 
@@ -175,7 +188,7 @@ class DecoderCrossAttentionStage(nn.Module):
       kernel_init=nn.initializers.xavier_uniform(),
       bias_init=nn.initializers.zeros,
       name="MultiHeadDotProductAttention_0",
-    )(residual, state.src_h, mask=state.src_pad_mask)
+    )(residual, state.src_h, mask=state.src_pad_mask > 0)
     return state._replace(tgt_h=attended, tgt_residual=residual)
 
 
@@ -285,12 +298,15 @@ class DecoderResidualNormStage(nn.Module):
 
 
 class TranslationFinalLogitsStage(nn.Module):
-  tgt_embedding: nn.Module
-
   def __call__(self, state: TranslationState) -> jnp.ndarray:
-    logits = self.tgt_embedding.attend(state.tgt_h)
+    logits = jnp.einsum("btd,vd->btv", state.tgt_h, state.tgt_embed_matrix)
     batch_size, target_length, vocab_size = logits.shape
-    return logits.reshape((batch_size * target_length, vocab_size))
+    flat_logits = logits.reshape((batch_size * target_length, vocab_size))
+    flat_valid = (state.tgt_nonpad_mask.reshape((batch_size * target_length,)) > 0).astype(jnp.int32)
+    flat_indices = jnp.arange(batch_size * target_length, dtype=jnp.int32)
+    sort_keys = (1 - flat_valid) * (batch_size * target_length) + flat_indices
+    sort_order = jnp.argsort(sort_keys, stable=True)
+    return flat_logits[sort_order]
 
 
 class TranslationFinalLogSoftmaxStage(nn.Module):
@@ -602,7 +618,7 @@ def create_transformer_iwslt_model(
       layers,
       stage_descriptors,
       "translation_logits",
-      TranslationFinalLogitsStage(tgt_embedding=tgt_embedding),
+      TranslationFinalLogitsStage(),
       passive_state_hessian="zero",
     )
     _append_passive(

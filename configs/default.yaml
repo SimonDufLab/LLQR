@@ -4,6 +4,7 @@ eval_batch_size: null
 learning_rate: 0.1
 momentum: 0.9
 main_optimizer: sgd
+adam_betas: [0.9, 0.999]
 weight_decay: null
 wd_mask: null # list of parameters type to exclude from wd
 total_epochs: 250 # used to be total_steps: 97656

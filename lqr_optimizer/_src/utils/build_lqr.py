@@ -755,7 +755,8 @@ def _cross_entropy_log_prob_gradient(log_probs, targets, label_smoothing):
     smooth = label_smoothing / num_classes
     one_hot = (1.0 - label_smoothing) * one_hot + smooth
 
-  grad = -one_hot / flat_log_probs.shape[0]
+  grad = jnp.zeros_like(flat_log_probs)
+  grad = grad.at[: flat_targets.shape[0]].set(-one_hot / flat_targets.shape[0])
   return grad.reshape(log_probs.shape)
 
 
