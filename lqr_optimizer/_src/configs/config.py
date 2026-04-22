@@ -7,6 +7,7 @@ from lqr_optimizer._src.models.vgg import create_vgg16bn
 from lqr_optimizer._src.models.wide_resnet import create_wide_resnet28x10
 from lqr_optimizer._src.models.grok_model import create_grok_model
 from lqr_optimizer._src.models.gpt import create_gpt_model
+from lqr_optimizer._src.models.transformer_iwslt import create_transformer_iwslt_model
 from lqr_optimizer._src.models.vit import create_vit_s16, create_vit_ti16
 from lqr_optimizer._src.utils import divergence
 
@@ -24,6 +25,7 @@ model_choice = {
   "wide-resnet-28-10": create_wide_resnet28x10,
   "grok-transformer": create_grok_model,
   "gpt2-small": create_gpt_model,
+  "transformer-iwslt-de-en": create_transformer_iwslt_model,
   "vit-ti-16": create_vit_ti16,
   "vit-s-16": create_vit_s16,
 }

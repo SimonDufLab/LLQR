@@ -1,0 +1,4 @@
+name: transformer-iwslt-de-en
+
+activation: relu
+size: null

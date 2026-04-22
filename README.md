@@ -28,8 +28,17 @@ The current dedicated architecture additions are:
 - `vgg16-bn`, implemented in `lqr_optimizer/_src/models/vgg.py`
 - `wide-resnet-28-10`, implemented in `lqr_optimizer/_src/models/wide_resnet.py`
 - `pyramidnet-110`, implemented in `lqr_optimizer/_src/models/pyramidnet.py`
+- `transformer-iwslt-de-en`, implemented in `lqr_optimizer/_src/models/transformer_iwslt.py`
 - `vit-ti-16`, implemented in `lqr_optimizer/_src/models/vit.py`
 - `vit-s-16`, implemented in `lqr_optimizer/_src/models/vit.py`
+
+The translation architecture surface is intentionally narrow in Wave 3:
+
+- routed architecture: `transformer-iwslt-de-en`
+- expected loader contract: `dataset.loader=local_seq2seq_text`
+- batch contract: `x=(src_tokens, prev_output_tokens)` and `y=target_tokens_flat`
+- model defaults: fairseq-style 6 encoder layers, 6 decoder layers, embed dim `512`, FFN dim `1024`, heads `4`, `relu`, sinusoidal positions, and tied decoder input/output embeddings
+- current boundary: Wave 3 lands the architecture and explicit `EnhancedSequential` stage/segment metadata only; the public recipe preset, generation, BLEU, and checkpoint-metric wiring land in later waves
 
 The maintained Friendly-SAM-aligned CIFAR presets currently exist for:
 
@@ -143,6 +152,7 @@ The `resnet18-cifar10` comparison remains an external-only higher-memory follow-
 - `lqr_optimizer/_src/utils/sam_mode_handlers.py`: SAM-family train-step dispatcher for `null`, `base_sam`, `base_fsam`, `past_fsam`, `asam`, and `fisher_sam`
 - `lqr_optimizer/_src/utils/seq2seq_utils.py`: seq2seq-specific runtime helpers kept separate from generic `utils.py` while the IWSLT14 translation surface is landing
 - `lqr_optimizer/_src/utils/dataloaders/iwslt14_de_en.py`: fairseq-faithful local IWSLT14 text loader with separate source and target dictionaries, flat numeric caches, and token-budget training batches
+- `lqr_optimizer/_src/models/transformer_iwslt.py`: fairseq-style IWSLT14 German-to-English encoder-decoder Transformer with explicit train/inference variants and LLQR segment metadata
 - `lqr_optimizer/_src/models/`: architecture definitions
 - `lqr_optimizer/_src/block_matrices_approx/`: structured inverse-preconditioner parameterizations
 
