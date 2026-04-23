@@ -1,4 +1,5 @@
 import abc
+import math
 from typing import Tuple, Optional, Any
 import jax
 import jax.numpy as jnp
@@ -244,6 +245,45 @@ KERNEL_KEYS = ("kernel", "embedding", "pos_embedding")
 BIAS_KEYS = ("bias", "scale")
 GPT_TOK_EMBED_COMPONENT = ("tok_embed", "embedding")
 GPT_LM_HEAD_COMPONENT = ("lm_head", "kernel")
+
+
+def _format_component_name(component: Tuple[str, ...]) -> str:
+  return "/".join(component)
+
+
+def _kernel_matrix_shape(component: Tuple[str, ...], kernel_shape: Tuple[int, ...]) -> Tuple[int, int]:
+  if len(kernel_shape) == 2:
+    return kernel_shape
+  if len(kernel_shape) == 4:
+    k_h, k_w, cin, cout = kernel_shape
+    return k_h * k_w * cin, cout
+  if len(kernel_shape) == 3:
+    if component and component[-1] == "pos_embedding":
+      return math.prod(kernel_shape[:-1]), kernel_shape[-1]
+    if component[-1] == "kernel" and len(component) >= 2:
+      projection_name = component[-2]
+      if projection_name in ("query", "key", "value"):
+        emb_dim, num_heads, head_dim = kernel_shape
+        return emb_dim, num_heads * head_dim
+      if projection_name == "out":
+        num_heads, head_dim, emb_dim = kernel_shape
+        return num_heads * head_dim, emb_dim
+    raise ValueError(
+      "unsupported rank-3 kernel-like component "
+      f"{_format_component_name(component)} with shape {kernel_shape}"
+    )
+  raise ValueError(
+    f"Kernel shape {kernel_shape} not supported for component {_format_component_name(component)}"
+  )
+
+
+def _kernel_shape_for_layer(component: Tuple[str, ...], kernel, *, layer_name: str) -> Tuple[int, int]:
+  if not hasattr(kernel, "shape"):
+    raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
+  try:
+    return _kernel_matrix_shape(component, kernel.shape)
+  except ValueError as exc:
+    raise ValueError(f"{exc} in layer {layer_name}") from exc
 class KroneckerBlock(BlockStructures):
   """
   A block structure that handles both kernel and bias parameters.
@@ -279,25 +319,10 @@ class KroneckerBlock(BlockStructures):
       for key in flat_params.keys():
         if any(k in key for k in KERNEL_KEYS):
           kernel = flat_params[key]
-          if not hasattr(kernel, "shape"):
-            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
-          if len(kernel.shape) == 2:
-            # Dense layer kernel: shape (m, n)
-            param_shape = kernel.shape
-            factor_A = self.identity_block_init(param_shape[0])
-            factor_B = self.identity_block_init(param_shape[1])
-            layer_blocks[key] = (factor_A, factor_B)
-          elif len(kernel.shape) == 4:
-            # Convolution layer kernel: shape (k_h, k_w, in_channels, out_channels)
-            k_h, k_w, cin, cout = kernel.shape
-            # param_shape = kernel.shape
-            # Reshape the kernel to 2D: (k_h*k_w*cin, cout)
-            # reshaped_kernel = kernel.reshape((k_h * k_w * cin, cout))
-            factor_A = self.identity_block_init(k_h * k_w * cin)
-            factor_B = self.identity_block_init(cout)
-            layer_blocks[key] = (factor_A, factor_B)
-          else:
-            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+          m, n = _kernel_shape_for_layer(key, kernel, layer_name=layer_name)
+          factor_A = self.identity_block_init(m)
+          factor_B = self.identity_block_init(n)
+          layer_blocks[key] = (factor_A, factor_B)
         # Process bias using a diagonal approximation
         if any(k in key for k in BIAS_KEYS):
           bias = flat_params[key]
@@ -325,12 +350,7 @@ class KroneckerBlock(BlockStructures):
       for component, vec_component in flatten_dict(layer_vectors).items():
         if any(k in component for k in KERNEL_KEYS):
           factor_A, factor_B = layer_blocks[component]
-          # Reshape the gradient vector according to the component type
-          vector_matrix = vec_component
-          vm_shape = vector_matrix.shape
-          if len(vm_shape) == 4:
-            k_h, k_w, cin, cout = vm_shape
-            vector_matrix = vector_matrix.reshape((k_h * k_w * cin, cout))
+          vector_matrix, vm_shape = _reshape_kernel_to_2d(component, vec_component)
           # Apply the Kronecker product approximation
           # product_matrix = factor_B @ vector_matrix.T @ factor_A.T
           # layer_product[component] = product_matrix.T.reshape(vm_shape)
@@ -340,7 +360,7 @@ class KroneckerBlock(BlockStructures):
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
           # Elementwise product for the diagonal approximation
-          flat_product = diag * vec_component
+          flat_product = _apply_diag_component(diag, vec_component)
           layer_product[component] = flat_product
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -353,7 +373,7 @@ class KroneckerBlock(BlockStructures):
       prepared_layer_vectors = {}
       for component, vec_component in flatten_dict(layer_vectors).items():
         if any(k in component for k in KERNEL_KEYS):
-          vector_matrix, _ = _reshape_kernel_to_2d(vec_component)
+          vector_matrix, _ = _reshape_kernel_to_2d(component, vec_component)
           prepared_layer_vectors[component] = vector_matrix
         elif any(k in component for k in BIAS_KEYS):
           prepared_layer_vectors[component] = jnp.ravel(vec_component)
@@ -559,24 +579,10 @@ class DiagKroneckerBlock(KroneckerBlock):
       for key in flat_params.keys():
         if any(k in key for k in KERNEL_KEYS):
           kernel = flat_params[key]
-          if not hasattr(kernel, "shape"):
-            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
-          if len(kernel.shape) == 2:
-            # Dense layer kernel: shape (m, n)
-            m, n = kernel.shape
-            diag_A = self.identity_diag_init(m)  # a ∈ R^m
-            diag_B = self.identity_diag_init(n)  # b ∈ R^n
-            layer_blocks[key] = (diag_A, diag_B)
-          elif len(kernel.shape) == 4:
-            # Convolution layer kernel: shape (k_h, k_w, in_channels, out_channels)
-            k_h, k_w, cin, cout = kernel.shape
-            M = k_h * k_w * cin
-            N = cout
-            diag_A = self.identity_diag_init(M)  # a ∈ R^{k_h*k_w*cin}
-            diag_B = self.identity_diag_init(N)  # b ∈ R^{cout}
-            layer_blocks[key] = (diag_A, diag_B)
-          else:
-            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+          m, n = _kernel_shape_for_layer(key, kernel, layer_name=layer_name)
+          diag_A = self.identity_diag_init(m)
+          diag_B = self.identity_diag_init(n)
+          layer_blocks[key] = (diag_A, diag_B)
 
         # Process bias using a diagonal approximation (unchanged)
         if any(k in key for k in BIAS_KEYS):
@@ -655,7 +661,7 @@ class DiagKroneckerBlock(KroneckerBlock):
         elif any(k in component for k in BIAS_KEYS):
           # Bias: elementwise product with diagonal (unchanged)
           diag = layer_blocks[component]
-          flat_product = diag * vec_component
+          flat_product = _apply_diag_component(diag, vec_component)
           layer_product[component] = flat_product
 
         else:
@@ -752,16 +758,15 @@ def _apply_sds_sym_norm_d(S_lower: jnp.ndarray, D: jnp.ndarray, X: jnp.ndarray) 
   return S_lower @ DStX
 
 
-def _reshape_kernel_to_2d(vec_component: jnp.ndarray) -> Tuple[jnp.ndarray, Tuple[int, ...]]:
-  """Dense/conv kernel reshape helper."""
+def _reshape_kernel_to_2d(component: Tuple[str, ...], vec_component: jnp.ndarray) -> Tuple[jnp.ndarray, Tuple[int, ...]]:
+  """Component-aware kernel reshape helper for Dense, Conv, DenseGeneral, and position embeddings."""
   orig_shape = vec_component.shape
-  if vec_component.ndim == 4:
-    k_h, k_w, cin, cout = orig_shape
-    return vec_component.reshape((k_h * k_w * cin, cout)), orig_shape
-  elif vec_component.ndim == 2:
-    return vec_component, orig_shape
-  else:
-    raise ValueError(f"Kernel shape {orig_shape} not supported")
+  rows, cols = _kernel_matrix_shape(component, orig_shape)
+  return vec_component.reshape((rows, cols)), orig_shape
+
+
+def _apply_diag_component(diag: jnp.ndarray, vec_component: jnp.ndarray) -> jnp.ndarray:
+  return (diag * jnp.ravel(vec_component)).reshape(vec_component.shape)
 
 
 # -----------------------------
@@ -812,7 +817,7 @@ class MirrorSymKroneckerBlock(KroneckerBlock):
 
         if any(k in component for k in KERNEL_KEYS):
           T_A, T_B = layer_blocks[component]  # each is (m,m) and (n,n), lower-tri parameter matrices
-          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
 
           # Apply A@X
           AX = _apply_mirror_sym(T_A, X2d)
@@ -824,7 +829,7 @@ class MirrorSymKroneckerBlock(KroneckerBlock):
 
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -872,7 +877,7 @@ class PSDSymKroneckerBlock(KroneckerBlock):
 
         if any(k in component for k in KERNEL_KEYS):
           L_A, L_B = layer_blocks[component]  # (m,m), (n,n), lower-tri params
-          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
 
           AX = _apply_psd_sym(L_A, X2d)
           out2d = _apply_psd_sym(L_B, AX.T).T
@@ -881,7 +886,7 @@ class PSDSymKroneckerBlock(KroneckerBlock):
 
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -930,13 +935,7 @@ class SDSSymKroneckerBlock(KroneckerBlock):
       for key in flat_params.keys():
         if any(k in key for k in KERNEL_KEYS):
           kernel = flat_params[key]
-          if len(kernel.shape) == 2:
-            m, n = kernel.shape
-          elif len(kernel.shape) == 4:
-            k_h, k_w, cin, cout = kernel.shape
-            m, n = k_h * k_w * cin, cout
-          else:
-            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+          m, n = _kernel_shape_for_layer(key, kernel, layer_name=layer_name)
 
           SA = self.identity_block_init(m)  # (S_A, D_A)
           SB = self.identity_block_init(n)  # (S_B, D_B)
@@ -989,7 +988,7 @@ class SDSSymKroneckerBlock(KroneckerBlock):
 
         if any(k in component for k in KERNEL_KEYS):
           (S_A, D_A), (S_B, D_B) = layer_blocks[component]
-          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
 
           AX = _apply_sds_sym(S_A, D_A, X2d)
           out2d = _apply_sds_sym(S_B, D_B, AX.T).T
@@ -998,7 +997,7 @@ class SDSSymKroneckerBlock(KroneckerBlock):
 
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -1035,7 +1034,7 @@ class NormalizedSDSSymKroneckerBlock(SDSSymKroneckerBlock):
 
         if any(k in component for k in KERNEL_KEYS):
           (S_A, D_A), (S_B, D_B) = layer_blocks[component]
-          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
 
           AX = _apply_sds_sym_norm_d(S_A, D_A, X2d)
           out2d = _apply_sds_sym_norm_d(S_B, D_B, AX.T).T
@@ -1044,7 +1043,7 @@ class NormalizedSDSSymKroneckerBlock(SDSSymKroneckerBlock):
 
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -1129,16 +1128,7 @@ class EKFACBlock(KroneckerBlock):
       for key in flat_params.keys():
         if any(k in key for k in KERNEL_KEYS):
           kernel = flat_params[key]
-          if not hasattr(kernel, "shape"):
-            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
-
-          if len(kernel.shape) == 2:
-            m, n = kernel.shape
-          elif len(kernel.shape) == 4:
-            k_h, k_w, cin, cout = kernel.shape
-            m, n = k_h * k_w * cin, cout
-          else:
-            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+          m, n = _kernel_shape_for_layer(key, kernel, layer_name=layer_name)
 
           layer_blocks[key] = self.identity_block_init((m, n))
 
@@ -1176,23 +1166,13 @@ class EKFACBlock(KroneckerBlock):
       for component, vec_component in flatten_dict(layer_vectors).items():
         if any(k in component for k in KERNEL_KEYS):
           Q_A, Q_G, inv_diag = layer_blocks[component]
-
-          X = vec_component
-          orig_shape = X.shape
-          if X.ndim == 4:
-            k_h, k_w, cin, cout = orig_shape
-            X2d = X.reshape((k_h * k_w * cin, cout))
-          elif X.ndim == 2:
-            X2d = X
-          else:
-            raise ValueError(f"Kernel shape {orig_shape} not supported for layer {layer_name}")
-
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
           out2d = self._ekfac_apply(Q_A, Q_G, inv_diag, X2d)
           layer_product[component] = out2d.reshape(orig_shape)
 
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -1206,7 +1186,7 @@ class EKFACBlock(KroneckerBlock):
       prepared_layer = {}
       for component, vec_component in flatten_dict(layer_vectors).items():
         if any(k in component for k in KERNEL_KEYS):
-          prepared_layer[component] = _reshape_kernel_to_2d(vec_component)[0]
+          prepared_layer[component] = _reshape_kernel_to_2d(component, vec_component)[0]
         elif any(k in component for k in BIAS_KEYS):
           prepared_layer[component] = jnp.ravel(vec_component)
         else:
@@ -1306,7 +1286,7 @@ class EKFACBlock(KroneckerBlock):
 
 
 class GPTEKFACBlock(EKFACBlock):
-  """EKFAC variant that keeps GPT vocab-sized basis factors diagonal."""
+  """Historically named EKFAC variant with diagonal handling for embedding-sized vocab factors."""
 
   @staticmethod
   def _identity_diag_factor_init(dim: int) -> jnp.ndarray:
@@ -1320,8 +1300,8 @@ class GPTEKFACBlock(EKFACBlock):
     return self._identity_scale * jnp.ones((m * n,), dtype=jnp.float32)
 
   @staticmethod
-  def _is_tok_embed_component(component) -> bool:
-    return component == GPT_TOK_EMBED_COMPONENT
+  def _is_embedding_like_component(component) -> bool:
+    return bool(component) and component[-1] == "embedding"
 
   @staticmethod
   def _is_lm_head_component(component) -> bool:
@@ -1370,18 +1350,9 @@ class GPTEKFACBlock(EKFACBlock):
       for key in flat_params.keys():
         if any(k in key for k in KERNEL_KEYS):
           kernel = flat_params[key]
-          if not hasattr(kernel, "shape"):
-            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
+          m, n = _kernel_shape_for_layer(key, kernel, layer_name=layer_name)
 
-          if len(kernel.shape) == 2:
-            m, n = kernel.shape
-          elif len(kernel.shape) == 4:
-            k_h, k_w, cin, cout = kernel.shape
-            m, n = k_h * k_w * cin, cout
-          else:
-            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
-
-          if self._is_tok_embed_component(key):
+          if self._is_embedding_like_component(key):
             layer_blocks[key] = (
               self._identity_diag_factor_init(m),
               self._identity_dense_factor_init(n),
@@ -1415,12 +1386,12 @@ class GPTEKFACBlock(EKFACBlock):
       for component, vec_component in flatten_dict(layer_vectors).items():
         if any(k in component for k in KERNEL_KEYS):
           q_a, q_g, inv_diag = layer_blocks[component]
-          x2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          x2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
           out2d = self._ekfac_apply_maybe_diag(q_a, q_g, inv_diag.astype(x2d.dtype), x2d)
           layer_product[component] = out2d.reshape(orig_shape)
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
 
@@ -1599,7 +1570,7 @@ class EKFACBlockNormalized(EKFACBlock):
             QA, QG, inv_diag = blk
             alpha = None
 
-          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
 
           d_eff = inv_diag.astype(X2d.dtype)
           if alpha is not None:
@@ -1610,7 +1581,7 @@ class EKFACBlockNormalized(EKFACBlock):
 
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -1739,7 +1710,7 @@ class SeparableEKFACBlock(EKFACBlock):
         if any(k in component for k in KERNEL_KEYS):
           QA, QG, a, g = layer_blocks[component]
 
-          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
 
           a_eff = a.astype(X2d.dtype)  # (m,)
           g_eff = g.astype(X2d.dtype)  # (n,)
@@ -1755,7 +1726,7 @@ class SeparableEKFACBlock(EKFACBlock):
 
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -1869,14 +1840,14 @@ class PSDEKFACBlock(EKFACBlock):
         if any(k in component for k in KERNEL_KEYS):
           QA, QG, raw_s = layer_blocks[component]
 
-          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
           out2d = _ekfac_apply_psd(QA, QG, raw_s, X2d, eps=self._eps)
 
           layer_product[component] = out2d.reshape(orig_shape)
 
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -1956,7 +1927,7 @@ class PSDSeparableEKFACBlock(EKFACBlock):
         if any(k in component for k in KERNEL_KEYS):
           QA, QG, raw_a, raw_g = layer_blocks[component]
 
-          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
 
           a = _psd_from_raw(raw_a, self._eps).astype(X2d.dtype)  # (m,)
           g = _psd_from_raw(raw_g, self._eps).astype(X2d.dtype)  # (n,)
@@ -1972,7 +1943,7 @@ class PSDSeparableEKFACBlock(EKFACBlock):
 
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -2099,16 +2070,7 @@ class HouseholderDiagKroneckerBlock(KroneckerBlock):
       for key in flat_params.keys():
         if any(k in key for k in KERNEL_KEYS):
           kernel = flat_params[key]
-          if not hasattr(kernel, "shape"):
-            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
-
-          if len(kernel.shape) == 2:
-            m, n = kernel.shape
-          elif len(kernel.shape) == 4:
-            k_h, k_w, cin, cout = kernel.shape
-            m, n = k_h * k_w * cin, cout
-          else:
-            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+          m, n = _kernel_shape_for_layer(key, kernel, layer_name=layer_name)
 
           # Left factor acts on rows (m), right factor on cols (n)
           FA = self.identity_block_init(m)  # (V_A, d_A)
@@ -2145,7 +2107,7 @@ class HouseholderDiagKroneckerBlock(KroneckerBlock):
         if any(k in component for k in KERNEL_KEYS):
           (V_A, d_A), (V_B, d_B) = layer_blocks[component]
 
-          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
 
           # Left apply: (m,m) operator on rows
           AX = _apply_QDQ(V_A, d_A.astype(X2d.dtype), X2d, eps=self._eps)
@@ -2157,7 +2119,7 @@ class HouseholderDiagKroneckerBlock(KroneckerBlock):
 
         elif any(k in component for k in BIAS_KEYS):
           diag = layer_blocks[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -2633,16 +2595,7 @@ class Sym_SWM_EKFAC(EKFACBlock):
       for key in flat_params.keys():
         if any(k in key for k in KERNEL_KEYS):
           kernel = flat_params[key]
-          if not hasattr(kernel, "shape"):
-            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
-
-          if len(kernel.shape) == 2:
-            m, n = kernel.shape
-          elif len(kernel.shape) == 4:
-            k_h, k_w, cin, cout = kernel.shape
-            m, n = k_h * k_w * cin, cout
-          else:
-            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+          m, n = _kernel_shape_for_layer(key, kernel, layer_name=layer_name)
 
           u_A = self._rand_vec(m)
           u_G = self._rand_vec(n)
@@ -2721,23 +2674,13 @@ class Sym_SWM_EKFAC(EKFACBlock):
       for component, vec_component in flatten_dict(layer_vectors).items():
         if any(k in component for k in KERNEL_KEYS):
           Q_A, Q_G, inv_diag = mem_layer[component]
-
-          X = vec_component
-          orig_shape = X.shape
-          if X.ndim == 4:
-            k_h, k_w, cin, cout = orig_shape
-            X2d = X.reshape((k_h * k_w * cin, cout))
-          elif X.ndim == 2:
-            X2d = X
-          else:
-            raise ValueError(f"Kernel shape {orig_shape} not supported for layer {layer_name}")
-
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
           out2d = self._ekfac_apply(Q_A, Q_G, inv_diag, X2d)
           layer_product[component] = out2d.reshape(orig_shape)
 
         elif any(k in component for k in BIAS_KEYS):
           diag = mem_layer[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
@@ -2879,16 +2822,7 @@ class Sym_SWM_SeparableEKFAC(SeparableEKFACBlock):
       for key in flat_params.keys():
         if any(k in key for k in KERNEL_KEYS):
           kernel = flat_params[key]
-          if not hasattr(kernel, "shape"):
-            raise ValueError(f"Kernel for layer {layer_name} does not have a shape attribute")
-
-          if len(kernel.shape) == 2:
-            m, n = kernel.shape
-          elif len(kernel.shape) == 4:
-            k_h, k_w, cin, cout = kernel.shape
-            m, n = k_h * k_w * cin, cout
-          else:
-            raise ValueError(f"Kernel shape {kernel.shape} not supported for layer {layer_name}")
+          m, n = _kernel_shape_for_layer(key, kernel, layer_name=layer_name)
 
           uA = self._rand_vec(m)
           uG = self._rand_vec(n)
@@ -2964,7 +2898,7 @@ class Sym_SWM_SeparableEKFAC(SeparableEKFACBlock):
       for component, vec_component in flatten_dict(layer_vectors).items():
         if any(k in component for k in KERNEL_KEYS):
           QA, QG, a, g = mem_layer[component]
-          X2d, orig_shape = _reshape_kernel_to_2d(vec_component)
+          X2d, orig_shape = _reshape_kernel_to_2d(component, vec_component)
 
           a_eff = a.astype(X2d.dtype)
           g_eff = g.astype(X2d.dtype)
@@ -2977,7 +2911,7 @@ class Sym_SWM_SeparableEKFAC(SeparableEKFACBlock):
 
         elif any(k in component for k in BIAS_KEYS):
           diag = mem_layer[component]
-          layer_product[component] = diag * vec_component
+          layer_product[component] = _apply_diag_component(diag, vec_component)
 
         else:
           raise ValueError(f"Unknown block type for {component} in layer {layer_name}")

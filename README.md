@@ -39,7 +39,7 @@ The translation surface is now intentionally narrow but public:
 - expected loader contract: `dataset.loader=local_seq2seq_text`
 - batch contract: `x=(src_tokens, prev_output_tokens)` and `y=target_tokens_flat`
 - model defaults: fairseq-style 6 encoder layers, 6 decoder layers, embed dim `512`, FFN dim `1024`, heads `4`, `relu`, sinusoidal positions, and tied decoder input/output embeddings
-- public recipe surface: `main_optimizer=adam`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=1e-4`, `label_smoothing=0.1`, `dataset.max_tokens=4096`, and LLQR `full_batch` seq2seq updates
+- public recipe surface: `main_optimizer=adam`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=0.3`, `total_epochs=300`, `label_smoothing=0.1`, `dataset.max_tokens=4096`, and LLQR `full_batch` seq2seq updates
 - public eval surface: beam-search generation with `beam_size=5`, fairseq-style `max_len=1.2*src_len+10`, `@@ ` BPE removal, Moses detokenization, sacreBLEU scoring, and BLEU-routed best-checkpoint snapshots when `preempt_handling=true`
 - current boundary: generation recomputes full decoder prefixes without an incremental cache, and `llqr_batch_update_mode=chunked_lqr_segment` remains intentionally unsupported for seq2seq translation batches
 - maintained validation note: `../tmp/benchmarks/llqr-iwslt14-de-en-translation-smokes/README.md`
@@ -119,6 +119,19 @@ Current runtime semantics:
 - canonical `fisher_sam` requires the same neutral legacy defaults and intentionally treats `sam_use_preconditioner_on_update` as inert in favor of the vanilla optimizer update
 - `run.py` now delegates mode-specific train-step orchestration to `lqr_optimizer/_src/utils/sam_mode_handlers.py`, while `lqr_optimizer/_src/utils/utils.py` keeps the generic perturbation, canonical ASAM, canonical Fisher-SAM, and buffer helpers
 
+For Kronecker-style preconditioners, the current maintained transformer support is:
+
+- the shared Kronecker/EKFAC kernel-layout helper now supports DenseGeneral
+  `query/key/value`, DenseGeneral `out`, and `pos_embedding` rank-3 tensors in
+  addition to dense-2D and conv-4D kernels
+- the public block-structure name `e-kfac-gpt` is now implemented as a
+  historically named embedding-aware EKFAC variant: it still keeps the GPT
+  mixed-layout rule for `tok_embed` and `lm_head`, and it now also applies the
+  same diagonal-left embedding rule to translation embeddings such as IWSLT14
+  `src_embedding` and `tgt_embedding`
+- the maintained local validation note for that surface is
+  `../tmp/benchmarks/llqr-embedding-aware-ekfac-smoke/README.md`
+
 The durable benchmark trail for SAM remains intentionally narrower than the full
 public mode set. Use the benchmark notes below for timing or comparison claims,
 and use the final correctness-only mode matrix note for the exact current smoke
@@ -163,7 +176,7 @@ The `resnet18-cifar10` comparison remains an external-only higher-memory follow-
 - `lqr_optimizer/_src/utils/dataloaders/iwslt14_de_en.py`: fairseq-faithful local IWSLT14 text loader with separate source and target dictionaries, flat numeric caches, and token-budget training batches
 - `lqr_optimizer/_src/models/transformer_iwslt.py`: fairseq-style IWSLT14 German-to-English encoder-decoder Transformer with explicit train/inference variants and LLQR segment metadata
 - `lqr_optimizer/_src/models/`: architecture definitions
-- `lqr_optimizer/_src/block_matrices_approx/`: structured inverse-preconditioner parameterizations
+- `lqr_optimizer/_src/block_matrices_approx/`: structured inverse-preconditioner parameterizations, including the shared Kronecker/EKFAC rank-3 kernel-layout helper and the historically named embedding-aware `e-kfac-gpt` variant
 
 ## Further documentation
 
