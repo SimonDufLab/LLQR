@@ -42,6 +42,7 @@ The translation surface is now intentionally narrow but public:
 - public recipe surface: `main_optimizer=adam`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=1e-4`, `label_smoothing=0.1`, `dataset.max_tokens=4096`, and LLQR `full_batch` seq2seq updates
 - public eval surface: beam-search generation with `beam_size=5`, fairseq-style `max_len=1.2*src_len+10`, `@@ ` BPE removal, Moses detokenization, sacreBLEU scoring, and BLEU-routed best-checkpoint snapshots when `preempt_handling=true`
 - current boundary: generation recomputes full decoder prefixes without an incremental cache, and `llqr_batch_update_mode=chunked_lqr_segment` remains intentionally unsupported for seq2seq translation batches
+- maintained validation note: `../tmp/benchmarks/llqr-iwslt14-de-en-translation-smokes/README.md`
 
 The maintained Friendly-SAM-aligned CIFAR presets currently exist for:
 
@@ -64,6 +65,7 @@ For the maintained CIFAR validation posture in this workspace, use:
 - `../tmp/benchmarks/llqr-vgg16bn-wrn28x10-architecture-smokes/README.md`
 - `../tmp/benchmarks/llqr-pyramidnet110-architecture-smokes/README.md`
 - `../tmp/benchmarks/llqr-vit-ti16-vit-s16-architecture-smokes/README.md`
+- `../tmp/benchmarks/llqr-iwslt14-de-en-translation-smokes/README.md`
 - `../docs/plans/completed/llqr-pyramidnet110-architecture-support-exec-plan.md`
 - `../docs/reports/llqr-pyramidnet110-architecture-support-final-report-2026-04-21.md`
 - `../docs/plans/completed/llqr-vit-ti16-vit-s16-architecture-support-exec-plan.md`
