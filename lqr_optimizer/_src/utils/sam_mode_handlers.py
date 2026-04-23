@@ -7,10 +7,10 @@ SUPPORTED_SAM_MODES = (None, "base_sam", "base_fsam", "past_fsam", "asam", "fish
 _LEGACY_SAM_NEUTRAL_DEFAULTS = (
   ("perturb_mode", "ema_grad"),
   ("norm_mode", "euclidean"),
-  ("sam_research_base_vector_source", "current_gradient"),
-  ("sam_research_perturb_sign", "ascent"),
-  ("gbar_beta", 0.9),
-  ("gbar_eps", 1e-12),
+  # ("sam_research_base_vector_source", "current_gradient"), # overkill limitations, can work with those, even if not well-formed
+  # ("sam_research_perturb_sign", "ascent"),
+  # ("gbar_beta", 0.9),
+  # ("gbar_eps", 1e-12),
 )
 
 
