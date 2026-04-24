@@ -13,6 +13,8 @@ from lqr_optimizer._src.utils.seq2seq_utils import SEQ2SEQ_TASK_KIND
 
 
 SPECIAL_TOKENS = ("<s>", "<pad>", "</s>", "<unk>")
+TRAIN_SHAPE_BUCKET_MODE_DYNAMIC = "dynamic"
+TRAIN_SHAPE_BUCKET_MODE_PERCENTILE = "percentile"
 EXPECTED_TEXT_FILES = (
   "train.de",
   "train.en",
@@ -391,10 +393,48 @@ def _batch_indices_by_max_tokens(
   return batches
 
 
-def _round_up_to_multiple(value: int, multiple: int) -> int:
-  if multiple <= 1:
-    return int(value)
-  return int(((int(value) + int(multiple) - 1) // int(multiple)) * int(multiple))
+def _normalize_train_shape_bucket_mode(mode: str) -> str:
+  normalized = str(mode).strip().lower()
+  if normalized not in (
+      TRAIN_SHAPE_BUCKET_MODE_DYNAMIC,
+      TRAIN_SHAPE_BUCKET_MODE_PERCENTILE,
+  ):
+    raise ValueError(
+      "Unsupported IWSLT14 train shape bucket mode "
+      f"{mode!r}; expected one of "
+      f"{TRAIN_SHAPE_BUCKET_MODE_DYNAMIC!r} or {TRAIN_SHAPE_BUCKET_MODE_PERCENTILE!r}."
+    )
+  return normalized
+
+
+def _lower_percentile(values: np.ndarray, percentiles: np.ndarray) -> np.ndarray:
+  try:
+    return np.percentile(values, percentiles, method="lower")
+  except TypeError:
+    return np.percentile(values, percentiles, interpolation="lower")
+
+
+def _compute_percentile_bucket_boundaries(sizes: np.ndarray, bucket_count: int) -> list[int]:
+  if int(bucket_count) <= 0:
+    raise ValueError("Percentile train shape bucketing requires a positive `train_shape_bucket_count`.")
+  if sizes.size == 0:
+    return []
+  percentiles = _lower_percentile(
+    np.asarray(sizes, dtype=np.int64),
+    np.linspace(0, 100, int(bucket_count) + 1)[1:],
+  )
+  return [int(value) for value in np.unique(percentiles).tolist()]
+
+
+def _bucket_sizes_to_boundaries(orig_sizes: np.ndarray, boundaries: Sequence[int]) -> np.ndarray:
+  sizes = np.copy(np.asarray(orig_sizes, dtype=np.int64))
+  start_val = -1
+  for end_val in boundaries:
+    bucket_end = int(end_val)
+    mask = (sizes > start_val) & (sizes <= bucket_end)
+    sizes[mask] = bucket_end
+    start_val = bucket_end
+  return sizes
 
 
 def _build_dynamic_batch_specs_by_max_tokens(
@@ -424,60 +464,39 @@ def _build_dynamic_batch_specs_by_max_tokens(
   return batch_specs
 
 
-def _build_static_shape_bucketed_batch_specs_by_max_tokens(
+def _build_percentile_shape_bucketed_batch_specs_by_max_tokens(
     ordered_indices: np.ndarray,
     src_sizes: np.ndarray,
     tgt_sizes: np.ndarray,
     *,
     max_tokens: int,
-    shape_bucket_multiple: int,
+    train_shape_bucket_count: int,
 ) -> list[TranslationBatchSpec]:
-  bucket_multiple = max(1, int(shape_bucket_multiple))
+  src_bucket_boundaries = _compute_percentile_bucket_boundaries(src_sizes, train_shape_bucket_count)
+  tgt_bucket_boundaries = _compute_percentile_bucket_boundaries(tgt_sizes, train_shape_bucket_count)
+  bucketed_src_sizes = _bucket_sizes_to_boundaries(src_sizes, src_bucket_boundaries)
+  bucketed_tgt_sizes = _bucket_sizes_to_boundaries(tgt_sizes, tgt_bucket_boundaries)
+  bucketed_num_tokens = np.maximum(bucketed_src_sizes, bucketed_tgt_sizes)
+
   batch_specs: list[TranslationBatchSpec] = []
-  current: list[int] = []
-  current_src_bucket = 0
-  current_tgt_bucket = 0
-  current_capacity = 0
-
-  def flush_current() -> None:
-    if not current:
-      return
-    batch_specs.append(
-      TranslationBatchSpec(
-        indices=np.asarray(current, dtype=np.int64),
-        padded_batch_size=int(current_capacity),
-        padded_src_length=int(current_src_bucket),
-        padded_tgt_length=int(current_tgt_bucket),
+  for bucketed_token_size in sorted(np.unique(bucketed_num_tokens[ordered_indices]).tolist()):
+    bucket_indices = [
+      int(index)
+      for index in ordered_indices
+      if int(bucketed_num_tokens[int(index)]) == int(bucketed_token_size)
+    ]
+    bucket_capacity = max(1, int(max_tokens) // int(bucketed_token_size))
+    padded_src_length = int(bucketed_src_sizes[bucket_indices].max())
+    padded_tgt_length = int(bucketed_tgt_sizes[bucket_indices].max())
+    for start in range(0, len(bucket_indices), bucket_capacity):
+      batch_specs.append(
+        TranslationBatchSpec(
+          indices=np.asarray(bucket_indices[start:start + bucket_capacity], dtype=np.int64),
+          padded_batch_size=int(bucket_capacity),
+          padded_src_length=int(padded_src_length),
+          padded_tgt_length=int(padded_tgt_length),
+        )
       )
-    )
-
-  for raw_index in ordered_indices:
-    index = int(raw_index)
-    src_bucket = _round_up_to_multiple(int(src_sizes[index]), bucket_multiple)
-    tgt_bucket = _round_up_to_multiple(int(tgt_sizes[index]), bucket_multiple)
-    bucket_token_size = max(src_bucket, tgt_bucket)
-    bucket_capacity = max(1, int(max_tokens) // int(bucket_token_size))
-
-    bucket_changed = (
-      current
-      and (src_bucket != current_src_bucket or tgt_bucket != current_tgt_bucket)
-    )
-    batch_full = current and (len(current) >= current_capacity)
-    if bucket_changed or batch_full:
-      flush_current()
-      current = []
-      current_src_bucket = 0
-      current_tgt_bucket = 0
-      current_capacity = 0
-
-    if not current:
-      current_src_bucket = src_bucket
-      current_tgt_bucket = tgt_bucket
-      current_capacity = bucket_capacity
-
-    current.append(index)
-
-  flush_current()
   return batch_specs
 
 
@@ -553,22 +572,23 @@ def _make_epoch_factory(
     batch_size: Optional[int] = None,
     shuffle: bool,
     rng: Optional[np.random.Generator],
-    static_shape_bucketing: bool = False,
-    shape_bucket_multiple: int = 8,
+    train_shape_bucket_mode: str = TRAIN_SHAPE_BUCKET_MODE_DYNAMIC,
+    train_shape_bucket_count: int = 8,
 ) -> Callable[[], Iterator[Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]]]:
   if (max_tokens is None) == (batch_size is None):
     raise ValueError("Specify exactly one of max_tokens or batch_size.")
+  train_shape_bucket_mode = _normalize_train_shape_bucket_mode(train_shape_bucket_mode)
 
   def factory():
     ordered = _ordered_indices(dataset.src_sizes, dataset.tgt_sizes, shuffle=shuffle, rng=rng)
     if max_tokens is not None:
-      if static_shape_bucketing:
-        batches = _build_static_shape_bucketed_batch_specs_by_max_tokens(
+      if train_shape_bucket_mode == TRAIN_SHAPE_BUCKET_MODE_PERCENTILE:
+        batches = _build_percentile_shape_bucketed_batch_specs_by_max_tokens(
           ordered,
           dataset.src_sizes,
           dataset.tgt_sizes,
           max_tokens=max_tokens,
-          shape_bucket_multiple=shape_bucket_multiple,
+          train_shape_bucket_count=train_shape_bucket_count,
         )
       else:
         batches = _build_dynamic_batch_specs_by_max_tokens(
@@ -593,8 +613,8 @@ def load_iwslt14_de_en(
     eval_batch_size: int,
     prefetch: int = 4,
     eval_prefetch: int = 2,
-    static_shape_bucketing: bool = True,
-    shape_bucket_multiple: int = 8,
+    train_shape_bucket_mode: str = TRAIN_SHAPE_BUCKET_MODE_PERCENTILE,
+    train_shape_bucket_count: int = 8,
     source_lang: str = "de",
     target_lang: str = "en",
     padding_factor: int = 8,
@@ -622,6 +642,7 @@ def load_iwslt14_de_en(
   rng = np.random.default_rng()
   pad_id = int(metadata["special_tokens"]["pad_id"])
   eos_id = int(metadata["special_tokens"]["eos_id"])
+  train_shape_bucket_mode = _normalize_train_shape_bucket_mode(train_shape_bucket_mode)
 
   train_epoch_factory = _make_epoch_factory(
     train_dataset,
@@ -630,8 +651,8 @@ def load_iwslt14_de_en(
     max_tokens=int(max_tokens),
     shuffle=True,
     rng=rng,
-    static_shape_bucketing=bool(static_shape_bucketing),
-    shape_bucket_multiple=int(shape_bucket_multiple),
+    train_shape_bucket_mode=train_shape_bucket_mode,
+    train_shape_bucket_count=int(train_shape_bucket_count),
   )
   valid_epoch_factory = _make_epoch_factory(
     valid_dataset,
@@ -646,13 +667,25 @@ def load_iwslt14_de_en(
   valid_loader = LoaderAsJaxIterator(valid_epoch_factory, prefetch=int(eval_prefetch), repeat=False)
 
   train_order = _ordered_indices(train_dataset.src_sizes, train_dataset.tgt_sizes, shuffle=False, rng=None)
-  if static_shape_bucketing:
-    train_batch_specs = _build_static_shape_bucketed_batch_specs_by_max_tokens(
+  src_bucket_boundaries: list[int] = []
+  tgt_bucket_boundaries: list[int] = []
+  active_bucket_count = 0
+  if train_shape_bucket_mode == TRAIN_SHAPE_BUCKET_MODE_PERCENTILE:
+    src_bucket_boundaries = _compute_percentile_bucket_boundaries(
+      train_dataset.src_sizes,
+      int(train_shape_bucket_count),
+    )
+    tgt_bucket_boundaries = _compute_percentile_bucket_boundaries(
+      train_dataset.tgt_sizes,
+      int(train_shape_bucket_count),
+    )
+    active_bucket_count = int(train_shape_bucket_count)
+    train_batch_specs = _build_percentile_shape_bucketed_batch_specs_by_max_tokens(
       train_order,
       train_dataset.src_sizes,
       train_dataset.tgt_sizes,
       max_tokens=int(max_tokens),
-      shape_bucket_multiple=int(shape_bucket_multiple),
+      train_shape_bucket_count=int(train_shape_bucket_count),
     )
   else:
     train_batch_specs = _build_dynamic_batch_specs_by_max_tokens(
@@ -687,8 +720,10 @@ def load_iwslt14_de_en(
       "test_eval_target_count": int(metadata["splits"]["valid"]["tgt_token_count"]),
     },
     "batch_shape_contract": {
-      "static_shape_bucketing": bool(static_shape_bucketing),
-      "shape_bucket_multiple": int(shape_bucket_multiple),
+      "shape_bucket_mode": train_shape_bucket_mode,
+      "shape_bucket_count": int(active_bucket_count),
+      "src_bucket_boundaries": [int(value) for value in src_bucket_boundaries],
+      "tgt_bucket_boundaries": [int(value) for value in tgt_bucket_boundaries],
       "train_shape_signature_count": int(len(train_shape_signatures)),
       "train_shape_signatures": [
         {
