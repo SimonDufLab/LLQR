@@ -7,5 +7,7 @@ source_lang: de
 target_lang: en
 max_tokens: 4096
 padding_factor: 8
+static_shape_bucketing: true
+shape_bucket_multiple: 8
 prefetch: 4
 eval_prefetch: 2

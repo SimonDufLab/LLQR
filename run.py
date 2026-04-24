@@ -71,6 +71,10 @@ def main(cfg: DictConfig):
   print(OmegaConf.to_yaml(cfg))
   experiment_name = cfg.dataset.name + "_" + cfg.architecture.name
   print("Experiment name: {}".format(experiment_name))
+  backend_name = jax.default_backend()
+  backend_devices = [str(device) for device in jax.devices()]
+  print(f"JAX backend: {backend_name}")
+  print(f"JAX devices: {backend_devices}")
 
   # Check for checkpoints
   load_from_preexisting_model_state = False
@@ -150,6 +154,8 @@ def main(cfg: DictConfig):
       eval_batch_size=cfg.eval_batch_size,
       prefetch=cfg.dataset.prefetch,
       eval_prefetch=cfg.dataset.eval_prefetch,
+      static_shape_bucketing=cfg.dataset.static_shape_bucketing,
+      shape_bucket_multiple=cfg.dataset.shape_bucket_multiple,
       source_lang=cfg.dataset.source_lang,
       target_lang=cfg.dataset.target_lang,
       padding_factor=cfg.dataset.padding_factor,
@@ -160,6 +166,11 @@ def main(cfg: DictConfig):
   task_kind = ds_info.get("task_kind")
   is_translation_task = task_kind == SEQ2SEQ_TASK_KIND
   num_classes = ds_info['num_classes']
+  translation_target_pad_id = (
+    int(ds_info["model_init_kwargs"]["pad_id"])
+    if is_translation_task
+    else None
+  )
   accounting = utl.resolve_runner_accounting(
     ds_info,
     batch_size=cfg.batch_size,
@@ -193,6 +204,10 @@ def main(cfg: DictConfig):
   # 1b) Initialize aim for logging
   run = Run(repo=cfg.logging.aim_repo, experiment=experiment_name, run_hash=aim_hash, force_resume=True)
   run["config"] = OmegaConf.to_container(cfg)
+  run["jax_backend"] = backend_name
+  run["jax_devices"] = backend_devices
+  if ds_info.get("batch_shape_contract") is not None:
+    run["batch_shape_contract"] = ds_info["batch_shape_contract"]
   if cfg.preempt_handling:
     run_state["aim_hash"] = run.hash
 
@@ -306,7 +321,11 @@ def main(cfg: DictConfig):
     divergence_f = divergence_choice[cfg.divergence]
   preconditioner = BasePreconditioner(
     divergence_function=divergence_f,
-    loss_fn=Partial(cross_entropy_loss, label_smoothing=cfg.label_smoothing),
+    loss_fn=Partial(
+      cross_entropy_loss,
+      label_smoothing=cfg.label_smoothing,
+      ignore_index=translation_target_pad_id,
+    ),
     block_structure=cfg.block_structure,
     block_structure_init=cfg.block_structure_init,
     model=inf_model,
@@ -353,7 +372,12 @@ def main(cfg: DictConfig):
       rngs={'dropout': _dropout_key},
       mutable=['batch_stats']
     )
-    loss = cross_entropy_loss(log_probs, y, label_smoothing=cfg.label_smoothing)
+    loss = cross_entropy_loss(
+      log_probs,
+      y,
+      label_smoothing=cfg.label_smoothing,
+      ignore_index=translation_target_pad_id,
+    )
     return loss, new_model_state
 
   @jax.jit
@@ -600,7 +624,12 @@ def main(cfg: DictConfig):
       run.track(train_loss, name="train loss", step=step)
       run.track(train_loss, name="train loss|t", step=elapsed_time*100)
       # Compute batch accuracy
-      batch_accuracy, _ = compute_batch_accuracy(state, x_batch, y_batch)
+      batch_accuracy, _ = compute_batch_accuracy(
+        state,
+        x_batch,
+        y_batch,
+        ignore_index=translation_target_pad_id,
+      )
       train_accuracy_name = "train token_accuracy" if is_translation_task else "train accuracy"
       run.track(batch_accuracy, name=train_accuracy_name, step=step)
       run.track(batch_accuracy, name=f"{train_accuracy_name}|t", step=elapsed_time*100)
@@ -614,10 +643,21 @@ def main(cfg: DictConfig):
       if is_translation_task:
         if cfg.record_histograms:
           valid_accuracy, valid_loss = compute_accuracy_and_loss_with_hists(
-            state, test_dataloader, test_eval_target_count, run, step=step, prefix='valid'
+            state,
+            test_dataloader,
+            test_eval_target_count,
+            run,
+            step=step,
+            prefix='valid',
+            ignore_index=translation_target_pad_id,
           )
         else:
-          valid_accuracy, valid_loss = compute_accuracy_and_loss(state, test_dataloader, test_eval_target_count)
+          valid_accuracy, valid_loss = compute_accuracy_and_loss(
+            state,
+            test_dataloader,
+            test_eval_target_count,
+            ignore_index=translation_target_pad_id,
+          )
         run.track(valid_accuracy, name="valid token_accuracy", step=step)
         run.track(valid_loss, name="valid loss", step=step)
         run.track(valid_accuracy, name="valid token_accuracy|t", step=elapsed_time*100)

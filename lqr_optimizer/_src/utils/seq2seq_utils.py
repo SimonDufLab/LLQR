@@ -357,11 +357,19 @@ def infer_seq2seq_batch_layout(batch, *, pad_id: int = SEQ2SEQ_DEFAULT_PAD_ID):
 
   target_lengths = infer_seq2seq_target_lengths(prev_output_tokens, pad_id=pad_id)
   expected_target_count = seq2seq_target_count(target_lengths)
-  if int(y_batch.shape[0]) != expected_target_count:
+  observed_target_count = int(y_batch.shape[0])
+  if observed_target_count < expected_target_count:
     raise ValueError(
       "Seq2seq batch target length mismatch: expected "
-      f"{expected_target_count} flattened targets, got {int(y_batch.shape[0])}."
+      f"at least {expected_target_count} flattened targets, got {observed_target_count}."
     )
+  if observed_target_count > expected_target_count:
+    padded_tail = y_batch[expected_target_count:]
+    if int(jnp.count_nonzero(padded_tail != int(pad_id))) != 0:
+      raise ValueError(
+        "Seq2seq batch target padding must use the dataset pad_id when the "
+        "flattened target vector is compilation-padded."
+      )
 
   return {
     "mode": SEQ2SEQ_TASK_KIND,

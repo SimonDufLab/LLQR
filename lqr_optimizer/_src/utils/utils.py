@@ -587,8 +587,20 @@ def align_log_probs_with_targets(log_probs, y):
   return log_probs[: flat_targets.shape[0]]
 
 
+def _flatten_aligned_targets(log_probs, y):
+  flat_targets = jnp.ravel(y)
+  log_probs = align_log_probs_with_targets(log_probs, flat_targets)
+  return log_probs, flat_targets
+
+
+def _target_valid_mask(targets, ignore_index=None):
+  if ignore_index is None:
+    return jnp.ones_like(targets, dtype=bool)
+  return targets != int(ignore_index)
+
+
 # Simple cross-entropy loss for classification
-def cross_entropy_loss(log_probs, y, label_smoothing=0.0):
+def cross_entropy_loss(log_probs, y, label_smoothing=0.0, ignore_index=None):
   """
   Cross-entropy loss with optional label smoothing.
 
@@ -597,9 +609,11 @@ def cross_entropy_loss(log_probs, y, label_smoothing=0.0):
       y: [batch,] integer class labels
       label_smoothing: float in [0, 1]. 0 = no smoothing (standard CE)
   """
-  log_probs = align_log_probs_with_targets(log_probs, y)
+  log_probs, y = _flatten_aligned_targets(log_probs, y)
+  valid_mask = _target_valid_mask(y, ignore_index=ignore_index)
   num_classes = log_probs.shape[-1]
-  one_hot = jax.nn.one_hot(y, num_classes)
+  safe_targets = jnp.where(valid_mask, y, 0)
+  one_hot = jax.nn.one_hot(safe_targets, num_classes)
 
   if label_smoothing > 0.0:
     smooth = label_smoothing / num_classes
@@ -607,7 +621,9 @@ def cross_entropy_loss(log_probs, y, label_smoothing=0.0):
 
   # Negative log-likelihood
   nll = -jnp.sum(one_hot * log_probs, axis=-1)
-  return jnp.mean(nll)
+  valid_weights = valid_mask.astype(log_probs.dtype)
+  normalizer = jnp.maximum(jnp.sum(valid_weights), 1.0)
+  return jnp.sum(nll * valid_weights) / normalizer
 
 
 def loss_eval(state, x, y):
@@ -1078,7 +1094,7 @@ def prepare_dataloader(
   return generator(), info
 
 
-def compute_batch_accuracy(state, x_batch, y_batch):
+def compute_batch_accuracy(state, x_batch, y_batch, *, ignore_index=None):
   """
   Computes accuracy for a single batch.
 
@@ -1095,17 +1111,20 @@ def compute_batch_accuracy(state, x_batch, y_batch):
   # Forward pass to compute logits
   variables = {'params': state.params, 'batch_stats': state.batch_stats}
   log_probs = state.apply_inf_fn(variables, x_batch, mutable=False)  # shape [batch_size, num_classes]
-  log_probs = align_log_probs_with_targets(log_probs, y_batch)
+  log_probs, y_batch = _flatten_aligned_targets(log_probs, y_batch)
+  valid_mask = _target_valid_mask(y_batch, ignore_index=ignore_index)
+  safe_targets = jnp.where(valid_mask, y_batch, 0)
 
   # Predicted class (argmax of logits)
   predictions = jnp.argmax(jnp.exp(log_probs), axis=1)
 
   # Compare predictions with ground truth
-  correct_predictions = jnp.sum(predictions == y_batch)
+  correct_predictions = jnp.sum((predictions == safe_targets) & valid_mask)
 
   # Compute accuracy
-  accuracy = (correct_predictions / y_batch.shape[0]) * 100
-  return accuracy, cross_entropy_loss(log_probs, y_batch)
+  valid_count = jnp.maximum(jnp.sum(valid_mask), 1)
+  accuracy = (correct_predictions / valid_count) * 100
+  return accuracy, cross_entropy_loss(log_probs, y_batch, ignore_index=ignore_index)
 
 # def compute_accuracy_and_loss(state, dataloader):
 #   """
@@ -1149,7 +1168,7 @@ def compute_batch_accuracy(state, x_batch, y_batch):
 #   accuracy = (correct_predictions / final_pred_size)
 #   return accuracy, running_loss / final_pred_size
 
-def compute_accuracy_and_loss(state, dataloader, num_samples: int):
+def compute_accuracy_and_loss(state, dataloader, num_samples: int, *, ignore_index=None):
   """
   Evaluate on ~num_samples examples from dataloader (works with infinite repeat()).
   """
@@ -1161,8 +1180,8 @@ def compute_accuracy_and_loss(state, dataloader, num_samples: int):
   seen = 0
 
   for x_batch, y_batch in dataloader:
-    pred_size = y_batch.shape[0]          # robust: counts labels actually present
-    acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
+    pred_size = int(jnp.count_nonzero(jnp.asarray(y_batch) != int(ignore_index))) if ignore_index is not None else y_batch.shape[0]
+    acc, loss = compute_batch_accuracy(state, x_batch, y_batch, ignore_index=ignore_index)
 
     correct_predictions += acc * pred_size
     running_loss += loss * pred_size
@@ -1188,6 +1207,7 @@ def compute_accuracy_and_loss_with_hists(
     bin_count: int = 50,
     max_points: int | None = 200_000,   # optional subsample cap (recommended for ImageNet)
     rng_seed: int = 0,
+    ignore_index=None,
 ):
   """
   Evaluate on ~num_samples examples from dataloader (works with repeat()) and track:
@@ -1238,26 +1258,32 @@ def compute_accuracy_and_loss_with_hists(
   for x_batch, y_batch in dataloader:
     variables = {'params': state.params, 'batch_stats': state.batch_stats}
     log_probs = state.apply_inf_fn(variables, x_batch, mutable=False)  # [B, C]
+    log_probs, y_batch = _flatten_aligned_targets(log_probs, y_batch)
+    valid_mask = _target_valid_mask(y_batch, ignore_index=ignore_index)
+    safe_targets = jnp.where(valid_mask, y_batch, 0)
+    valid_count = int(jnp.sum(valid_mask))
+    if valid_count == 0:
+      continue
 
     # Preds (your version used argmax(exp(log_probs)); argmax(log_probs) is equivalent)
     preds = jnp.argmax(log_probs, axis=1)
 
     # Per-sample correctness (0/1)
-    correct = (preds == y_batch).astype(jnp.float32)
+    correct = ((preds == safe_targets) & valid_mask).astype(jnp.float32)
 
     # p(correct class) and per-sample NLL
     idx = jnp.arange(y_batch.shape[0])
-    lp_true = log_probs[idx, y_batch]                 # log p(y|x)
+    lp_true = log_probs[idx, safe_targets]            # log p(y|x)
     p_true = jnp.exp(lp_true)                         # p(y|x) in [0,1]
     nll = -lp_true                                    # NLL >= 0
 
-    bs = int(y_batch.shape[0])
     correct_sum += float(jnp.sum(correct))
-    loss_sum += float(jnp.sum(nll))
-    seen += bs
+    loss_sum += float(jnp.sum(nll * valid_mask.astype(nll.dtype)))
+    seen += valid_count
 
     # move to host for Aim histogram
-    _reservoir_add(np.asarray(p_true), np.asarray(nll))
+    valid_mask_np = np.asarray(valid_mask, dtype=bool)
+    _reservoir_add(np.asarray(p_true)[valid_mask_np], np.asarray(nll)[valid_mask_np])
 
     if seen >= num_samples:
       break

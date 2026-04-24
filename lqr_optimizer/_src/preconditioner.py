@@ -91,6 +91,12 @@ def _batch_size_from_datapoint(datapoint, batch_axis):
   return int(first_x.shape[batch_axis])
 
 
+def _logical_batch_size(layout, datapoint):
+  if layout["mode"] == SEQ2SEQ_TASK_KIND:
+    return int(sum(int(length) > 0 for length in layout["target_lengths"]))
+  return _batch_size_from_datapoint(datapoint, layout["batch_axis"])
+
+
 def _effective_loss_count(layout, batch_size, *, start=0):
   if layout["mode"] == "text":
     return int(layout["T"] * batch_size)
@@ -161,10 +167,17 @@ def _concat_preconditioner_batches(batches, layout, precond_batch_size):
     target_lengths = []
     for batch in batches:
       batch_layout = infer_batch_layout(batch)
-      inputs, targets = batch
+      real_batch_size = _logical_batch_size(batch_layout, batch)
+      if real_batch_size <= 0:
+        continue
+      inputs, targets = _slice_batch_datapoint(batch, batch_layout, 0, real_batch_size)
       input_batches.append(inputs)
       target_batches.append(jnp.asarray(targets))
-      target_lengths.extend(batch_layout["target_lengths"])
+      target_lengths.extend(
+        int(length)
+        for length in batch_layout["target_lengths"]
+        if int(length) > 0
+      )
 
     accumulated_inputs = pad_and_concatenate_seq2seq_input_batches(
       input_batches,
@@ -211,14 +224,13 @@ def _concat_preconditioner_batches(batches, layout, precond_batch_size):
 def _take_full_preconditioner_datapoint(dataloader, precond_batch_size):
   first_batch = next(dataloader)
   layout = infer_batch_layout(first_batch)
-  batch_axis = layout["batch_axis"]
 
   batches = [first_batch]
-  accumulated_size = _batch_size_from_datapoint(first_batch, batch_axis)
+  accumulated_size = _logical_batch_size(layout, first_batch)
   while accumulated_size < precond_batch_size:
     batch = next(dataloader)
     batches.append(batch)
-    accumulated_size += _batch_size_from_datapoint(batch, batch_axis)
+    accumulated_size += _logical_batch_size(infer_batch_layout(batch), batch)
 
   return layout, _concat_preconditioner_batches(batches, layout, precond_batch_size)
 

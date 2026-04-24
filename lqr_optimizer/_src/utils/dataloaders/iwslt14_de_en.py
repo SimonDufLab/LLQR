@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, Optional, Sequence, Tuple
@@ -145,6 +146,14 @@ class ParallelTextDataset:
 
   def __len__(self) -> int:
     return len(self.src)
+
+
+@dataclass(frozen=True)
+class TranslationBatchSpec:
+  indices: np.ndarray
+  padded_batch_size: int
+  padded_src_length: int
+  padded_tgt_length: int
 
 
 def prepare_local_seq2seq_dataset(name: str):
@@ -382,6 +391,96 @@ def _batch_indices_by_max_tokens(
   return batches
 
 
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+  if multiple <= 1:
+    return int(value)
+  return int(((int(value) + int(multiple) - 1) // int(multiple)) * int(multiple))
+
+
+def _build_dynamic_batch_specs_by_max_tokens(
+    ordered_indices: np.ndarray,
+    src_sizes: np.ndarray,
+    tgt_sizes: np.ndarray,
+    *,
+    max_tokens: int,
+) -> list[TranslationBatchSpec]:
+  batch_specs = []
+  for batch_indices in _batch_indices_by_max_tokens(
+      ordered_indices,
+      src_sizes,
+      tgt_sizes,
+      max_tokens=max_tokens,
+  ):
+    batch_src_sizes = src_sizes[batch_indices]
+    batch_tgt_sizes = tgt_sizes[batch_indices]
+    batch_specs.append(
+      TranslationBatchSpec(
+        indices=np.asarray(batch_indices, dtype=np.int64),
+        padded_batch_size=int(batch_indices.shape[0]),
+        padded_src_length=int(batch_src_sizes.max()),
+        padded_tgt_length=int(batch_tgt_sizes.max()),
+      )
+    )
+  return batch_specs
+
+
+def _build_static_shape_bucketed_batch_specs_by_max_tokens(
+    ordered_indices: np.ndarray,
+    src_sizes: np.ndarray,
+    tgt_sizes: np.ndarray,
+    *,
+    max_tokens: int,
+    shape_bucket_multiple: int,
+) -> list[TranslationBatchSpec]:
+  bucket_multiple = max(1, int(shape_bucket_multiple))
+  batch_specs: list[TranslationBatchSpec] = []
+  current: list[int] = []
+  current_src_bucket = 0
+  current_tgt_bucket = 0
+  current_capacity = 0
+
+  def flush_current() -> None:
+    if not current:
+      return
+    batch_specs.append(
+      TranslationBatchSpec(
+        indices=np.asarray(current, dtype=np.int64),
+        padded_batch_size=int(current_capacity),
+        padded_src_length=int(current_src_bucket),
+        padded_tgt_length=int(current_tgt_bucket),
+      )
+    )
+
+  for raw_index in ordered_indices:
+    index = int(raw_index)
+    src_bucket = _round_up_to_multiple(int(src_sizes[index]), bucket_multiple)
+    tgt_bucket = _round_up_to_multiple(int(tgt_sizes[index]), bucket_multiple)
+    bucket_token_size = max(src_bucket, tgt_bucket)
+    bucket_capacity = max(1, int(max_tokens) // int(bucket_token_size))
+
+    bucket_changed = (
+      current
+      and (src_bucket != current_src_bucket or tgt_bucket != current_tgt_bucket)
+    )
+    batch_full = current and (len(current) >= current_capacity)
+    if bucket_changed or batch_full:
+      flush_current()
+      current = []
+      current_src_bucket = 0
+      current_tgt_bucket = 0
+      current_capacity = 0
+
+    if not current:
+      current_src_bucket = src_bucket
+      current_tgt_bucket = tgt_bucket
+      current_capacity = bucket_capacity
+
+    current.append(index)
+
+  flush_current()
+  return batch_specs
+
+
 def _batch_indices_by_sentences(ordered_indices: np.ndarray, batch_size: int) -> list[np.ndarray]:
   batches = []
   for start in range(0, len(ordered_indices), int(batch_size)):
@@ -391,11 +490,24 @@ def _batch_indices_by_sentences(ordered_indices: np.ndarray, batch_size: int) ->
 
 def _collate_translation_batch(
     dataset: ParallelTextDataset,
-    indices: np.ndarray,
+    batch_spec: np.ndarray | TranslationBatchSpec,
     *,
     pad_id: int,
     eos_id: int,
 ) -> Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]:
+  if isinstance(batch_spec, TranslationBatchSpec):
+    indices = batch_spec.indices
+    padded_batch_size = int(batch_spec.padded_batch_size)
+    padded_src_length = int(batch_spec.padded_src_length)
+    padded_tgt_length = int(batch_spec.padded_tgt_length)
+  else:
+    indices = np.asarray(batch_spec, dtype=np.int64)
+    src_lengths = dataset.src_sizes[indices]
+    tgt_lengths = dataset.tgt_sizes[indices]
+    padded_batch_size = int(indices.shape[0])
+    padded_src_length = int(src_lengths.max())
+    padded_tgt_length = int(tgt_lengths.max())
+
   src_examples = [dataset.src[int(index)] for index in indices]
   tgt_examples = [dataset.tgt[int(index)] for index in indices]
   src_lengths = np.asarray([example.shape[0] for example in src_examples], dtype=np.int32)
@@ -406,8 +518,14 @@ def _collate_translation_batch(
   batch_size = len(src_examples)
   max_src_length = max(example.shape[0] for example in src_examples)
   max_tgt_length = max(example.shape[0] for example in tgt_examples)
-  src_batch = np.full((batch_size, max_src_length), pad_id, dtype=np.int32)
-  prev_output_batch = np.full((batch_size, max_tgt_length), pad_id, dtype=np.int32)
+  if padded_batch_size < batch_size:
+    raise ValueError("Padded batch size cannot be smaller than the number of examples.")
+  if padded_src_length < max_src_length:
+    raise ValueError("Padded source length cannot be smaller than the batch maximum.")
+  if padded_tgt_length < max_tgt_length:
+    raise ValueError("Padded target length cannot be smaller than the batch maximum.")
+  src_batch = np.full((padded_batch_size, padded_src_length), pad_id, dtype=np.int32)
+  prev_output_batch = np.full((padded_batch_size, padded_tgt_length), pad_id, dtype=np.int32)
   flat_targets = []
 
   for row_index, (src_tokens, tgt_tokens) in enumerate(zip(src_examples, tgt_examples)):
@@ -419,7 +537,10 @@ def _collate_translation_batch(
     prev_output_batch[row_index, : prev_output.shape[0]] = prev_output
     flat_targets.append(np.asarray(tgt_tokens, dtype=np.int32))
 
-  y_batch = np.concatenate(flat_targets).astype(np.int32, copy=False)
+  flat_targets_array = np.concatenate(flat_targets).astype(np.int32, copy=False)
+  padded_target_count = int(padded_batch_size * padded_tgt_length)
+  y_batch = np.full((padded_target_count,), pad_id, dtype=np.int32)
+  y_batch[: flat_targets_array.shape[0]] = flat_targets_array
   return (src_batch, prev_output_batch), y_batch
 
 
@@ -432,6 +553,8 @@ def _make_epoch_factory(
     batch_size: Optional[int] = None,
     shuffle: bool,
     rng: Optional[np.random.Generator],
+    static_shape_bucketing: bool = False,
+    shape_bucket_multiple: int = 8,
 ) -> Callable[[], Iterator[Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]]]:
   if (max_tokens is None) == (batch_size is None):
     raise ValueError("Specify exactly one of max_tokens or batch_size.")
@@ -439,7 +562,21 @@ def _make_epoch_factory(
   def factory():
     ordered = _ordered_indices(dataset.src_sizes, dataset.tgt_sizes, shuffle=shuffle, rng=rng)
     if max_tokens is not None:
-      batches = _batch_indices_by_max_tokens(ordered, dataset.src_sizes, dataset.tgt_sizes, max_tokens=max_tokens)
+      if static_shape_bucketing:
+        batches = _build_static_shape_bucketed_batch_specs_by_max_tokens(
+          ordered,
+          dataset.src_sizes,
+          dataset.tgt_sizes,
+          max_tokens=max_tokens,
+          shape_bucket_multiple=shape_bucket_multiple,
+        )
+      else:
+        batches = _build_dynamic_batch_specs_by_max_tokens(
+          ordered,
+          dataset.src_sizes,
+          dataset.tgt_sizes,
+          max_tokens=max_tokens,
+        )
     else:
       batches = _batch_indices_by_sentences(ordered, batch_size=batch_size)
     for batch_indices in batches:
@@ -456,6 +593,8 @@ def load_iwslt14_de_en(
     eval_batch_size: int,
     prefetch: int = 4,
     eval_prefetch: int = 2,
+    static_shape_bucketing: bool = True,
+    shape_bucket_multiple: int = 8,
     source_lang: str = "de",
     target_lang: str = "en",
     padding_factor: int = 8,
@@ -491,6 +630,8 @@ def load_iwslt14_de_en(
     max_tokens=int(max_tokens),
     shuffle=True,
     rng=rng,
+    static_shape_bucketing=bool(static_shape_bucketing),
+    shape_bucket_multiple=int(shape_bucket_multiple),
   )
   valid_epoch_factory = _make_epoch_factory(
     valid_dataset,
@@ -505,12 +646,29 @@ def load_iwslt14_de_en(
   valid_loader = LoaderAsJaxIterator(valid_epoch_factory, prefetch=int(eval_prefetch), repeat=False)
 
   train_order = _ordered_indices(train_dataset.src_sizes, train_dataset.tgt_sizes, shuffle=False, rng=None)
-  train_microbatches = _batch_indices_by_max_tokens(
-    train_order,
-    train_dataset.src_sizes,
-    train_dataset.tgt_sizes,
-    max_tokens=int(max_tokens),
-  )
+  if static_shape_bucketing:
+    train_batch_specs = _build_static_shape_bucketed_batch_specs_by_max_tokens(
+      train_order,
+      train_dataset.src_sizes,
+      train_dataset.tgt_sizes,
+      max_tokens=int(max_tokens),
+      shape_bucket_multiple=int(shape_bucket_multiple),
+    )
+  else:
+    train_batch_specs = _build_dynamic_batch_specs_by_max_tokens(
+      train_order,
+      train_dataset.src_sizes,
+      train_dataset.tgt_sizes,
+      max_tokens=int(max_tokens),
+    )
+  train_shape_signatures = {
+    (
+      int(batch_spec.padded_batch_size),
+      int(batch_spec.padded_src_length),
+      int(batch_spec.padded_tgt_length),
+    )
+    for batch_spec in train_batch_specs
+  }
   ds_info = {
     "num_classes": int(metadata["vocab_sizes"][target_lang]),
     "ds_size": int(metadata["splits"]["train"]["num_examples"]),
@@ -524,9 +682,22 @@ def load_iwslt14_de_en(
       "eos_id": eos_id,
     },
     "runner_contract": {
-      "train_microbatches_per_epoch": int(len(train_microbatches)),
+      "train_microbatches_per_epoch": int(len(train_batch_specs)),
       "train_eval_target_count": int(metadata["splits"]["train"]["tgt_token_count"]),
       "test_eval_target_count": int(metadata["splits"]["valid"]["tgt_token_count"]),
+    },
+    "batch_shape_contract": {
+      "static_shape_bucketing": bool(static_shape_bucketing),
+      "shape_bucket_multiple": int(shape_bucket_multiple),
+      "train_shape_signature_count": int(len(train_shape_signatures)),
+      "train_shape_signatures": [
+        {
+          "batch_size": int(signature[0]),
+          "src_length": int(signature[1]),
+          "tgt_length": int(signature[2]),
+        }
+        for signature in sorted(train_shape_signatures)
+      ],
     },
     "source_lang": source_lang,
     "target_lang": target_lang,

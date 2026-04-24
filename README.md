@@ -13,7 +13,7 @@ It contains the main training entrypoint, config-driven experiment definitions, 
 Experiments are composed from `configs/`.
 The main user-facing group is `configs/experiment/`, which selects a dataset, architecture, and schedule bundle.
 Representative experiments currently include ResNet/CIFAR, ResNet/ImageNet, GPT/WikiText-103, grokking-style transformer runs, and the CIFAR architecture-support presets `vgg16bn-cifar10`, `vgg16bn-cifar100`, `wide-resnet28x10-cifar10`, `wide-resnet28x10-cifar100`, `pyramidnet110-cifar10`, and `pyramidnet110-cifar100`.
-The dataset surface now also includes the fairseq-faithful local `iwslt14_de_en` text contract under `configs/dataset/iwslt14_de_en.yaml`; it expects an extracted `iwslt14.tokenized.de-en/` directory, writes a local `.llqr_numeric_cache/`, maps the current `run.py` held-out eval path to `valid`, and exposes deterministic `valid` and `test` split helpers for bounded generation and BLEU checks.
+The dataset surface now also includes the fairseq-faithful local `iwslt14_de_en` text contract under `configs/dataset/iwslt14_de_en.yaml`; it expects an extracted `iwslt14.tokenized.de-en/` directory, writes a local `.llqr_numeric_cache/`, maps the current `run.py` held-out eval path to `valid`, and exposes deterministic `valid` and `test` split helpers for bounded generation and BLEU checks. The train loader now also defaults to compile-stable seq2seq shape bucketing (`dataset.static_shape_bucketing=true`, `dataset.shape_bucket_multiple=8`) so JAX does not keep recompiling on every new token-budget batch shape.
 
 A typical Hydra invocation shape is:
 
@@ -37,7 +37,7 @@ The translation surface is now intentionally narrow but public:
 - routed architecture: `transformer-iwslt-de-en`
 - public experiment preset: `transformer-iwslt14-de-en`
 - expected loader contract: `dataset.loader=local_seq2seq_text`
-- batch contract: `x=(src_tokens, prev_output_tokens)` and `y=target_tokens_flat`
+- batch contract: `x=(src_tokens, prev_output_tokens)` and `y=target_tokens_flat`, with the train loader allowed to pad the flattened target tail using `pad_id` so JAX train-step shapes stay compile-stable
 - model defaults: fairseq-style 6 encoder layers, 6 decoder layers, embed dim `512`, FFN dim `1024`, heads `4`, `relu`, sinusoidal positions, and tied decoder input/output embeddings
 - public recipe surface: `main_optimizer=adam`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=0.3`, `total_epochs=300`, `label_smoothing=0.1`, `dataset.max_tokens=4096`, and LLQR `full_batch` seq2seq updates
 - public eval surface: beam-search generation with `beam_size=5`, fairseq-style `max_len=1.2*src_len+10`, `@@ ` BPE removal, Moses detokenization, sacreBLEU scoring, and BLEU-routed best-checkpoint snapshots when `preempt_handling=true`
