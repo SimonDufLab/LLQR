@@ -1,4 +1,5 @@
 """Python script to run experiments"""
+import inspect
 import os
 import time
 from datetime import timedelta
@@ -42,9 +43,27 @@ def should_run_periodic_event(*, step: int, total_steps: int, every: int) -> boo
   return (step % every == 0) and ((step != 0) or (total_steps == 1))
 
 
-def build_model_pair_from_dataset_info(*, architecture_name: str, num_classes: int, ds_info):
+def build_model_pair_from_dataset_info(*, architecture_name: str, num_classes: int, ds_info, architecture_cfg=None):
   """Build `(train_model, inf_model, model_kwargs)` from dataset metadata."""
   model_kwargs = utl.resolve_model_init_kwargs(architecture_name, ds_info)
+  if architecture_cfg is not None:
+    raw_architecture_cfg = (
+      OmegaConf.to_container(architecture_cfg, resolve=True)
+      if isinstance(architecture_cfg, DictConfig)
+      else dict(architecture_cfg)
+    )
+    factory_signature = inspect.signature(model_choice[architecture_name])
+    supported_keys = set(factory_signature.parameters)
+    supported_keys.discard("num_classes")
+    accepts_var_keyword = any(
+      parameter.kind == inspect.Parameter.VAR_KEYWORD
+      for parameter in factory_signature.parameters.values()
+    )
+    for key, value in raw_architecture_cfg.items():
+      if key == "name" or value is None:
+        continue
+      if accepts_var_keyword or key in supported_keys:
+        model_kwargs[key] = value
   model, inf_model = model_choice[architecture_name](num_classes=num_classes, **model_kwargs)
   if inf_model is None:
     inf_model = model
@@ -218,6 +237,7 @@ def main(cfg: DictConfig):
     architecture_name=cfg.architecture.name,
     num_classes=num_classes,
     ds_info=ds_info,
+    architecture_cfg=cfg.architecture,
   )
 
   # 3) Initialize model parameters
