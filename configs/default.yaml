@@ -13,7 +13,7 @@ test_eval_freq: 2000
 add_train_eval: false # Record additional metrics on raw train dataset (no augmentation) at the same freq as test_eval
 record_histograms: false # Record histogram over p(correct class) and per-sample NLL, for analysis purpose
 checkpoint_freq: 1000 # Snapshot of model and training for preemption handling
-logging_freq: 10 # Base logging freq for training losses etc. with aim
+logging_freq: 50 # Base logging freq for training losses etc. with aim
 report_freq: 200 # Frequency (in steps) at which current training progress is reported in CLI
 init_key: 42
 rng_seed: 123 # For dropout, etc.
