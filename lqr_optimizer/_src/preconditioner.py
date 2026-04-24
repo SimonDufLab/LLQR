@@ -241,11 +241,6 @@ def _take_preconditioner_chunk_datapoints(dataloader, precond_batch_size, batch_
 
   current_batch = next(dataloader)
   layout = infer_batch_layout(current_batch)
-  if layout["mode"] == SEQ2SEQ_TASK_KIND:
-    raise ValueError(
-      "llqr_batch_update_mode='chunked_lqr_segment' does not support "
-      "seq2seq_translation batches yet; use full_batch for translation."
-    )
   batch_axis = layout["batch_axis"]
   current_batch_size = _batch_size_from_datapoint(current_batch, batch_axis)
   current_offset = 0
@@ -272,7 +267,7 @@ def _take_preconditioner_chunk_datapoints(dataloader, precond_batch_size, batch_
 
 
 def _supports_chunked_execution_stage_update_layout(layout):
-  return layout["mode"] in ("cv", "text")
+  return layout["mode"] in ("cv", "text", SEQ2SEQ_TASK_KIND)
 
 
 def _normalize_execution_stage_update_datapoint(datapoint, layout):

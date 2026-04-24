@@ -661,7 +661,9 @@ def create_transformer_iwslt_model(
       make_lqr_segment_descriptor(
         "translation_final",
         ("translation_logits", "translation_log_softmax"),
-        sample_separable_second_order=bool(deterministic),
+        # The flattened-and-sorted readout erases a stable per-sample output axis,
+        # so translation final readout is not a sample-separable second-order surface.
+        sample_separable_second_order=False,
       )
     )
 

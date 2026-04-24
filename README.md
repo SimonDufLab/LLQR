@@ -39,9 +39,9 @@ The translation surface is now intentionally narrow but public:
 - expected loader contract: `dataset.loader=local_seq2seq_text`
 - batch contract: `x=(src_tokens, prev_output_tokens)` and `y=target_tokens_flat`, with the train loader allowed to pad the flattened target tail using `pad_id` so JAX train-step shapes stay compile-stable
 - model defaults: fairseq-style 6 encoder layers, 6 decoder layers, embed dim `512`, FFN dim `1024`, heads `4`, `relu`, sinusoidal positions, and tied decoder input/output embeddings
-- public recipe surface: `main_optimizer=adam`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=0.3`, `total_epochs=300`, `label_smoothing=0.1`, `dataset.max_tokens=4096`, and LLQR `full_batch` seq2seq updates
+- public recipe surface: `main_optimizer=adam`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=0.3`, `total_epochs=300`, `label_smoothing=0.1`, `dataset.max_tokens=4096`, and a conservative default of LLQR `full_batch` seq2seq updates
 - public eval surface: beam-search generation with `beam_size=5`, fairseq-style `max_len=1.2*src_len+10`, `@@ ` BPE removal, Moses detokenization, sacreBLEU scoring, and BLEU-routed best-checkpoint snapshots when `preempt_handling=true`
-- current boundary: generation recomputes full decoder prefixes without an incremental cache, and `llqr_batch_update_mode=chunked_lqr_segment` remains intentionally unsupported for seq2seq translation batches
+- current boundary: generation recomputes full decoder prefixes without an incremental cache; translation also keeps `llqr_batch_update_mode=full_batch` as the default preset, while `chunked_lqr_segment` is supported only for `llqr_second_order_mode=batched_exact` and translation `sample_separable_exact` remains intentionally unsupported because the final readout flattens away a stable per-sample output axis
 - maintained validation note: `../tmp/benchmarks/llqr-iwslt14-de-en-translation-smokes/README.md`
 - completed plan: `../docs/plans/completed/llqr-iwslt14-de-en-translation-support-exec-plan.md`
 - final audit: `../docs/reports/llqr-iwslt14-de-en-translation-support-final-report-2026-04-22.md`
