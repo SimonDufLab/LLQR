@@ -719,6 +719,12 @@ def load_iwslt14_de_en(
       "train_eval_target_count": int(metadata["splits"]["train"]["tgt_token_count"]),
       "test_eval_target_count": int(metadata["splits"]["valid"]["tgt_token_count"]),
     },
+    "preconditioner_shape_contract": {
+      "mode": SEQ2SEQ_TASK_KIND,
+      "canonical_src_length": int(metadata["splits"]["train"]["max_src_length"]),
+      "canonical_tgt_length": int(metadata["splits"]["train"]["max_tgt_length"]),
+      "pad_id": pad_id,
+    },
     "batch_shape_contract": {
       "shape_bucket_mode": train_shape_bucket_mode,
       "shape_bucket_count": int(active_bucket_count),

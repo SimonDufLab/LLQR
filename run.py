@@ -208,6 +208,8 @@ def main(cfg: DictConfig):
   run["jax_devices"] = backend_devices
   if ds_info.get("batch_shape_contract") is not None:
     run["batch_shape_contract"] = ds_info["batch_shape_contract"]
+  if ds_info.get("preconditioner_shape_contract") is not None:
+    run["preconditioner_shape_contract"] = ds_info["preconditioner_shape_contract"]
   if cfg.preempt_handling:
     run_state["aim_hash"] = run.hash
 
@@ -350,6 +352,7 @@ def main(cfg: DictConfig):
     llqr_batch_update_chunk_size=cfg.llqr_batch_update_chunk_size,
     llqr_second_order_mode=cfg.llqr_second_order_mode,
     llqr_second_order_chunk_size=cfg.llqr_second_order_chunk_size,
+    seq2seq_preconditioner_shape_contract=ds_info.get("preconditioner_shape_contract"),
     optax_solver_requires_value_and_grad=utl.precond_solver_requires_value_and_grad(cfg.precond_solver),
   )
   llqr_batch_update_gate = preconditioner.describe_llqr_batch_update_gate()

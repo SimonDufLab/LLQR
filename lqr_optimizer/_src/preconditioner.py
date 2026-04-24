@@ -13,10 +13,13 @@ from flax.core.frozen_dict import FrozenDict, freeze
 from lqr_optimizer._src.utils.utils import (normalize_gradient, timed_jit, pytree_max_min, pytree_l2_norm,
                                             get_per_layer_norm, _deep_copy_pytree, infer_batch_layout, get_per_layer_skews)
 from lqr_optimizer._src.utils.seq2seq_utils import (
+  describe_seq2seq_datapoint,
   pad_and_concatenate_seq2seq_input_batches,
+  pad_seq2seq_datapoint_to_static_shape,
   SEQ2SEQ_TASK_KIND,
   seq2seq_target_count,
   slice_seq2seq_flat_targets,
+  validate_seq2seq_preconditioner_shape_contract,
 )
 import lqr_optimizer._src.block_matrices_approx.block_structures as block_structures
 from lqr_optimizer._src.utils.build_lqr import (lqr_forward_matrices_and_states,
@@ -97,6 +100,12 @@ def _logical_batch_size(layout, datapoint):
   return _batch_size_from_datapoint(datapoint, layout["batch_axis"])
 
 
+def _ingestion_batch_size(layout, datapoint):
+  if layout["mode"] == SEQ2SEQ_TASK_KIND:
+    return _logical_batch_size(layout, datapoint)
+  return _batch_size_from_datapoint(datapoint, layout["batch_axis"])
+
+
 def _effective_loss_count(layout, batch_size, *, start=0):
   if layout["mode"] == "text":
     return int(layout["T"] * batch_size)
@@ -157,7 +166,21 @@ def _slice_batch_datapoint(datapoint, layout, start, size):
   return jax.tree_util.tree_map(slice_leaf, datapoint)
 
 
-def _concat_preconditioner_batches(batches, layout, precond_batch_size):
+def _canonicalize_seq2seq_preconditioner_datapoint(datapoint, seq2seq_shape_contract, *,
+                                                   canonical_batch_size):
+  if seq2seq_shape_contract is None:
+    return datapoint
+  return pad_seq2seq_datapoint_to_static_shape(
+    datapoint,
+    padded_batch_size=int(canonical_batch_size),
+    padded_src_length=int(seq2seq_shape_contract["canonical_src_length"]),
+    padded_tgt_length=int(seq2seq_shape_contract["canonical_tgt_length"]),
+    pad_id=int(seq2seq_shape_contract["pad_id"]),
+  )
+
+
+def _concat_preconditioner_batches(batches, layout, precond_batch_size, *,
+                                   seq2seq_shape_contract=None):
   mode = layout["mode"]
   batch_axis = layout["batch_axis"]
 
@@ -186,11 +209,16 @@ def _concat_preconditioner_batches(batches, layout, precond_batch_size):
     accumulated_targets = jnp.concatenate(target_batches, axis=0)
     accumulated_layout = dict(layout)
     accumulated_layout["target_lengths"] = tuple(int(length) for length in target_lengths)
-    return _slice_batch_datapoint(
+    live_datapoint = _slice_batch_datapoint(
       (accumulated_inputs, accumulated_targets),
       accumulated_layout,
       0,
       precond_batch_size,
+    )
+    return _canonicalize_seq2seq_preconditioner_datapoint(
+      live_datapoint,
+      seq2seq_shape_contract,
+      canonical_batch_size=precond_batch_size,
     )
 
   def concat_fn(*xs):
@@ -221,7 +249,8 @@ def _concat_preconditioner_batches(batches, layout, precond_batch_size):
   return _slice_batch_datapoint(accumulated, layout, 0, precond_batch_size)
 
 
-def _take_full_preconditioner_datapoint(dataloader, precond_batch_size):
+def _take_full_preconditioner_datapoint(dataloader, precond_batch_size, *,
+                                        seq2seq_shape_contract=None):
   first_batch = next(dataloader)
   layout = infer_batch_layout(first_batch)
 
@@ -232,17 +261,25 @@ def _take_full_preconditioner_datapoint(dataloader, precond_batch_size):
     batches.append(batch)
     accumulated_size += _logical_batch_size(infer_batch_layout(batch), batch)
 
-  return layout, _concat_preconditioner_batches(batches, layout, precond_batch_size)
+  datapoint = _concat_preconditioner_batches(
+    batches,
+    layout,
+    precond_batch_size,
+    seq2seq_shape_contract=seq2seq_shape_contract,
+  )
+  if layout["mode"] == SEQ2SEQ_TASK_KIND:
+    return infer_batch_layout(datapoint), datapoint
+  return layout, datapoint
 
 
-def _take_preconditioner_chunk_datapoints(dataloader, precond_batch_size, batch_chunk_size):
+def _take_preconditioner_chunk_datapoints(dataloader, precond_batch_size, batch_chunk_size, *,
+                                          seq2seq_shape_contract=None):
   if batch_chunk_size is None:
     raise ValueError("batch_chunk_size must be set for chunked preconditioner ingestion")
 
   current_batch = next(dataloader)
   layout = infer_batch_layout(current_batch)
-  batch_axis = layout["batch_axis"]
-  current_batch_size = _batch_size_from_datapoint(current_batch, batch_axis)
+  current_batch_size = _ingestion_batch_size(layout, current_batch)
   current_offset = 0
   accumulated_size = 0
   chunk_datapoints = []
@@ -253,16 +290,25 @@ def _take_preconditioner_chunk_datapoints(dataloader, precond_batch_size, batch_
     available = current_batch_size - current_offset
     remaining_total = precond_batch_size - accumulated_size
     take_size = min(batch_chunk_size, available, remaining_total)
-    chunk_datapoints.append(_slice_batch_datapoint(current_batch, current_layout, current_offset, take_size))
+    chunk_datapoint = _slice_batch_datapoint(current_batch, current_layout, current_offset, take_size)
+    chunk_datapoint = _canonicalize_seq2seq_preconditioner_datapoint(
+      chunk_datapoint,
+      seq2seq_shape_contract if current_layout["mode"] == SEQ2SEQ_TASK_KIND else None,
+      canonical_batch_size=batch_chunk_size,
+    )
+    chunk_datapoints.append(chunk_datapoint)
     chunk_weights.append(_effective_loss_count(current_layout, take_size, start=current_offset))
     accumulated_size += take_size
     current_offset += take_size
 
     if current_offset == current_batch_size and accumulated_size < precond_batch_size:
       current_batch = next(dataloader)
-      current_batch_size = _batch_size_from_datapoint(current_batch, batch_axis)
+      current_layout = infer_batch_layout(current_batch)
+      current_batch_size = _ingestion_batch_size(current_layout, current_batch)
       current_offset = 0
 
+  if layout["mode"] == SEQ2SEQ_TASK_KIND and chunk_datapoints:
+    layout = infer_batch_layout(chunk_datapoints[0])
   return layout, chunk_datapoints, chunk_weights
 
 
@@ -905,6 +951,7 @@ class BasePreconditioner(abc.ABC):
                llqr_batch_update_chunk_size = None,
                llqr_second_order_mode: str = "batched_exact",
                llqr_second_order_chunk_size = None,
+               seq2seq_preconditioner_shape_contract = None,
                use_spectral_norm: bool = False,
                optax_solver_requires_value_and_grad: bool = False):
     self._divergence_function = divergence_function
@@ -1018,6 +1065,11 @@ class BasePreconditioner(abc.ABC):
     self._llqr_second_order_mode = llqr_second_order_mode
     self._llqr_second_order_chunk_size = (
       None if llqr_second_order_chunk_size is None else int(llqr_second_order_chunk_size)
+    )
+    self._seq2seq_preconditioner_shape_contract = (
+      None
+      if seq2seq_preconditioner_shape_contract is None
+      else validate_seq2seq_preconditioner_shape_contract(seq2seq_preconditioner_shape_contract)
     )
     if (
       self._llqr_batch_update_mode == "chunked_lqr_segment"
@@ -1237,6 +1289,7 @@ class BasePreconditioner(abc.ABC):
 
   def _record_llqr_batch_update_route(self, *, operation, route, precond_batch_size,
                                               layout=None, normalized_layout=None,
+                                              datapoint=None,
                                               chunk_datapoints=None, chunk_weights=None,
                                               fallback_reason=None):
     route_info = self.describe_llqr_batch_update_gate()
@@ -1271,8 +1324,48 @@ class BasePreconditioner(abc.ABC):
       route_info["layout_supported"] = bool(_supports_chunked_execution_stage_update_layout(layout))
     if normalized_layout is not None:
       route_info["normalized_layout"] = self._serialize_batch_layout(normalized_layout)
+    if datapoint is not None and layout is not None and layout.get("mode") == SEQ2SEQ_TASK_KIND:
+      seq2seq_summary = describe_seq2seq_datapoint(
+        datapoint,
+        pad_id=int(layout["pad_id"]),
+      )
+      route_info["seq2seq_signature"] = {
+        "src_tokens": seq2seq_summary["src_tokens"],
+        "prev_output_tokens": seq2seq_summary["prev_output_tokens"],
+        "targets": seq2seq_summary["targets"],
+      }
+      route_info["seq2seq_live_batch_size"] = int(seq2seq_summary["live_batch_size"])
+      route_info["seq2seq_live_target_token_count"] = int(
+        seq2seq_summary["live_target_token_count"]
+      )
     if chunk_datapoints is not None:
       route_info["chunk_count"] = len(chunk_datapoints)
+      if layout is not None and layout.get("mode") == SEQ2SEQ_TASK_KIND:
+        chunk_summaries = [
+          describe_seq2seq_datapoint(chunk_datapoint, pad_id=int(layout["pad_id"]))
+          for chunk_datapoint in chunk_datapoints
+        ]
+        first_chunk_signature = {
+          "src_tokens": chunk_summaries[0]["src_tokens"],
+          "prev_output_tokens": chunk_summaries[0]["prev_output_tokens"],
+          "targets": chunk_summaries[0]["targets"],
+        }
+        route_info["seq2seq_chunk_signature"] = first_chunk_signature
+        route_info["seq2seq_chunk_signatures_consistent"] = bool(all(
+          summary["src_tokens"] == first_chunk_signature["src_tokens"]
+          and summary["prev_output_tokens"] == first_chunk_signature["prev_output_tokens"]
+          and summary["targets"] == first_chunk_signature["targets"]
+          for summary in chunk_summaries
+        ))
+        route_info["seq2seq_chunk_live_batch_sizes"] = [
+          int(summary["live_batch_size"]) for summary in chunk_summaries
+        ]
+        route_info["seq2seq_chunk_live_target_token_counts"] = [
+          int(summary["live_target_token_count"]) for summary in chunk_summaries
+        ]
+        route_info["seq2seq_live_target_token_count"] = int(sum(
+          summary["live_target_token_count"] for summary in chunk_summaries
+        ))
     if chunk_weights is not None:
       route_info["chunk_weights"] = [int(weight) for weight in chunk_weights]
     if fallback_reason is not None:
@@ -2017,6 +2110,7 @@ class BasePreconditioner(abc.ABC):
           dataloader,
           precond_batch_size,
           self._resolved_llqr_batch_update_chunk_size(),
+          seq2seq_shape_contract=self._seq2seq_preconditioner_shape_contract,
         )
         if _supports_chunked_execution_stage_update_layout(layout):
           normalized_layout, normalized_chunk_datapoints = _normalize_execution_stage_update_chunks(
@@ -2044,12 +2138,18 @@ class BasePreconditioner(abc.ABC):
             snapshot_preconditioner=should_snapshot,
           )
         else:
-          acc_batches = _concat_preconditioner_batches(chunk_datapoints, layout, precond_batch_size)
+          acc_batches = _concat_preconditioner_batches(
+            chunk_datapoints,
+            layout,
+            precond_batch_size,
+            seq2seq_shape_contract=self._seq2seq_preconditioner_shape_contract,
+          )
           self._record_llqr_batch_update_route(
             operation="update",
             route="chunked_lqr_segment_layout_fallback",
             precond_batch_size=precond_batch_size,
             layout=layout,
+            datapoint=acc_batches,
             chunk_datapoints=chunk_datapoints,
             chunk_weights=chunk_weights,
             fallback_reason=f"unsupported_layout:{layout.get('mode')}",
@@ -2064,7 +2164,11 @@ class BasePreconditioner(abc.ABC):
             snapshot_preconditioner=should_snapshot,
           )
       else:
-        layout, acc_batches = _take_full_preconditioner_datapoint(dataloader, precond_batch_size)
+        layout, acc_batches = _take_full_preconditioner_datapoint(
+          dataloader,
+          precond_batch_size,
+          seq2seq_shape_contract=self._seq2seq_preconditioner_shape_contract,
+        )
         normalized_layout = layout
         if self._use_execution_stage_active_path:
           normalized_layout, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
@@ -2074,6 +2178,7 @@ class BasePreconditioner(abc.ABC):
           precond_batch_size=precond_batch_size,
           layout=layout,
           normalized_layout=normalized_layout,
+          datapoint=acc_batches,
         )
         updated_blocks = self._update_preconditioner_fn(
           _blocks,
@@ -2116,6 +2221,7 @@ class BasePreconditioner(abc.ABC):
           dataloader,
           precond_batch_size,
           self._resolved_llqr_batch_update_chunk_size(),
+          seq2seq_shape_contract=self._seq2seq_preconditioner_shape_contract,
         )
         if _supports_chunked_execution_stage_update_layout(layout):
           normalized_layout, normalized_chunk_datapoints = _normalize_execution_stage_update_chunks(
@@ -2143,12 +2249,18 @@ class BasePreconditioner(abc.ABC):
             snapshot_preconditioner=True,
           )
         else:
-          acc_batches = _concat_preconditioner_batches(chunk_datapoints, layout, precond_batch_size)
+          acc_batches = _concat_preconditioner_batches(
+            chunk_datapoints,
+            layout,
+            precond_batch_size,
+            seq2seq_shape_contract=self._seq2seq_preconditioner_shape_contract,
+          )
           self._record_llqr_batch_update_route(
             operation="compile",
             route="chunked_lqr_segment_layout_fallback",
             precond_batch_size=precond_batch_size,
             layout=layout,
+            datapoint=acc_batches,
             chunk_datapoints=chunk_datapoints,
             chunk_weights=chunk_weights,
             fallback_reason=f"unsupported_layout:{layout.get('mode')}",
@@ -2156,7 +2268,11 @@ class BasePreconditioner(abc.ABC):
           blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
                                      acc_batches, opt_state)
       else:
-        layout, acc_batches = _take_full_preconditioner_datapoint(dataloader, precond_batch_size)
+        layout, acc_batches = _take_full_preconditioner_datapoint(
+          dataloader,
+          precond_batch_size,
+          seq2seq_shape_contract=self._seq2seq_preconditioner_shape_contract,
+        )
         normalized_layout = layout
         if self._use_execution_stage_active_path:
           normalized_layout, acc_batches = _normalize_execution_stage_update_datapoint(acc_batches, layout)
@@ -2166,6 +2282,7 @@ class BasePreconditioner(abc.ABC):
           precond_batch_size=precond_batch_size,
           layout=layout,
           normalized_layout=normalized_layout,
+          datapoint=acc_batches,
         )
         blocks = self._update_preconditioner_fn(self._block_structure.blocks, params, precond_lr, other_model_variables,
                                      acc_batches, opt_state)
