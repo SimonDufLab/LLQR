@@ -500,6 +500,19 @@ def _build_percentile_shape_bucketed_batch_specs_by_max_tokens(
   return batch_specs
 
 
+def _shuffle_batches(
+    batches: Sequence[np.ndarray | TranslationBatchSpec],
+    *,
+    rng: np.random.Generator,
+) -> list[np.ndarray | TranslationBatchSpec]:
+  if rng is None:
+    raise ValueError("An RNG is required to shuffle train batches.")
+  if len(batches) <= 1:
+    return list(batches)
+  permutation = rng.permutation(len(batches))
+  return [batches[int(index)] for index in permutation]
+
+
 def _batch_indices_by_sentences(ordered_indices: np.ndarray, batch_size: int) -> list[np.ndarray]:
   batches = []
   for start in range(0, len(ordered_indices), int(batch_size)):
@@ -599,6 +612,8 @@ def _make_epoch_factory(
         )
     else:
       batches = _batch_indices_by_sentences(ordered, batch_size=batch_size)
+    if shuffle:
+      batches = _shuffle_batches(batches, rng=rng)
     for batch_indices in batches:
       yield _collate_translation_batch(dataset, batch_indices, pad_id=pad_id, eos_id=eos_id)
 
