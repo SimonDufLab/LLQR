@@ -75,14 +75,18 @@ def build_model_pair_from_dataset_info(*, architecture_name: str, num_classes: i
 
 
 def build_translation_next_log_probs_fn(*, model, state):
-  def next_log_probs(src_tokens, prev_output_tokens):
-    variables = {'params': state.params, 'batch_stats': state.batch_stats}
+  @jax.jit
+  def apply_next_log_probs(variables, src_tokens, prev_output_tokens):
     return model.apply(
       variables,
       (src_tokens, prev_output_tokens),
       method=model.next_log_probs,
       mutable=False,
     )
+
+  def next_log_probs(src_tokens, prev_output_tokens):
+    variables = {'params': state.params, 'batch_stats': state.batch_stats}
+    return apply_next_log_probs(variables, src_tokens, prev_output_tokens)
 
   return next_log_probs
 

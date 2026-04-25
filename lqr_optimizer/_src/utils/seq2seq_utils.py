@@ -450,6 +450,109 @@ def generate_seq2seq_beam_search(
   return np.asarray(best.tokens[1:], dtype=np.int32)
 
 
+def generate_seq2seq_batched_beam_search(
+    *,
+    next_log_probs_fn,
+    src_tokens,
+    beam_size: int,
+    max_len_a: float,
+    max_len_b: int,
+    pad_id: int,
+    eos_id: int,
+    max_target_positions: int,
+) -> list[np.ndarray]:
+  """Batched beam search that issues one model call per generation step."""
+  if beam_size <= 0:
+    raise ValueError(f"beam_size must be positive, got {beam_size}.")
+
+  src_tokens = np.asarray(src_tokens, dtype=np.int32)
+  if src_tokens.ndim != 2:
+    raise ValueError(f"`src_tokens` must be rank-2, got shape {src_tokens.shape}.")
+  if src_tokens.shape[0] == 0:
+    return []
+
+  max_generated_lengths = []
+  for row in src_tokens:
+    src_length = seq2seq_source_length(row, pad_id=pad_id, eos_id=eos_id)
+    max_generated_length = int(max_len_a * src_length + max_len_b)
+    max_generated_length = max(1, min(int(max_target_positions) - 1, max_generated_length))
+    max_generated_lengths.append(max_generated_length)
+  if min(max_generated_lengths) <= 0:
+    raise ValueError("max_target_positions must be at least 2 for seq2seq generation.")
+  max_generated_length = max(max_generated_lengths)
+  max_active_count = src_tokens.shape[0] * int(beam_size)
+  fixed_prev_output_length = max_generated_length + 1
+
+  beams_by_example = [
+    [Seq2SeqBeamCandidate(tokens=(int(eos_id),), score=0.0, finished=False)]
+    for _ in range(src_tokens.shape[0])
+  ]
+
+  for step in range(max_generated_length):
+    active_records = []
+    for example_index, beams in enumerate(beams_by_example):
+      if step >= max_generated_lengths[example_index]:
+        continue
+      for beam in beams:
+        if not beam.finished:
+          active_records.append((example_index, beam))
+    if not active_records:
+      break
+
+    active_count = len(active_records)
+    active_src = np.empty(
+      (max_active_count, src_tokens.shape[1]),
+      dtype=np.int32,
+    )
+    active_prev_output = np.full(
+      (max_active_count, fixed_prev_output_length),
+      int(pad_id),
+      dtype=np.int32,
+    )
+    for record_index, (example_index, beam) in enumerate(active_records):
+      active_src[record_index] = src_tokens[example_index]
+      active_prev_output[record_index, :len(beam.tokens)] = beam.tokens
+    if active_count < max_active_count:
+      active_src[active_count:] = src_tokens[0]
+      active_prev_output[active_count:, 0] = int(eos_id)
+    step_log_probs = np.asarray(
+      translation_next_log_probs(next_log_probs_fn, active_src, active_prev_output),
+      dtype=np.float32,
+    )[:active_count]
+
+    candidates_by_example = [
+      [beam for beam in beams if beam.finished]
+      for beams in beams_by_example
+    ]
+    for record_index, (example_index, beam) in enumerate(active_records):
+      top_indices = np.argsort(-step_log_probs[record_index])[:beam_size]
+      for token_id in top_indices.tolist():
+        token_id = int(token_id)
+        candidates_by_example[example_index].append(
+          Seq2SeqBeamCandidate(
+            tokens=beam.tokens + (token_id,),
+            score=float(beam.score + step_log_probs[record_index, token_id]),
+            finished=bool(token_id == int(eos_id)),
+          )
+        )
+
+    for example_index, candidates in enumerate(candidates_by_example):
+      if not candidates:
+        candidates = beams_by_example[example_index]
+      candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+      beams_by_example[example_index] = candidates[:beam_size]
+
+    if all(all(beam.finished for beam in beams) for beams in beams_by_example):
+      break
+
+  best_tokens = []
+  for beams in beams_by_example:
+    completed = [beam for beam in beams if beam.finished]
+    best = max(completed or beams, key=lambda candidate: candidate.score)
+    best_tokens.append(np.asarray(best.tokens[1:], dtype=np.int32))
+  return best_tokens
+
+
 def evaluate_translation_generation(
     *,
     dataloader,
@@ -468,6 +571,7 @@ def evaluate_translation_generation(
     max_examples: int | None = None,
     progress_freq: int | None = None,
     progress_callback: Callable[[int], None] | None = None,
+    use_batched_generation: bool = True,
 ):
   if hasattr(dataloader, "reset"):
     dataloader.reset()
@@ -491,14 +595,26 @@ def evaluate_translation_generation(
     src_tokens, prev_output_tokens = unpack_seq2seq_inputs(x_batch)
     target_sequences = recover_seq2seq_target_sequences(prev_output_tokens, y_batch, pad_id=pad_id)
     src_tokens = np.asarray(src_tokens, dtype=np.int32)
+    live_examples = []
     for example_index, reference_tokens in enumerate(target_sequences):
-      if max_examples is not None and len(hypotheses) >= int(max_examples):
+      if (
+          max_examples is not None
+          and len(hypotheses) + len(live_examples) >= int(max_examples)
+      ):
         break
       if len(reference_tokens) == 0:
         continue
-      hypothesis_tokens = generate_seq2seq_beam_search(
+      live_examples.append((example_index, reference_tokens))
+    if not live_examples:
+      continue
+
+    if use_batched_generation:
+      batch_hypothesis_tokens = generate_seq2seq_batched_beam_search(
         next_log_probs_fn=next_log_probs_fn,
-        src_tokens=src_tokens[example_index],
+        src_tokens=np.asarray(
+          [src_tokens[example_index] for example_index, _ in live_examples],
+          dtype=np.int32,
+        ),
         beam_size=beam_size,
         max_len_a=max_len_a,
         max_len_b=max_len_b,
@@ -506,6 +622,22 @@ def evaluate_translation_generation(
         eos_id=eos_id,
         max_target_positions=max_target_positions,
       )
+    else:
+      batch_hypothesis_tokens = [
+        generate_seq2seq_beam_search(
+          next_log_probs_fn=next_log_probs_fn,
+          src_tokens=src_tokens[example_index],
+          beam_size=beam_size,
+          max_len_a=max_len_a,
+          max_len_b=max_len_b,
+          pad_id=pad_id,
+          eos_id=eos_id,
+          max_target_positions=max_target_positions,
+        )
+        for example_index, _ in live_examples
+      ]
+
+    for hypothesis_tokens, (_, reference_tokens) in zip(batch_hypothesis_tokens, live_examples):
       hypothesis = decode_seq2seq_text(
         target_dictionary,
         hypothesis_tokens,
