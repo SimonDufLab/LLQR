@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
@@ -324,6 +325,62 @@ def score_translation_bleu(hypotheses: Sequence[str], references: Sequence[str])
   return float(sacrebleu.corpus_bleu(list(hypotheses), [list(references)]).score)
 
 
+def _periodic_event_due(*, step: int, total_steps: int, every: int) -> bool:
+  return (int(step) % int(every) == 0) and ((int(step) != 0) or (int(total_steps) == 1))
+
+
+def _resolve_optional_nonnegative_int(value: Any, *, name: str) -> int | None:
+  if value is None:
+    return None
+  resolved = int(value)
+  if resolved < 0:
+    raise ValueError(f"`{name}` must be non-negative or null, got {value!r}.")
+  return resolved
+
+
+def translation_bleu_eval_mode(
+    *,
+    step: int,
+    total_steps: int,
+    enabled: bool,
+    freq,
+    test_eval_freq: int,
+    full_eval_at_end: bool,
+    full_eval_freq,
+) -> str | None:
+  """Return `sampled`, `full`, or `None` for the BLEU eval due at this step."""
+  if not enabled:
+    return None
+
+  step = int(step)
+  total_steps = int(total_steps)
+  is_final_step = total_steps > 0 and step == total_steps - 1
+  full_due = bool(full_eval_at_end) and is_final_step
+
+  resolved_full_freq = _resolve_optional_nonnegative_int(
+    full_eval_freq, name="translation_eval.full_eval_freq"
+  )
+  if resolved_full_freq:
+    full_due = full_due or _periodic_event_due(
+      step=step,
+      total_steps=total_steps,
+      every=resolved_full_freq,
+    )
+  if full_due:
+    return "full"
+
+  resolved_freq = _resolve_optional_nonnegative_int(
+    freq, name="translation_eval.freq"
+  )
+  if resolved_freq is None:
+    resolved_freq = int(test_eval_freq)
+  if resolved_freq == 0:
+    return None
+  if _periodic_event_due(step=step, total_steps=total_steps, every=resolved_freq):
+    return "sampled"
+  return None
+
+
 def decode_seq2seq_text(dictionary, token_ids, *, remove_bpe, detokenize: Callable[[str], str], unk_string: str) -> str:
   text = dictionary.string(token_ids, remove_bpe=remove_bpe, unk_string=unk_string)
   return detokenize(text)
@@ -408,9 +465,21 @@ def evaluate_translation_generation(
     max_target_positions: int,
     remove_bpe,
     detok: str | None,
+    max_examples: int | None = None,
+    progress_freq: int | None = None,
+    progress_callback: Callable[[int], None] | None = None,
 ):
   if hasattr(dataloader, "reset"):
     dataloader.reset()
+  if max_examples is not None and int(max_examples) <= 0:
+    return {
+      "bleu": 0.0,
+      "hypotheses": [],
+      "references": [],
+      "sample_hypothesis": None,
+      "sample_reference": None,
+      "num_examples": 0,
+    }
 
   detokenize = build_translation_detokenizer(detok, target_lang=target_lang)
   hypotheses = []
@@ -423,6 +492,10 @@ def evaluate_translation_generation(
     target_sequences = recover_seq2seq_target_sequences(prev_output_tokens, y_batch, pad_id=pad_id)
     src_tokens = np.asarray(src_tokens, dtype=np.int32)
     for example_index, reference_tokens in enumerate(target_sequences):
+      if max_examples is not None and len(hypotheses) >= int(max_examples):
+        break
+      if len(reference_tokens) == 0:
+        continue
       hypothesis_tokens = generate_seq2seq_beam_search(
         next_log_probs_fn=next_log_probs_fn,
         src_tokens=src_tokens[example_index],
@@ -452,6 +525,25 @@ def evaluate_translation_generation(
       if sample_hypothesis is None:
         sample_hypothesis = hypothesis
         sample_reference = reference
+      if (
+          progress_callback is not None
+          and progress_freq is not None
+          and int(progress_freq) > 0
+          and len(hypotheses) % int(progress_freq) == 0
+      ):
+        progress_callback(len(hypotheses))
+    if max_examples is not None and len(hypotheses) >= int(max_examples):
+      break
+
+  if not hypotheses:
+    return {
+      "bleu": 0.0,
+      "hypotheses": hypotheses,
+      "references": references,
+      "sample_hypothesis": sample_hypothesis,
+      "sample_reference": sample_reference,
+      "num_examples": 0,
+    }
 
   return {
     "bleu": score_translation_bleu(hypotheses, references),

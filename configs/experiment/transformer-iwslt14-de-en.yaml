@@ -36,6 +36,11 @@ llqr_batch_update_mode: full_batch
 
 translation_eval:
   enabled: true
+  freq: 1000
+  max_examples: 256
+  full_eval_at_end: true
+  full_eval_freq: null
+  progress_freq: 64
   beam_size: 5
   max_len_a: 1.2
   max_len_b: 10

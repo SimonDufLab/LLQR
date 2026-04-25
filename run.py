@@ -29,7 +29,11 @@ from lqr_optimizer._src.utils.dataloaders.iwslt14_de_en import (
   load_iwslt14_de_en_dictionaries,
   prepare_local_seq2seq_dataset,
 )
-from lqr_optimizer._src.utils.seq2seq_utils import SEQ2SEQ_TASK_KIND, evaluate_translation_generation
+from lqr_optimizer._src.utils.seq2seq_utils import (
+  SEQ2SEQ_TASK_KIND,
+  evaluate_translation_generation,
+  translation_bleu_eval_mode,
+)
 import lqr_optimizer._src.utils.sam_mode_handlers as sam_mode_handlers
 import lqr_optimizer._src.utils.utils as utl
 
@@ -660,33 +664,73 @@ def main(cfg: DictConfig):
         # Print info
         print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
         print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
-    if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.test_eval_freq):
+    token_eval_due = should_run_periodic_event(
+      step=step,
+      total_steps=total_steps,
+      every=cfg.test_eval_freq,
+    )
+    bleu_eval_mode = None
+    if is_translation_task:
+      bleu_eval_mode = translation_bleu_eval_mode(
+        step=step,
+        total_steps=total_steps,
+        enabled=bool(cfg.translation_eval.enabled),
+        freq=cfg.translation_eval.freq,
+        test_eval_freq=cfg.test_eval_freq,
+        full_eval_at_end=bool(cfg.translation_eval.full_eval_at_end),
+        full_eval_freq=cfg.translation_eval.full_eval_freq,
+      )
+    if token_eval_due or bleu_eval_mode is not None:
       test_time_start = time.time()
       elapsed_time = time.time() - start_time + prev_elapsed_time
       if is_translation_task:
-        if cfg.record_histograms:
-          valid_accuracy, valid_loss = compute_accuracy_and_loss_with_hists(
-            state,
-            test_dataloader,
-            test_eval_target_count,
-            run,
-            step=step,
-            prefix='valid',
-            ignore_index=translation_target_pad_id,
-          )
-        else:
-          valid_accuracy, valid_loss = compute_accuracy_and_loss(
-            state,
-            test_dataloader,
-            test_eval_target_count,
-            ignore_index=translation_target_pad_id,
-          )
-        run.track(valid_accuracy, name="valid token_accuracy", step=step)
-        run.track(valid_loss, name="valid loss", step=step)
-        run.track(valid_accuracy, name="valid token_accuracy|t", step=elapsed_time*100)
-        run.track(valid_loss, name="valid loss|t", step=elapsed_time*100)
+        if token_eval_due:
+          if cfg.record_histograms:
+            valid_accuracy, valid_loss = compute_accuracy_and_loss_with_hists(
+              state,
+              test_dataloader,
+              test_eval_target_count,
+              run,
+              step=step,
+              prefix='valid',
+              ignore_index=translation_target_pad_id,
+            )
+          else:
+            valid_accuracy, valid_loss = compute_accuracy_and_loss(
+              state,
+              test_dataloader,
+              test_eval_target_count,
+              ignore_index=translation_target_pad_id,
+            )
+          run.track(valid_accuracy, name="valid token_accuracy", step=step)
+          run.track(valid_loss, name="valid loss", step=step)
+          run.track(valid_accuracy, name="valid token_accuracy|t", step=elapsed_time*100)
+          run.track(valid_loss, name="valid loss|t", step=elapsed_time*100)
+          print("============================")
+          print(f"Step {step} | Valid Loss: {valid_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
+          print(f"Step {step} | Valid Token Accuracy: {valid_accuracy:.2f}%")
+          print(f"Valid token evaluation computed in {time.time() - test_time_start:.2f} seconds")
+          print("============================")
 
-        if cfg.translation_eval.enabled:
+        if bleu_eval_mode is not None:
+          bleu_time_start = time.time()
+          bleu_is_full = bleu_eval_mode == "full"
+          max_bleu_examples = None if bleu_is_full else cfg.translation_eval.max_examples
+          metric_name = "valid bleu" if bleu_is_full else "valid bleu_sampled"
+          progress_freq = cfg.translation_eval.progress_freq
+          limit_msg = "full validation set" if max_bleu_examples is None else f"up to {int(max_bleu_examples)} examples"
+          print("============================")
+          print(
+            f"Step {step} | Starting {bleu_eval_mode} BLEU evaluation "
+            f"({limit_msg}, beam={cfg.translation_eval.beam_size})"
+          )
+
+          def _print_bleu_progress(example_count):
+            print(
+              f"Step {step} | {bleu_eval_mode} BLEU progress: "
+              f"{example_count} examples | Elapsed {time.time() - bleu_time_start:.2f} seconds"
+            )
+
           translation_metrics = evaluate_translation_generation(
             dataloader=test_dataloader,
             next_log_probs_fn=build_translation_next_log_probs_fn(model=inf_model, state=state),
@@ -701,57 +745,55 @@ def main(cfg: DictConfig):
             max_target_positions=int(model_kwargs.get("max_target_positions", 1024)),
             remove_bpe=cfg.translation_eval.remove_bpe,
             detok=cfg.translation_eval.detok,
+            max_examples=max_bleu_examples,
+            progress_freq=progress_freq,
+            progress_callback=_print_bleu_progress,
           )
           valid_bleu = translation_metrics["bleu"]
-          run.track(valid_bleu, name="valid bleu", step=step)
-          run.track(valid_bleu, name="valid bleu|t", step=elapsed_time*100)
-          improved = utl.metric_improved(
-            valid_bleu,
-            best_metric_value,
-            maximize=cfg.translation_eval.maximize_checkpoint_metric,
-          )
-          if improved:
-            best_metric_name = cfg.translation_eval.checkpoint_metric
-            best_metric_value = valid_bleu
-            best_metric_step = step
-            if cfg.preempt_handling:
-              utl.update_run_state_best_metric(
-                run_state,
-                metric_name=best_metric_name,
-                metric_value=best_metric_value,
-                step=best_metric_step,
-              )
-              utl.save_run_state(run_state)
-              utl.checkpoint_exp(
-                run_state,
-                state,
-                preconditioner.expose_blocks(),
-                curr_epoch=step // steps_per_epoch_rounded,
-                curr_step=step,
-                dropout_key=dropout_key,
-                training_time=elapsed_time,
-                target_dir=Path(run_state["model_dir"]) / "checkpoint_best",
-              )
-          run.track(best_metric_value, name="best valid bleu", step=step)
-          run.track(best_metric_step, name="best valid bleu step", step=step)
-          print("============================")
-          print(f"Step {step} | Valid Loss: {valid_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
-          print(f"Step {step} | Valid Token Accuracy: {valid_accuracy:.2f}%")
-          print(f"Step {step} | Valid BLEU: {valid_bleu:.2f}")
+          run.track(valid_bleu, name=metric_name, step=step)
+          run.track(valid_bleu, name=f"{metric_name}|t", step=elapsed_time*100)
+          run.track(translation_metrics["num_examples"], name=f"{metric_name} examples", step=step)
+          if bleu_is_full:
+            improved = utl.metric_improved(
+              valid_bleu,
+              best_metric_value,
+              maximize=cfg.translation_eval.maximize_checkpoint_metric,
+            )
+            if improved:
+              best_metric_name = cfg.translation_eval.checkpoint_metric
+              best_metric_value = valid_bleu
+              best_metric_step = step
+              if cfg.preempt_handling:
+                utl.update_run_state_best_metric(
+                  run_state,
+                  metric_name=best_metric_name,
+                  metric_value=best_metric_value,
+                  step=best_metric_step,
+                )
+                utl.save_run_state(run_state)
+                utl.checkpoint_exp(
+                  run_state,
+                  state,
+                  preconditioner.expose_blocks(),
+                  curr_epoch=step // steps_per_epoch_rounded,
+                  curr_step=step,
+                  dropout_key=dropout_key,
+                  training_time=elapsed_time,
+                  target_dir=Path(run_state["model_dir"]) / "checkpoint_best",
+                )
+            run.track(best_metric_value, name="best valid bleu", step=step)
+            run.track(best_metric_step, name="best valid bleu step", step=step)
+          print(f"Step {step} | Valid BLEU ({bleu_eval_mode}): {valid_bleu:.2f}")
+          print(f"Step {step} | Valid BLEU Examples ({bleu_eval_mode}): {translation_metrics['num_examples']}")
           if cfg.translation_eval.print_samples and translation_metrics["sample_hypothesis"] is not None:
             print(f"Sample Hypothesis: {translation_metrics['sample_hypothesis']}")
             print(f"Sample Reference: {translation_metrics['sample_reference']}")
-          print(
-            f"{best_metric_name} best checkpoint metric after step {step}: "
-            f"{best_metric_value:.2f} (step {best_metric_step})"
-          )
-          print(f"Valid translation evaluation computed in {time.time() - test_time_start:.2f} seconds")
-          print("============================")
-        else:
-          print("============================")
-          print(f"Step {step} | Valid Loss: {valid_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
-          print(f"Step {step} | Valid Token Accuracy: {valid_accuracy:.2f}%")
-          print(f"Valid token evaluation computed in {time.time() - test_time_start:.2f} seconds")
+          if bleu_is_full:
+            print(
+              f"{best_metric_name} best checkpoint metric after step {step}: "
+              f"{best_metric_value:.2f} (step {best_metric_step})"
+            )
+          print(f"Valid {bleu_eval_mode} BLEU evaluation computed in {time.time() - bleu_time_start:.2f} seconds")
           print("============================")
       else:
         if cfg.record_histograms:

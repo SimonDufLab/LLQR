@@ -20,6 +20,11 @@ rng_seed: 123 # For dropout, etc.
 
 translation_eval:
   enabled: false
+  freq: null # Null uses test_eval_freq; 0 disables periodic sampled BLEU.
+  max_examples: null # Cap periodic sampled BLEU; full BLEU ignores this.
+  full_eval_at_end: true
+  full_eval_freq: null # Positive integer enables periodic full BLEU/checkpoint selection.
+  progress_freq: 64
   beam_size: 5
   max_len_a: 1.2
   max_len_b: 10
