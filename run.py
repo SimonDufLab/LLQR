@@ -513,11 +513,11 @@ def main(cfg: DictConfig):
     precond_apply_fn=precond_apply_fn,
   )
 
-  def train_step(state, precond_blocks, train_dataloader, dropout_key):
+  def train_step(state, precond_blocks, train_dataloader, dropout_key, step):
     x_acc, y_acc = utl.next_accumulated_batches(train_dataloader, cfg.grad_acc_steps)
 
     new_state, mean_loss, dropout_key = train_step_jit(
-      state, precond_blocks, x_acc, y_acc, dropout_key
+      state, precond_blocks, x_acc, y_acc, dropout_key, step=step
     )
 
     return new_state, mean_loss, utl.tree_axis0_take(x_acc, -1), utl.tree_axis0_take(y_acc, -1)
@@ -644,7 +644,7 @@ def main(cfg: DictConfig):
     # x_batch, y_batch = next(dataloader)
     #
     dropout_key, consumed_key = jax.random.split(dropout_key)
-    state, loss, x_batch, y_batch = train_step(state, preconditioner.expose_blocks(), dataloader, consumed_key)
+    state, loss, x_batch, y_batch = train_step(state, preconditioner.expose_blocks(), dataloader, consumed_key, step)
 
     # Logging or testing every so often
     if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.logging_freq):

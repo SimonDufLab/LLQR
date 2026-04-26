@@ -1,3 +1,5 @@
+import numbers
+
 import jax
 
 import lqr_optimizer._src.utils.utils as utl
@@ -7,10 +9,10 @@ SUPPORTED_SAM_MODES = (None, "base_sam", "base_fsam", "past_fsam", "asam", "fish
 _LEGACY_SAM_NEUTRAL_DEFAULTS = (
   ("perturb_mode", "ema_grad"),
   ("norm_mode", "euclidean"),
-  # ("sam_research_base_vector_source", "current_gradient"), # overkill limitations, can work with those, even if not well-formed
-  # ("sam_research_perturb_sign", "ascent"),
-  # ("gbar_beta", 0.9),
-  # ("gbar_eps", 1e-12),
+  ("sam_research_base_vector_source", "current_gradient"),
+  ("sam_research_perturb_sign", "ascent"),
+  ("gbar_beta", 0.9),
+  ("gbar_eps", 1e-12),
 )
 
 
@@ -20,6 +22,24 @@ def _normalize_sam_mode(sam_mode):
 
 def _sam_outer_update_uses_preconditioner(cfg):
   return getattr(cfg, "sam_use_preconditioner_on_update", True)
+
+
+def _resolve_start_sam_after_step(cfg):
+  start_step = getattr(cfg, "start_sam_after_step", None)
+  if start_step is None:
+    return 0
+  if isinstance(start_step, bool) or not isinstance(start_step, numbers.Integral):
+    raise ValueError(
+      "start_sam_after_step must be null or a non-negative integer; "
+      f"got {start_step!r}."
+    )
+  start_step = int(start_step)
+  if start_step < 0:
+    raise ValueError(
+      "start_sam_after_step must be null or a non-negative integer; "
+      f"got {start_step!r}."
+    )
+  return start_step
 
 
 def _llqr_outer_update_toggle_is_active(sam_mode):
@@ -69,6 +89,7 @@ def _validate_fisher_sam_mode_contract(cfg):
 
 def validate_sam_mode_contract(cfg, opt_state):
   sam_mode = _normalize_sam_mode(cfg.sam_mode)
+  _resolve_start_sam_after_step(cfg)
   if sam_mode not in SUPPORTED_SAM_MODES:
     raise ValueError(f"Unsupported sam_mode: {cfg.sam_mode}")
   if sam_mode == "asam":
@@ -108,13 +129,35 @@ def build_train_step_jit(
     builder = builders[sam_mode]
   except KeyError as exc:
     raise ValueError(f"Unsupported sam_mode: {cfg.sam_mode}") from exc
-  return builder(
+  sam_train_step_jit = builder(
     cfg,
     accumulate_grads=accumulate_grads,
     apply_training_update=apply_training_update,
     apply_vanilla_training_update=apply_vanilla_training_update,
     precond_apply_fn=precond_apply_fn,
   )
+  start_sam_after_step = _resolve_start_sam_after_step(cfg)
+  if sam_mode is None or start_sam_after_step == 0:
+    def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key, *, step=None):
+      del step
+      return sam_train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key)
+
+    return train_step_jit
+
+  no_sam_train_step_jit = _build_no_sam_train_step(
+    cfg,
+    accumulate_grads=accumulate_grads,
+    apply_training_update=apply_training_update,
+    apply_vanilla_training_update=apply_vanilla_training_update,
+    precond_apply_fn=precond_apply_fn,
+  )
+
+  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key, *, step=None):
+    if step is None or int(step) >= start_sam_after_step:
+      return sam_train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key)
+    return no_sam_train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key)
+
+  return train_step_jit
 
 
 def _build_no_sam_train_step(

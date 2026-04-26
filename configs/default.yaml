@@ -74,6 +74,7 @@ jobid: null  # To manually restart a previous job
 
 # SAM / Friendly-SAM training options
 sam_mode: null # "base_sam" | "base_fsam" | "past_fsam" | "asam" | "fisher_sam"
+start_sam_after_step: null # Null or 0 starts SAM immediately; positive int delays active SAM updates until step >= this threshold.
 perturbation_rho: 0.1
 asam_eta: 0.01 # Canonical ASAM stability offset on non-bias parameters.
 fisher_sam_eta: 0.1 # Canonical Fisher-SAM additive inverse-Fisher diagonal regularizer.

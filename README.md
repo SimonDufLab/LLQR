@@ -41,6 +41,7 @@ The translation surface is now intentionally narrow but public:
 - preconditioner contract: translation LLQR updates now preserve a loader-provided canonical padded seq2seq signature for both `full_batch` and `chunked_lqr_segment`, while route diagnostics report the separate live target-token count for weighting and debugging
 - model defaults: fairseq-style 6 encoder layers, 6 decoder layers, embed dim `512`, FFN dim `1024`, heads `4`, `relu`, sinusoidal positions, and tied decoder input/output embeddings
 - public recipe surface: `main_optimizer=adamw`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=1e-4`, `total_epochs=55`, `architecture.dropout=0.3`, `label_smoothing=0.1`, `dataset.max_tokens=4096`, and a conservative default of LLQR `full_batch` seq2seq updates
+- SAM policy for this preset: `start_sam_after_step=4000`, aligned with inverse-sqrt `warmup_updates`, so any non-null `sam_mode` begins active SAM updates only after LR warmup completes
 - public eval surface: batched beam-search generation with `beam_size=5`, fairseq-style `max_len=1.2*src_len+10`, `@@ ` BPE removal, Moses detokenization, sacreBLEU scoring, sampled periodic BLEU logged as `valid bleu_sampled`, and full BLEU-routed best-checkpoint snapshots when `preempt_handling=true`
 - current boundary: generation uses fixed-shape JIT full-prefix beam search without an incremental decoder cache; periodic BLEU is capped by default and full BLEU is final-only unless `translation_eval.full_eval_freq` is set; translation also keeps `llqr_batch_update_mode=full_batch` as the default preset, while `chunked_lqr_segment` is supported only for `llqr_second_order_mode=batched_exact` and translation `sample_separable_exact` remains intentionally unsupported because the final readout flattens away a stable per-sample output axis
 - maintained validation note: `../tmp/benchmarks/llqr-iwslt14-de-en-translation-smokes/README.md`
@@ -101,6 +102,7 @@ fits.
 
 The current public SAM configuration surface is:
 - `sam_mode`: perturbation source selector; current supported values are `null`, `base_sam`, `base_fsam`, `past_fsam`, `asam`, and `fisher_sam`
+- `start_sam_after_step`: optional non-negative step threshold; `null` and `0` preserve immediate SAM behavior, while positive values delay active SAM updates until step `>= start_sam_after_step`
 - `perturbation_rho`: perturbation magnitude
 - `asam_eta`: canonical ASAM stability offset on non-bias parameters; default `0.01`
 - `fisher_sam_eta`: canonical Fisher-SAM additive inverse-Fisher diagonal regularizer; default `0.1`
@@ -110,6 +112,7 @@ The current public SAM configuration surface is:
 
 Current runtime semantics:
 - `sam_mode=null` disables perturbation and treats `sam_use_preconditioner_on_update` as inert
+- before a positive `start_sam_after_step` threshold, active SAM modes use the ordinary non-SAM configured update route rather than a SAM perturbation/update
 - `base_sam` perturbs from the current gradient and leaves `gbar` / `g_last` untouched
 - `base_fsam` perturbs from `g_current - gbar`
 - `past_fsam` preserves the rolling-buffer variant used before the rename
