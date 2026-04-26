@@ -1,5 +1,6 @@
 """Python script to run experiments"""
 import inspect
+import math
 import os
 import time
 from datetime import timedelta
@@ -51,6 +52,25 @@ def should_run_periodic_event(*, step: int, total_steps: int, every: int) -> boo
 def should_run_training_step(*, step: int, total_steps: int) -> bool:
   """Return whether this loop step should mutate model or preconditioner state."""
   return int(step) < int(total_steps) - 1
+
+
+def track_translation_token_validation_metrics(
+    run,
+    *,
+    valid_accuracy,
+    valid_loss,
+    step: int,
+    elapsed_time: float,
+):
+  """Track translation token validation metrics, including fairseq NLL bits/token."""
+  valid_nll_loss_bits = float(valid_loss) / math.log(2.0)
+  time_step = elapsed_time * 100
+  run.track(valid_accuracy, name="valid token_accuracy", step=step)
+  run.track(valid_loss, name="valid loss", step=step)
+  run.track(valid_nll_loss_bits, name="valid_nll_loss", step=step)
+  run.track(valid_accuracy, name="valid token_accuracy|t", step=time_step)
+  run.track(valid_loss, name="valid loss|t", step=time_step)
+  run.track(valid_nll_loss_bits, name="valid_nll_loss|t", step=time_step)
 
 
 def build_model_pair_from_dataset_info(*, architecture_name: str, num_classes: int, ds_info, architecture_cfg=None):
@@ -620,10 +640,13 @@ def main(cfg: DictConfig):
               test_eval_target_count,
               ignore_index=translation_target_pad_id,
             )
-          run.track(valid_accuracy, name="valid token_accuracy", step=step)
-          run.track(valid_loss, name="valid loss", step=step)
-          run.track(valid_accuracy, name="valid token_accuracy|t", step=elapsed_time*100)
-          run.track(valid_loss, name="valid loss|t", step=elapsed_time*100)
+          track_translation_token_validation_metrics(
+            run,
+            valid_accuracy=valid_accuracy,
+            valid_loss=valid_loss,
+            step=step,
+            elapsed_time=elapsed_time,
+          )
           print("============================")
           print(f"Step {step} | Valid Loss: {valid_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
           print(f"Step {step} | Valid Token Accuracy: {valid_accuracy:.2f}%")
