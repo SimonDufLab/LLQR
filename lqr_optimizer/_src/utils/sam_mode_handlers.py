@@ -9,10 +9,10 @@ SUPPORTED_SAM_MODES = (None, "base_sam", "base_fsam", "past_fsam", "asam", "fish
 _LEGACY_SAM_NEUTRAL_DEFAULTS = (
   ("perturb_mode", "ema_grad"),
   ("norm_mode", "euclidean"),
-  ("sam_research_base_vector_source", "current_gradient"),
-  ("sam_research_perturb_sign", "ascent"),
-  ("gbar_beta", 0.9),
-  ("gbar_eps", 1e-12),
+  # ("sam_research_base_vector_source", "current_gradient"), # overkill, no need to fail fast on those
+  # ("sam_research_perturb_sign", "ascent"),
+  # ("gbar_beta", 0.9),
+  # ("gbar_eps", 1e-12),
 )
 
 
@@ -105,7 +105,8 @@ def validate_sam_mode_contract(cfg, opt_state):
       f"sam_mode={sam_mode!r} requires use_preconditioner=true when "
       "sam_use_preconditioner_on_update=true."
     )
-  utl.validate_sam_research_contract(cfg, opt_state)
+  if sam_mode not in ("asam", "fisher_sam"):
+    utl.validate_sam_research_contract(cfg, opt_state)
 
 
 def build_train_step_jit(

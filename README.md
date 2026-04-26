@@ -119,8 +119,8 @@ Current runtime semantics:
 - `asam` applies the canonical ASAM perturbation from the current gradient using element-wise non-bias parameter scaling and leaves `gbar` / `g_last` untouched
 - `fisher_sam` applies the canonical Fisher-SAM perturbation from the accumulated minibatch gradient using the diagonal Fisher approximation `g^2`, additive inverse-Fisher regularization `fisher_sam_eta`, and a vanilla outer update, and leaves `gbar` / `g_last` untouched
 - `base_sam`, `base_fsam`, `past_fsam`, and `asam` follow `sam_use_preconditioner_on_update` for the outer parameter update; a true LLQR perturbation-only ablation still requires a legacy LLQR-backed perturbation mode such as `perturb_mode=ema_precond_grad` or `ema_direction`
-- canonical `asam` requires the neutral legacy defaults for `perturb_mode`, `norm_mode`, `sam_research_*`, `gbar_beta`, and `gbar_eps`; those knobs remain part of the legacy SAM / Friendly-SAM surface rather than the ASAM contract
-- canonical `fisher_sam` requires the same neutral legacy defaults and intentionally treats `sam_use_preconditioner_on_update` as inert in favor of the vanilla optimizer update
+- canonical `asam` requires neutral `perturb_mode` and `norm_mode`; `sam_research_*`, `gbar_beta`, and `gbar_eps` are ignored by this mode
+- canonical `fisher_sam` requires neutral `perturb_mode` and `norm_mode`, ignores `sam_research_*`, `gbar_beta`, and `gbar_eps`, and intentionally treats `sam_use_preconditioner_on_update` as inert in favor of the vanilla optimizer update
 - `run.py` now delegates mode-specific train-step orchestration to `lqr_optimizer/_src/utils/sam_mode_handlers.py`, while `lqr_optimizer/_src/utils/utils.py` keeps the generic perturbation, canonical ASAM, canonical Fisher-SAM, and buffer helpers
 
 For Kronecker-style preconditioners, the current maintained transformer support is:
