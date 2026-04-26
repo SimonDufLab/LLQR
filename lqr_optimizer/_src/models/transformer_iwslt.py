@@ -37,6 +37,18 @@ def _embedding_init(*, embedding_dim: int, pad_id: int):
   return init
 
 
+def _xavier_uniform_gain(gain: float):
+  return nn.initializers.variance_scaling(
+    scale=gain * gain,
+    mode="fan_avg",
+    distribution="uniform",
+  )
+
+
+def _fairseq_qkv_kernel_init():
+  return _xavier_uniform_gain(1.0 / math.sqrt(2.0))
+
+
 def _make_fairseq_token_positions(tokens: jnp.ndarray, pad_id: int) -> jnp.ndarray:
   """Return fairseq-style token positions with pads fixed at `pad_id`."""
   nonpad = (tokens != int(pad_id)).astype(jnp.int32)
@@ -186,8 +198,10 @@ class EncoderSelfAttentionStage(nn.Module):
       dropout_rate=self.attention_dropout_rate,
       broadcast_dropout=False,
       deterministic=self.deterministic,
-      kernel_init=nn.initializers.xavier_uniform(),
+      kernel_init=_fairseq_qkv_kernel_init(),
+      out_kernel_init=nn.initializers.xavier_uniform(),
       bias_init=nn.initializers.zeros,
+      out_bias_init=nn.initializers.zeros,
       name="MultiHeadDotProductAttention_0",
     )(residual, residual, mask=state.src_pad_mask > 0)
     return state._replace(src_h=attended, src_residual=residual)
@@ -209,8 +223,10 @@ class DecoderSelfAttentionStage(nn.Module):
       dropout_rate=self.attention_dropout_rate,
       broadcast_dropout=False,
       deterministic=self.deterministic,
-      kernel_init=nn.initializers.xavier_uniform(),
+      kernel_init=_fairseq_qkv_kernel_init(),
+      out_kernel_init=nn.initializers.xavier_uniform(),
       bias_init=nn.initializers.zeros,
+      out_bias_init=nn.initializers.zeros,
       name="MultiHeadDotProductAttention_0",
     )(residual, residual, mask=state.tgt_self_mask > 0)
     return state._replace(tgt_h=attended, tgt_residual=residual)
@@ -232,8 +248,10 @@ class DecoderCrossAttentionStage(nn.Module):
       dropout_rate=self.attention_dropout_rate,
       broadcast_dropout=False,
       deterministic=self.deterministic,
-      kernel_init=nn.initializers.xavier_uniform(),
+      kernel_init=_fairseq_qkv_kernel_init(),
+      out_kernel_init=nn.initializers.xavier_uniform(),
       bias_init=nn.initializers.zeros,
+      out_bias_init=nn.initializers.zeros,
       name="MultiHeadDotProductAttention_0",
     )(residual, state.src_h, mask=state.src_pad_mask > 0)
     return state._replace(tgt_h=attended, tgt_residual=residual)
