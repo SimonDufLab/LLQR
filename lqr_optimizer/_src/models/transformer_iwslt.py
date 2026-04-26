@@ -37,13 +37,60 @@ def _embedding_init(*, embedding_dim: int, pad_id: int):
   return init
 
 
-def _sinusoidal_position_encoding(seq_len: int, dim: int, dtype) -> jnp.ndarray:
-  positions = jnp.arange(seq_len, dtype=dtype)[:, None]
-  div_term = jnp.exp(jnp.arange(0, dim, 2, dtype=dtype) * (-math.log(10000.0) / dim))
-  encoding = jnp.zeros((seq_len, dim), dtype=dtype)
-  encoding = encoding.at[:, 0::2].set(jnp.sin(positions * div_term))
-  encoding = encoding.at[:, 1::2].set(jnp.cos(positions * div_term))
-  return encoding[None, :, :]
+def _make_fairseq_token_positions(tokens: jnp.ndarray, pad_id: int) -> jnp.ndarray:
+  """Return fairseq-style token positions with pads fixed at `pad_id`."""
+  nonpad = (tokens != int(pad_id)).astype(jnp.int32)
+  return (jnp.cumsum(nonpad, axis=1) * nonpad) + int(pad_id)
+
+
+def _fairseq_sinusoidal_embedding_table(
+    *,
+    num_positions: int,
+    dim: int,
+    pad_id: int,
+    dtype,
+) -> jnp.ndarray:
+  """Return fairseq-compatible sinusoidal embeddings with the pad row zeroed."""
+  half_dim = int(dim) // 2
+  positions = jnp.arange(int(num_positions), dtype=dtype)[:, None]
+  if half_dim > 0:
+    if half_dim == 1:
+      div_term = jnp.ones((1,), dtype=dtype)
+    else:
+      div_term = jnp.exp(
+        jnp.arange(half_dim, dtype=dtype) * (-math.log(10000.0) / (half_dim - 1))
+      )
+    scaled_positions = positions * div_term[None, :]
+    encoding = jnp.concatenate(
+      [jnp.sin(scaled_positions), jnp.cos(scaled_positions)],
+      axis=1,
+    )
+  else:
+    encoding = jnp.zeros((int(num_positions), 0), dtype=dtype)
+  if int(dim) % 2 == 1:
+    encoding = jnp.concatenate(
+      [encoding, jnp.zeros((int(num_positions), 1), dtype=dtype)],
+      axis=1,
+    )
+  return encoding.at[int(pad_id)].set(jnp.zeros((int(dim),), dtype=dtype))
+
+
+def _add_token_positional_encoding(
+    hidden: jnp.ndarray,
+    tokens: jnp.ndarray,
+    *,
+    pad_id: int,
+) -> jnp.ndarray:
+  """Add fairseq-style pad-aware sinusoidal positional encodings."""
+  positions = _make_fairseq_token_positions(tokens, pad_id=pad_id)
+  num_positions = tokens.shape[1] + int(pad_id) + 1
+  table = _fairseq_sinusoidal_embedding_table(
+    num_positions=num_positions,
+    dim=hidden.shape[-1],
+    pad_id=pad_id,
+    dtype=hidden.dtype,
+  )
+  return hidden + table[positions]
 
 
 def _validate_tokens(tokens: jnp.ndarray, *, expected_rank: int, max_positions: int, field_name: str) -> None:
@@ -99,8 +146,8 @@ class TranslationInitStage(nn.Module):
     tgt_h = embed_scale * self.tgt_embedding(prev_output_tokens)
     tgt_embed_matrix = self.tgt_embedding.embedding
 
-    src_h = src_h + _sinusoidal_position_encoding(src_tokens.shape[1], self.emb_dim, src_h.dtype)
-    tgt_h = tgt_h + _sinusoidal_position_encoding(prev_output_tokens.shape[1], self.emb_dim, tgt_h.dtype)
+    src_h = _add_token_positional_encoding(src_h, src_tokens, pad_id=self.pad_id)
+    tgt_h = _add_token_positional_encoding(tgt_h, prev_output_tokens, pad_id=self.pad_id)
 
     src_h = nn.Dropout(rate=self.dropout_rate)(src_h, deterministic=self.deterministic)
     tgt_h = nn.Dropout(rate=self.dropout_rate)(tgt_h, deterministic=self.deterministic)
