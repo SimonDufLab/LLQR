@@ -559,31 +559,29 @@ def generate_seq2seq_batched_beam_search(
   if src_tokens.shape[0] == 0:
     return []
 
-  max_generated_lengths = []
-  for row in src_tokens:
-    src_length = seq2seq_source_length(row, pad_id=pad_id, eos_id=eos_id)
-    max_generated_length = int(max_len_a * src_length + max_len_b)
-    max_generated_length = max(1, min(int(max_target_positions) - 1, max_generated_length))
-    max_generated_lengths.append(max_generated_length)
-  if min(max_generated_lengths) <= 0:
-    raise ValueError("max_target_positions must be at least 2 for seq2seq generation.")
-  max_generated_length = max(max_generated_lengths)
+  max_len = _fairseq_max_len_from_source_width(
+    src_tokens,
+    max_len_a=max_len_a,
+    max_len_b=max_len_b,
+    max_target_positions=max_target_positions,
+  )
   max_active_count = src_tokens.shape[0] * int(beam_size)
-  fixed_prev_output_length = max_generated_length + 1
+  fixed_prev_output_length = max_len + 1
 
-  beams_by_example = [
+  active_beams_by_example = [
     [Seq2SeqBeamCandidate(tokens=(int(eos_id),), score=0.0, finished=False)]
     for _ in range(src_tokens.shape[0])
   ]
+  finalized_beams_by_example = [[] for _ in range(src_tokens.shape[0])]
+  finished_examples = [False for _ in range(src_tokens.shape[0])]
 
-  for step in range(max_generated_length):
+  for step in range(max_len + 1):
     active_records = []
-    for example_index, beams in enumerate(beams_by_example):
-      if step >= max_generated_lengths[example_index]:
+    for example_index, beams in enumerate(active_beams_by_example):
+      if finished_examples[example_index]:
         continue
       for beam in beams:
-        if not beam.finished:
-          active_records.append((example_index, beam))
+        active_records.append((example_index, beam))
     if not active_records:
       break
 
@@ -607,36 +605,80 @@ def generate_seq2seq_batched_beam_search(
       translation_next_log_probs(next_log_probs_fn, active_src, active_prev_output),
       dtype=np.float32,
     )[:active_count]
+    if step_log_probs.ndim != 2 or step_log_probs.shape[0] != active_count:
+      raise ValueError(
+        "`next_log_probs_fn` must return shape `(active_records, vocab_size)` "
+        f"for batched beam search after slicing, got {step_log_probs.shape}."
+      )
 
-    candidates_by_example = [
-      [beam for beam in beams if beam.finished]
-      for beams in beams_by_example
-    ]
+    candidates_by_example = [[] for _ in range(src_tokens.shape[0])]
     for record_index, (example_index, beam) in enumerate(active_records):
-      top_indices = np.argsort(-step_log_probs[record_index])[:beam_size]
+      masked_log_probs = _mask_fairseq_step_log_probs(
+        step_log_probs[record_index],
+        step=step,
+        max_len=max_len,
+        pad_id=pad_id,
+        eos_id=eos_id,
+      )
+      cumulative_scores = masked_log_probs + float(beam.score)
+      top_indices = np.argsort(-cumulative_scores)[:min(2 * int(beam_size), cumulative_scores.size)]
       for token_id in top_indices.tolist():
+        candidate_score = float(cumulative_scores[int(token_id)])
+        if not np.isfinite(candidate_score):
+          continue
         token_id = int(token_id)
         candidates_by_example[example_index].append(
           Seq2SeqBeamCandidate(
             tokens=beam.tokens + (token_id,),
-            score=float(beam.score + step_log_probs[record_index, token_id]),
+            score=candidate_score,
             finished=bool(token_id == int(eos_id)),
           )
         )
 
     for example_index, candidates in enumerate(candidates_by_example):
-      if not candidates:
-        candidates = beams_by_example[example_index]
       candidates.sort(key=lambda candidate: candidate.score, reverse=True)
-      beams_by_example[example_index] = candidates[:beam_size]
+      candidates = candidates[:min(2 * int(beam_size), len(candidates))]
+      for candidate in candidates[:int(beam_size)]:
+        if (
+            candidate.finished
+            and len(finalized_beams_by_example[example_index]) < int(beam_size)
+        ):
+          finalized_beams_by_example[example_index].append(
+            Seq2SeqBeamCandidate(
+              tokens=candidate.tokens,
+              score=float(
+                candidate.score / ((step + 1) ** _FAIRSEQ_DEFAULT_LEN_PENALTY)
+              ),
+              finished=True,
+            )
+          )
+      if (
+          len(finalized_beams_by_example[example_index]) == int(beam_size)
+          or step == max_len
+      ):
+        finished_examples[example_index] = True
+        active_beams_by_example[example_index] = []
+        continue
+      active_beams_by_example[example_index] = [
+        Seq2SeqBeamCandidate(
+          tokens=candidate.tokens,
+          score=candidate.score,
+          finished=False,
+        )
+        for candidate in candidates
+        if not candidate.finished
+      ][:int(beam_size)]
 
-    if all(all(beam.finished for beam in beams) for beams in beams_by_example):
+    if all(finished_examples):
       break
 
   best_tokens = []
-  for beams in beams_by_example:
-    completed = [beam for beam in beams if beam.finished]
-    best = max(completed or beams, key=lambda candidate: candidate.score)
+  for example_index in range(src_tokens.shape[0]):
+    candidates = (
+      finalized_beams_by_example[example_index]
+      or active_beams_by_example[example_index]
+    )
+    best = max(candidates, key=lambda candidate: candidate.score)
     best_tokens.append(np.asarray(best.tokens[1:], dtype=np.int32))
   return best_tokens
 
