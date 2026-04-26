@@ -10,6 +10,8 @@ import numpy as np
 
 SEQ2SEQ_TASK_KIND = "seq2seq_translation"
 SEQ2SEQ_DEFAULT_PAD_ID = 1
+_FAIRSEQ_DEFAULT_MIN_LEN = 1
+_FAIRSEQ_DEFAULT_LEN_PENALTY = 1.0
 _REQUIRED_MODEL_INIT_KWARGS = (
   "src_vocab_size",
   "tgt_vocab_size",
@@ -392,6 +394,45 @@ def translation_next_log_probs(next_log_probs_fn, src_tokens, prev_output_tokens
   return jnp.asarray(next_log_probs_fn(src_tokens, prev_output_tokens))
 
 
+def _fairseq_max_len_from_source_width(
+    src_tokens,
+    *,
+    max_len_a: float,
+    max_len_b: int,
+    max_target_positions: int,
+) -> int:
+  if int(max_target_positions) < 2:
+    raise ValueError("max_target_positions must be at least 2 for seq2seq generation.")
+  src_width = int(np.asarray(src_tokens).shape[-1])
+  max_len = min(
+    int(float(max_len_a) * src_width + int(max_len_b)),
+    int(max_target_positions) - 1,
+  )
+  if _FAIRSEQ_DEFAULT_MIN_LEN > max_len:
+    raise ValueError("min_len cannot be larger than max_len for seq2seq generation.")
+  return int(max_len)
+
+
+def _mask_fairseq_step_log_probs(
+    log_probs,
+    *,
+    step: int,
+    max_len: int,
+    pad_id: int,
+    eos_id: int,
+):
+  log_probs = np.asarray(log_probs, dtype=np.float32).copy()
+  log_probs[~np.isfinite(log_probs)] = -np.inf
+  log_probs[int(pad_id)] = -np.inf
+  if int(step) >= int(max_len):
+    eos_log_prob = log_probs[int(eos_id)]
+    log_probs.fill(-np.inf)
+    log_probs[int(eos_id)] = eos_log_prob
+  elif int(step) < _FAIRSEQ_DEFAULT_MIN_LEN:
+    log_probs[int(eos_id)] = -np.inf
+  return log_probs
+
+
 def generate_seq2seq_beam_search(
     *,
     next_log_probs_fn,
@@ -407,46 +448,93 @@ def generate_seq2seq_beam_search(
     raise ValueError(f"beam_size must be positive, got {beam_size}.")
 
   src_tokens = np.asarray(src_tokens, dtype=np.int32)
-  src_length = seq2seq_source_length(src_tokens, pad_id=pad_id, eos_id=eos_id)
-  max_generated_length = int(max_len_a * src_length + max_len_b)
-  max_generated_length = max(1, min(int(max_target_positions) - 1, max_generated_length))
-  if max_generated_length <= 0:
-    raise ValueError("max_target_positions must be at least 2 for seq2seq generation.")
+  max_len = _fairseq_max_len_from_source_width(
+    src_tokens,
+    max_len_a=max_len_a,
+    max_len_b=max_len_b,
+    max_target_positions=max_target_positions,
+  )
 
-  beams = [Seq2SeqBeamCandidate(tokens=(int(eos_id),), score=0.0, finished=False)]
-  for _ in range(max_generated_length):
-    active = [beam for beam in beams if not beam.finished]
-    finished = [beam for beam in beams if beam.finished]
-    if not active:
+  active_beams = [Seq2SeqBeamCandidate(tokens=(int(eos_id),), score=0.0, finished=False)]
+  finalized_beams = []
+  for step in range(max_len + 1):
+    if not active_beams:
       break
 
-    repeated_src = np.repeat(src_tokens[None, :], len(active), axis=0)
-    active_prev_output = np.asarray([beam.tokens for beam in active], dtype=np.int32)
+    repeated_src = np.repeat(src_tokens[None, :], len(active_beams), axis=0)
+    active_prev_output = np.asarray([beam.tokens for beam in active_beams], dtype=np.int32)
     step_log_probs = np.asarray(
       translation_next_log_probs(next_log_probs_fn, repeated_src, active_prev_output),
       dtype=np.float32,
     )
+    if step_log_probs.ndim != 2 or step_log_probs.shape[0] != len(active_beams):
+      raise ValueError(
+        "`next_log_probs_fn` must return shape `(active_beams, vocab_size)` "
+        f"for scalar beam search, got {step_log_probs.shape}."
+      )
 
-    candidates = list(finished)
-    for beam_index, beam in enumerate(active):
-      top_indices = np.argsort(-step_log_probs[beam_index])[:beam_size]
-      for token_id in top_indices.tolist():
-        token_id = int(token_id)
-        candidates.append(
+    masked_log_probs = np.stack(
+      [
+        _mask_fairseq_step_log_probs(
+          step_log_probs[beam_index],
+          step=step,
+          max_len=max_len,
+          pad_id=pad_id,
+          eos_id=eos_id,
+        )
+        for beam_index in range(len(active_beams))
+      ],
+      axis=0,
+    )
+    cumulative_scores = masked_log_probs + np.asarray(
+      [beam.score for beam in active_beams],
+      dtype=np.float32,
+    )[:, None]
+    flat_scores = cumulative_scores.reshape(-1)
+    top_flat_indices = np.argsort(-flat_scores)[:min(2 * int(beam_size), flat_scores.size)]
+
+    candidates = []
+    vocab_size = cumulative_scores.shape[1]
+    for flat_index in top_flat_indices.tolist():
+      candidate_score = float(flat_scores[flat_index])
+      if not np.isfinite(candidate_score):
+        continue
+      beam_index, token_id = divmod(int(flat_index), int(vocab_size))
+      token_id = int(token_id)
+      candidates.append(
+        Seq2SeqBeamCandidate(
+          tokens=active_beams[beam_index].tokens + (token_id,),
+          score=candidate_score,
+          finished=bool(token_id == int(eos_id)),
+        )
+      )
+
+    for candidate in candidates[:int(beam_size)]:
+      if candidate.finished and len(finalized_beams) < int(beam_size):
+        finalized_beams.append(
           Seq2SeqBeamCandidate(
-            tokens=beam.tokens + (token_id,),
-            score=float(beam.score + step_log_probs[beam_index, token_id]),
-            finished=bool(token_id == int(eos_id)),
+            tokens=candidate.tokens,
+            score=float(
+              candidate.score / ((step + 1) ** _FAIRSEQ_DEFAULT_LEN_PENALTY)
+            ),
+            finished=True,
           )
         )
 
-    candidates.sort(key=lambda candidate: candidate.score, reverse=True)
-    beams = candidates[:beam_size]
-    if all(candidate.finished for candidate in beams):
+    if len(finalized_beams) == int(beam_size) or step == max_len:
       break
 
-  completed = [beam for beam in beams if beam.finished]
-  best = max(completed or beams, key=lambda candidate: candidate.score)
+    active_beams = [
+      Seq2SeqBeamCandidate(
+        tokens=candidate.tokens,
+        score=candidate.score,
+        finished=False,
+      )
+      for candidate in candidates
+      if not candidate.finished
+    ][:int(beam_size)]
+
+  best = max(finalized_beams or active_beams, key=lambda candidate: candidate.score)
   return np.asarray(best.tokens[1:], dtype=np.int32)
 
 
