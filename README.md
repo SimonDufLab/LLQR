@@ -8,6 +8,11 @@ It contains the main training entrypoint, config-driven experiment definitions, 
 - `run.py`: main Hydra-driven experiment runner and the authoritative runtime path
 - `run_single_layer_test.py`: toy analytical script for LLQR-style validation; audit before relying on it as a current regression path
 
+`run.py` treats `total_steps` as including one final eval sentinel. Due eval
+runs before same-step preconditioner maintenance or train updates, and the final
+`step == total_steps - 1` sentinel exits after eval without mutating model or
+preconditioner state.
+
 ## Config structure
 
 Experiments are composed from `configs/`.

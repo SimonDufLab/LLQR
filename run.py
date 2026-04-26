@@ -41,10 +41,16 @@ import lqr_optimizer._src.utils.utils as utl
 def should_run_periodic_event(*, step: int, total_steps: int, every: int) -> bool:
   """Skip expensive step-0 periodic work on multi-step runs.
 
-  Single-step runs such as `total_epochs=0` still keep the step-0 report/eval
-  surface because there is no later step to observe.
+  Single-step runs such as `total_epochs=0` still keep step-0 periodic
+  eligibility because there is no later step to observe. The training loop
+  separately skips mutating work on its final sentinel.
   """
   return (step % every == 0) and ((step != 0) or (total_steps == 1))
+
+
+def should_run_training_step(*, step: int, total_steps: int) -> bool:
+  """Return whether this loop step should mutate model or preconditioner state."""
+  return int(step) < int(total_steps) - 1
 
 
 def build_model_pair_from_dataset_info(*, architecture_name: str, num_classes: int, ds_info, architecture_cfg=None):
@@ -574,100 +580,8 @@ def main(cfg: DictConfig):
       )
       print(
         f"Checkpointing performed in: {timedelta(seconds=time.time() - chckpt_init_time)}")
-    # Possibly update the preconditioner every `update_preconditioner_every` steps
-    _update_precond_every = precond_up_sched(step)
-    if load_from_preexisting_model_state:
-      # trigger compilation
-      precond_lr = precond_lr_fn(step)
-      preconditioner.compile_precond_updater(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size,
-                                           other_model_variables={'batch_stats': state.batch_stats})
-      compile_route = preconditioner.describe_last_llqr_batch_update_route()
-      print(f"Compiled LLQR preconditioner update route: {compile_route}")
-      run["llqr_batch_compile_route"] = compile_route
-      load_from_preexisting_model_state = False
-    if (step % _update_precond_every) == 0 and cfg.use_preconditioner and step < cfg.update_preconditioner_until:
-      # The preconditioner update can be run on a mini-batch from the dataloader
-      # We do multiple steps (precond_steps) of "preconditioner training"
-      precond_update_start_time = time.time()
-      precond_lr = precond_lr_fn(step)
-      _ema_decay = ema_fn(step)
-      preconditioner.update_preconditioner(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size, _ema_decay,
-                                           other_model_variables={'batch_stats': state.batch_stats})
-      update_route = preconditioner.describe_last_llqr_batch_update_route()
-      if not logged_first_batch_update_route:
-        print(f"LLQR preconditioner update route at step {step}: {update_route}")
-        run["llqr_batch_first_update_route"] = update_route
-        logged_first_batch_update_route = True
-      if last_logged_batch_update_route != update_route:
-        if logged_first_batch_update_route and last_logged_batch_update_route is not None:
-          print(f"LLQR preconditioner update route changed at step {step}: {update_route}")
-        run["llqr_batch_last_update_route"] = update_route
-        last_logged_batch_update_route = dict(update_route)
-      precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
-      # !!Remove below when timing against non-2nd order methods!! (Affect computation time)
-      run.track(precond_max, name="Maximum across preconditioner", step=step)
-      run.track(precond_min, name="Minimum across preconditioner", step=step)
-      run.track(precond_norm, name="Preconditioner l2 norm", step=step)
-      for layer, l_norm in per_layer_norm.items():
-        run.track(l_norm, name=f"{layer} l2 norm", step=step)
-      print(f"Preconditioner was updated in {time.time()-precond_update_start_time:.2f} seconds")
 
-      # Asymmetry check
-      if cfg.measure_asymmetry:
-        skews_dict = preconditioner.get_precond_asymmetry()
-        for layer, layer_skews in skews_dict.items():
-          # layer_skews: List[Tuple[frob, spectral]]
-          if len(layer_skews) == 0:
-            continue
-
-          if len(layer_skews) == 1:
-            frob_skew, spectral_skew = layer_skews[0]
-            run.track(frob_skew, name=f"{layer}/frob skew", step=step)
-            run.track(spectral_skew, name=f"{layer}/spectral skew", step=step)
-          else:
-            for i, (frob_skew, spectral_skew) in enumerate(layer_skews, start=1):
-              run.track(
-                frob_skew,
-                name=f"{layer}/part {i}/frob skew",
-                step=step,
-              )
-              run.track(
-                spectral_skew,
-                name=f"{layer}/part {i}/spectral skew",
-                step=step,
-              )
-        avg_frob_skew, avg_spectral_skew = utl.average_skews(skews_dict)
-        run.track(avg_frob_skew, name="Average frob skew across preconditioner", step=step)
-        run.track(avg_spectral_skew, name="Average spectral skew across preconditioner", step=step)
-
-    # Grab the next batch for normal training
-    # x_batch, y_batch = next(dataloader)
-    #
-    dropout_key, consumed_key = jax.random.split(dropout_key)
-    state, loss, x_batch, y_batch = train_step(state, preconditioner.expose_blocks(), dataloader, consumed_key, step)
-
-    # Logging or testing every so often
-    if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.logging_freq):
-      # Simple logging
-      # train_loss = loss_eval(state, x_batch, y_batch)
-      train_loss = loss
-      elapsed_time = time.time() - start_time + prev_elapsed_time  # Calculate elapsed time
-      run.track(train_loss, name="train loss", step=step)
-      run.track(train_loss, name="train loss|t", step=elapsed_time*100)
-      # Compute batch accuracy
-      batch_accuracy, _ = compute_batch_accuracy(
-        state,
-        x_batch,
-        y_batch,
-        ignore_index=translation_target_pad_id,
-      )
-      train_accuracy_name = "train token_accuracy" if is_translation_task else "train accuracy"
-      run.track(batch_accuracy, name=train_accuracy_name, step=step)
-      run.track(batch_accuracy, name=f"{train_accuracy_name}|t", step=elapsed_time*100)
-      if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.report_freq):
-        # Print info
-        print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
-        print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
+    # Run due eval before any same-step preconditioner or parameter update.
     token_eval_due = should_run_periodic_event(
       step=step,
       total_steps=total_steps,
@@ -827,6 +741,104 @@ def main(cfg: DictConfig):
         print(f"Step {step} | Test Accuracy: {test_accuracy:.2f}%")
         print(f"Test accuracy across entire dataset computed in {time.time() - test_time_start:.2f} seconds")
         print("============================")
+
+    if not should_run_training_step(step=step, total_steps=total_steps):
+      continue
+
+    # Possibly update the preconditioner every `update_preconditioner_every` steps
+    _update_precond_every = precond_up_sched(step)
+    if load_from_preexisting_model_state:
+      # trigger compilation
+      precond_lr = precond_lr_fn(step)
+      preconditioner.compile_precond_updater(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size,
+                                           other_model_variables={'batch_stats': state.batch_stats})
+      compile_route = preconditioner.describe_last_llqr_batch_update_route()
+      print(f"Compiled LLQR preconditioner update route: {compile_route}")
+      run["llqr_batch_compile_route"] = compile_route
+      load_from_preexisting_model_state = False
+    if (step % _update_precond_every) == 0 and cfg.use_preconditioner and step < cfg.update_preconditioner_until:
+      # The preconditioner update can be run on a mini-batch from the dataloader
+      # We do multiple steps (precond_steps) of "preconditioner training"
+      precond_update_start_time = time.time()
+      precond_lr = precond_lr_fn(step)
+      _ema_decay = ema_fn(step)
+      preconditioner.update_preconditioner(state.params, dataloader, precond_lr, state.opt_state, cfg.precond_batch_size, _ema_decay,
+                                           other_model_variables={'batch_stats': state.batch_stats})
+      update_route = preconditioner.describe_last_llqr_batch_update_route()
+      if not logged_first_batch_update_route:
+        print(f"LLQR preconditioner update route at step {step}: {update_route}")
+        run["llqr_batch_first_update_route"] = update_route
+        logged_first_batch_update_route = True
+      if last_logged_batch_update_route != update_route:
+        if logged_first_batch_update_route and last_logged_batch_update_route is not None:
+          print(f"LLQR preconditioner update route changed at step {step}: {update_route}")
+        run["llqr_batch_last_update_route"] = update_route
+        last_logged_batch_update_route = dict(update_route)
+      precond_max, precond_min, precond_norm, per_layer_norm = preconditioner.get_stats()
+      # !!Remove below when timing against non-2nd order methods!! (Affect computation time)
+      run.track(precond_max, name="Maximum across preconditioner", step=step)
+      run.track(precond_min, name="Minimum across preconditioner", step=step)
+      run.track(precond_norm, name="Preconditioner l2 norm", step=step)
+      for layer, l_norm in per_layer_norm.items():
+        run.track(l_norm, name=f"{layer} l2 norm", step=step)
+      print(f"Preconditioner was updated in {time.time()-precond_update_start_time:.2f} seconds")
+
+      # Asymmetry check
+      if cfg.measure_asymmetry:
+        skews_dict = preconditioner.get_precond_asymmetry()
+        for layer, layer_skews in skews_dict.items():
+          # layer_skews: List[Tuple[frob, spectral]]
+          if len(layer_skews) == 0:
+            continue
+
+          if len(layer_skews) == 1:
+            frob_skew, spectral_skew = layer_skews[0]
+            run.track(frob_skew, name=f"{layer}/frob skew", step=step)
+            run.track(spectral_skew, name=f"{layer}/spectral skew", step=step)
+          else:
+            for i, (frob_skew, spectral_skew) in enumerate(layer_skews, start=1):
+              run.track(
+                frob_skew,
+                name=f"{layer}/part {i}/frob skew",
+                step=step,
+              )
+              run.track(
+                spectral_skew,
+                name=f"{layer}/part {i}/spectral skew",
+                step=step,
+              )
+        avg_frob_skew, avg_spectral_skew = utl.average_skews(skews_dict)
+        run.track(avg_frob_skew, name="Average frob skew across preconditioner", step=step)
+        run.track(avg_spectral_skew, name="Average spectral skew across preconditioner", step=step)
+
+    # Grab the next batch for normal training
+    # x_batch, y_batch = next(dataloader)
+    #
+    dropout_key, consumed_key = jax.random.split(dropout_key)
+    state, loss, x_batch, y_batch = train_step(state, preconditioner.expose_blocks(), dataloader, consumed_key, step)
+
+    # Logging or testing every so often
+    if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.logging_freq):
+      # Simple logging
+      # train_loss = loss_eval(state, x_batch, y_batch)
+      train_loss = loss
+      elapsed_time = time.time() - start_time + prev_elapsed_time  # Calculate elapsed time
+      run.track(train_loss, name="train loss", step=step)
+      run.track(train_loss, name="train loss|t", step=elapsed_time*100)
+      # Compute batch accuracy
+      batch_accuracy, _ = compute_batch_accuracy(
+        state,
+        x_batch,
+        y_batch,
+        ignore_index=translation_target_pad_id,
+      )
+      train_accuracy_name = "train token_accuracy" if is_translation_task else "train accuracy"
+      run.track(batch_accuracy, name=train_accuracy_name, step=step)
+      run.track(batch_accuracy, name=f"{train_accuracy_name}|t", step=elapsed_time*100)
+      if should_run_periodic_event(step=step, total_steps=total_steps, every=cfg.report_freq):
+        # Print info
+        print(f"Step {step} | Train Loss: {train_loss:.4f} | Time Elapsed: {elapsed_time:.2f} seconds")
+        print(f"Step {step} | Batch Accuracy: {batch_accuracy:.2f}%")
 
 
   print("Training complete!")
