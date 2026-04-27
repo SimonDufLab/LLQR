@@ -76,6 +76,19 @@ def track_translation_token_validation_metrics(
   run.track(valid_ppl, name="valid_ppl|t", step=time_step)
 
 
+def track_translation_bleu_internals(run, translation_metrics, *, step: int, full_eval: bool):
+  """Track fairseq-style BLEU internals for full validation BLEU only."""
+  if not full_eval:
+    return
+
+  for index, value in enumerate(translation_metrics["_bleu_counts"]):
+    run.track(int(value), name=f"_bleu_counts_{index}", step=step)
+  for index, value in enumerate(translation_metrics["_bleu_totals"]):
+    run.track(int(value), name=f"_bleu_totals_{index}", step=step)
+  run.track(int(translation_metrics["_bleu_sys_len"]), name="_bleu_sys_len", step=step)
+  run.track(int(translation_metrics["_bleu_ref_len"]), name="_bleu_ref_len", step=step)
+
+
 def build_model_pair_from_dataset_info(*, architecture_name: str, num_classes: int, ds_info, architecture_cfg=None):
   """Build `(train_model, inf_model, model_kwargs)` from dataset metadata."""
   model_kwargs = utl.resolve_model_init_kwargs(architecture_name, ds_info)
@@ -697,6 +710,12 @@ def main(cfg: DictConfig):
           run.track(valid_bleu, name=metric_name, step=step)
           run.track(valid_bleu, name=f"{metric_name}|t", step=elapsed_time*100)
           run.track(translation_metrics["num_examples"], name=f"{metric_name} examples", step=step)
+          track_translation_bleu_internals(
+            run,
+            translation_metrics,
+            step=step,
+            full_eval=bleu_is_full,
+          )
           if bleu_is_full:
             improved = utl.metric_improved(
               valid_bleu,
