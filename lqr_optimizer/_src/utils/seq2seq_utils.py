@@ -317,14 +317,41 @@ def build_translation_detokenizer(detok: str | None, *, target_lang: str):
   return lambda text: detokenizer.detokenize(text.split())
 
 
-def score_translation_bleu(hypotheses: Sequence[str], references: Sequence[str]) -> float:
+def _empty_translation_bleu_metrics() -> dict[str, Any]:
+  return {
+    "bleu": 0.0,
+    "_bleu_counts": [0, 0, 0, 0],
+    "_bleu_totals": [0, 0, 0, 0],
+    "_bleu_sys_len": 0,
+    "_bleu_ref_len": 0,
+  }
+
+
+def score_translation_bleu_with_internals(
+    hypotheses: Sequence[str],
+    references: Sequence[str],
+) -> dict[str, Any]:
   try:
     import sacrebleu
   except ImportError as exc:
     raise ImportError(
       "Translation BLEU scoring requires sacrebleu. Install it with `uv add sacrebleu`."
     ) from exc
-  return float(sacrebleu.corpus_bleu(list(hypotheses), [list(references)]).score)
+  if not hypotheses:
+    return _empty_translation_bleu_metrics()
+
+  bleu = sacrebleu.corpus_bleu(list(hypotheses), [list(references)])
+  return {
+    "bleu": float(bleu.score),
+    "_bleu_counts": [int(value) for value in bleu.counts],
+    "_bleu_totals": [int(value) for value in bleu.totals],
+    "_bleu_sys_len": int(bleu.sys_len),
+    "_bleu_ref_len": int(bleu.ref_len),
+  }
+
+
+def score_translation_bleu(hypotheses: Sequence[str], references: Sequence[str]) -> float:
+  return float(score_translation_bleu_with_internals(hypotheses, references)["bleu"])
 
 
 def _periodic_event_due(*, step: int, total_steps: int, every: int) -> bool:
@@ -707,7 +734,7 @@ def evaluate_translation_generation(
     dataloader.reset()
   if max_examples is not None and int(max_examples) <= 0:
     return {
-      "bleu": 0.0,
+      **_empty_translation_bleu_metrics(),
       "hypotheses": [],
       "references": [],
       "sample_hypothesis": None,
@@ -799,7 +826,7 @@ def evaluate_translation_generation(
 
   if not hypotheses:
     return {
-      "bleu": 0.0,
+      **_empty_translation_bleu_metrics(),
       "hypotheses": hypotheses,
       "references": references,
       "sample_hypothesis": sample_hypothesis,
@@ -808,7 +835,7 @@ def evaluate_translation_generation(
     }
 
   return {
-    "bleu": score_translation_bleu(hypotheses, references),
+    **score_translation_bleu_with_internals(hypotheses, references),
     "hypotheses": hypotheses,
     "references": references,
     "sample_hypothesis": sample_hypothesis,
