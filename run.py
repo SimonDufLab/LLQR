@@ -64,13 +64,16 @@ def track_translation_token_validation_metrics(
 ):
   """Track translation token validation metrics, including fairseq NLL bits/token."""
   valid_nll_loss_bits = float(valid_loss) / math.log(2.0)
+  valid_ppl = 2.0 ** valid_nll_loss_bits
   time_step = elapsed_time * 100
   run.track(valid_accuracy, name="valid token_accuracy", step=step)
   run.track(valid_loss, name="valid loss", step=step)
   run.track(valid_nll_loss_bits, name="valid_nll_loss", step=step)
+  run.track(valid_ppl, name="valid_ppl", step=step)
   run.track(valid_accuracy, name="valid token_accuracy|t", step=time_step)
   run.track(valid_loss, name="valid loss|t", step=time_step)
   run.track(valid_nll_loss_bits, name="valid_nll_loss|t", step=time_step)
+  run.track(valid_ppl, name="valid_ppl|t", step=time_step)
 
 
 def build_model_pair_from_dataset_info(*, architecture_name: str, num_classes: int, ds_info, architecture_cfg=None):
