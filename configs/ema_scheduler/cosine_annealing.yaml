@@ -1,5 +1,5 @@
 name: cosine_annealing
 
-t_max: 55
+t_max: 133
 eta_min: 0.925
 cycle: false
