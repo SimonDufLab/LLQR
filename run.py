@@ -54,6 +54,32 @@ def should_run_training_step(*, step: int, total_steps: int) -> bool:
   return int(step) < int(total_steps) - 1
 
 
+def ema_schedule_is_decreasing(cfg: DictConfig) -> bool:
+  """Return whether the configured EMA schedule decreases from cfg.ema_decay."""
+  scheduler_name = OmegaConf.select(cfg, "ema_scheduler.name")
+  if scheduler_name in (None, "constant"):
+    return False
+  ema_decay = OmegaConf.select(cfg, "ema_decay")
+  endpoint = OmegaConf.select(cfg, "ema_scheduler.eta_min")
+  if ema_decay is None or endpoint is None:
+    return False
+  return float(ema_decay) > float(endpoint)
+
+
+def warn_if_ema_schedule_decreases(cfg: DictConfig) -> bool:
+  if not ema_schedule_is_decreasing(cfg):
+    return False
+  scheduler_name = OmegaConf.select(cfg, "ema_scheduler.name")
+  ema_decay = float(OmegaConf.select(cfg, "ema_decay"))
+  endpoint = float(OmegaConf.select(cfg, "ema_scheduler.eta_min"))
+  print(
+    "Warning: EMA decay schedule is decreasing: "
+    f"ema_scheduler={scheduler_name}, ema_decay={ema_decay}, "
+    f"eta_min={endpoint}."
+  )
+  return True
+
+
 def track_translation_token_validation_metrics(
     run,
     *,
@@ -136,6 +162,7 @@ def build_translation_next_log_probs_fn(*, model, state):
 @hydra.main(config_path="configs", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
   assert 0.0 <= cfg.ema_decay <= 1.0, f"cfg.ema_decay ({cfg.ema_decay}) must be in [0, 1]"
+  warn_if_ema_schedule_decreases(cfg)
   # Print the loaded config
   print(OmegaConf.to_yaml(cfg))
   experiment_name = cfg.dataset.name + "_" + cfg.architecture.name

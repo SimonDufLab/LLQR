@@ -41,6 +41,7 @@ The translation surface is now intentionally narrow but public:
 
 - routed architecture: `transformer-iwslt-de-en`
 - public experiment preset: `transformer-iwslt14-de-en`
+- EMA-cosine preset variant: `transformer-iwslt14-de-en-ema-cosine0925`, which keeps the same translation recipe but sets `ema_scheduler=cosine_annealing` with endpoint `0.925` and starts from the user-overridable `ema_decay`
 - expected loader contract: `dataset.loader=local_seq2seq_text`
 - batch contract: `x=(src_tokens, prev_output_tokens)` and `y=target_tokens_flat`, with the train loader allowed to pad the flattened target tail using `pad_id` so JAX train-step shapes stay compile-stable
 - preconditioner contract: translation LLQR updates now preserve a loader-provided canonical padded seq2seq signature for both `full_batch` and `chunked_lqr_segment`, while route diagnostics report the separate live target-token count for weighting and debugging
