@@ -142,6 +142,10 @@ For Kronecker-style preconditioners, the current maintained transformer support 
   mixed-layout rule for `tok_embed` and `lm_head`, and it now also applies the
   same diagonal-left embedding rule to translation embeddings such as IWSLT14
   `src_embedding` and `tgt_embedding`
+- `sep-e-kfac`, `psd-e-kfac`, and `psd-sep-e-kfac` use the same active-path
+  streamed vector preparation and exact block-parameter pullback contract as
+  plain `e-kfac`, with PSD variants chaining through their squared raw
+  diagonal parameters
 - the maintained local validation note for that surface is
   `../tmp/benchmarks/llqr-embedding-aware-ekfac-smoke/README.md`
 
@@ -189,7 +193,7 @@ The `resnet18-cifar10` comparison remains an external-only higher-memory follow-
 - `lqr_optimizer/_src/utils/dataloaders/iwslt14_de_en.py`: fairseq-faithful local IWSLT14 text loader with separate source and target dictionaries, flat numeric caches, and token-budget training batches whose formed batch order is reshuffled each epoch
 - `lqr_optimizer/_src/models/transformer_iwslt.py`: fairseq-style IWSLT14 German-to-English encoder-decoder Transformer with explicit train/inference variants and LLQR segment metadata
 - `lqr_optimizer/_src/models/`: architecture definitions
-- `lqr_optimizer/_src/block_matrices_approx/`: structured inverse-preconditioner parameterizations, including the shared Kronecker/EKFAC rank-3 kernel-layout helper and the historically named embedding-aware `e-kfac-gpt` variant
+- `lqr_optimizer/_src/block_matrices_approx/`: structured inverse-preconditioner parameterizations, including the shared Kronecker/EKFAC rank-3 kernel-layout helper, optimized EKFAC-family block pullbacks, and the historically named embedding-aware `e-kfac-gpt` variant
 
 ## Further documentation
 

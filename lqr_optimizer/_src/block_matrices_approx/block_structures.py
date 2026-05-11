@@ -1157,6 +1157,26 @@ class EKFACBlock(KroneckerBlock):
     # Back-transform
     return (Q_A @ X_hat_scaled) @ Q_G.T
 
+  @staticmethod
+  def _ekfac_effective_diag_pullback(q_a: jnp.ndarray,
+                                     q_g: jnp.ndarray,
+                                     d_eff: jnp.ndarray,
+                                     x_matrix: jnp.ndarray,
+                                     output_cotangent_component: jnp.ndarray):
+    """Pull back through QA @ (d_eff * (QA.T @ X @ QG)) @ QG.T."""
+    g_matrix = output_cotangent_component.reshape(x_matrix.shape)
+    d_matrix = d_eff.reshape(x_matrix.shape)
+
+    x_hat = (q_a.T @ x_matrix) @ q_g
+    grad_z = (q_a.T @ g_matrix) @ q_g
+    grad_x_hat = d_matrix * grad_z
+    z_matrix = d_matrix * x_hat
+
+    grad_q_a = g_matrix @ q_g @ z_matrix.T + (x_matrix @ q_g) @ grad_x_hat.T
+    grad_q_g = g_matrix.T @ q_a @ z_matrix + (x_matrix.T @ q_a) @ grad_x_hat
+    grad_d_eff = grad_z * x_hat
+    return grad_q_a, grad_q_g, grad_d_eff
+
   def train_matrix_product(self, blocks, vectors):
     product_dict = {}
     for layer_name, layer_vectors in vectors.items():
@@ -1225,7 +1245,6 @@ class EKFACBlock(KroneckerBlock):
     if any(k in component_name for k in KERNEL_KEYS):
       blk = block_component
       x_matrix = prepared_component
-      g_matrix = output_cotangent_component.reshape(x_matrix.shape)
 
       if len(blk) == 3:
         q_a, q_g, inv_diag = blk
@@ -1239,14 +1258,9 @@ class EKFACBlock(KroneckerBlock):
       if alpha is not None:
         d_eff = alpha.astype(x_matrix.dtype) * d_eff
 
-      x_hat = (q_a.T @ x_matrix) @ q_g
-      grad_z = (q_a.T @ g_matrix) @ q_g
-      grad_x_hat = (d_eff.reshape(x_matrix.shape) * grad_z)
-      z_matrix = (d_eff * x_hat.reshape(-1)).reshape(x_matrix.shape)
-
-      grad_q_a = g_matrix @ q_g @ z_matrix.T + (x_matrix @ q_g) @ grad_x_hat.T
-      grad_q_g = g_matrix.T @ q_a @ z_matrix + (x_matrix.T @ q_a) @ grad_x_hat
-      grad_d_eff = grad_z * x_hat
+      grad_q_a, grad_q_g, grad_d_eff = self._ekfac_effective_diag_pullback(
+        q_a, q_g, d_eff, x_matrix, output_cotangent_component
+      )
 
       if alpha is None:
         return grad_q_a, grad_q_g, grad_d_eff.reshape(inv_diag.shape)
@@ -1736,10 +1750,76 @@ class SeparableEKFACBlock(EKFACBlock):
     return product_dict
 
   def prepare_train_vectors(self, vectors):
-    return BlockStructures.prepare_train_vectors(self, vectors)
+    return EKFACBlock.prepare_train_vectors(self, vectors)
 
   def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
-    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
+    layer_blocks = blocks[layer_name]
+    flat_parts = []
+    for component, vec_component in prepared_layer_vector.items():
+      if any(k in component for k in KERNEL_KEYS):
+        QA, QG, a, g = layer_blocks[component]
+        a_eff = a.astype(vec_component.dtype)
+        g_eff = g.astype(vec_component.dtype)
+        AX = _apply_QdiagQt(QA, a_eff, vec_component)
+        out2d = _apply_QdiagQt(QG, g_eff, AX.T).T
+        flat_parts.append(jnp.ravel(out2d))
+      elif any(k in component for k in BIAS_KEYS):
+        diag = layer_blocks[component]
+        flat_parts.append(jnp.ravel(diag * vec_component))
+      else:
+        raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+    if len(flat_parts) == 1:
+      return flat_parts[0]
+    return jnp.concatenate(flat_parts)
+
+  @staticmethod
+  def _separable_effective_pullback(q_a, q_g, a_eff, g_eff, x_matrix, output_cotangent_component):
+    d_eff = (a_eff[:, None] * g_eff[None, :]).reshape(-1)
+    grad_q_a, grad_q_g, grad_d_eff = EKFACBlock._ekfac_effective_diag_pullback(
+      q_a, q_g, d_eff, x_matrix, output_cotangent_component
+    )
+    grad_d_matrix = grad_d_eff.reshape(x_matrix.shape)
+    grad_a_eff = jnp.sum(grad_d_matrix * g_eff[None, :], axis=1)
+    grad_g_eff = jnp.sum(grad_d_matrix * a_eff[:, None], axis=0)
+    return grad_q_a, grad_q_g, grad_a_eff, grad_g_eff
+
+  def _separable_component_pullback(self, component_name, block_component, prepared_component,
+                                    output_cotangent_component):
+    if any(k in component_name for k in KERNEL_KEYS):
+      q_a, q_g, a, g = block_component
+      x_matrix = prepared_component
+      a_eff = a.astype(x_matrix.dtype)
+      g_eff = g.astype(x_matrix.dtype)
+      return self._separable_effective_pullback(
+        q_a, q_g, a_eff, g_eff, x_matrix, output_cotangent_component
+      )
+
+    if any(k in component_name for k in BIAS_KEYS):
+      return output_cotangent_component * prepared_component
+
+    raise ValueError(f"Unknown separable EKFAC component type {component_name}")
+
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    layer_blocks = blocks[layer_name]
+    output_cotangent_flat = jnp.ravel(jnp.atleast_1d(output_cotangent_flat))
+    offset = 0
+    layer_grads = {}
+
+    for component, vec_component in prepared_layer_vector.items():
+      component_size = vec_component.size
+      component_cotangent = output_cotangent_flat[offset:offset + component_size]
+      layer_grads[component] = self._separable_component_pullback(
+        component, layer_blocks[component], vec_component, component_cotangent
+      )
+      offset += component_size
+
+    if offset != output_cotangent_flat.size:
+      raise ValueError(
+        f"Output cotangent size mismatch for layer {layer_name}: consumed {offset}, "
+        f"received {output_cotangent_flat.size}"
+      )
+    return layer_grads
 
 
 # -----------------------------
@@ -1857,10 +1937,63 @@ class PSDEKFACBlock(EKFACBlock):
     return product_dict
 
   def prepare_train_vectors(self, vectors):
-    return BlockStructures.prepare_train_vectors(self, vectors)
+    return EKFACBlock.prepare_train_vectors(self, vectors)
 
   def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
-    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
+    layer_blocks = blocks[layer_name]
+    flat_parts = []
+    for component, vec_component in prepared_layer_vector.items():
+      if any(k in component for k in KERNEL_KEYS):
+        QA, QG, raw_s = layer_blocks[component]
+        out2d = _ekfac_apply_psd(QA, QG, raw_s, vec_component, eps=self._eps)
+        flat_parts.append(jnp.ravel(out2d))
+      elif any(k in component for k in BIAS_KEYS):
+        diag = layer_blocks[component]
+        flat_parts.append(jnp.ravel(diag * vec_component))
+      else:
+        raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+    if len(flat_parts) == 1:
+      return flat_parts[0]
+    return jnp.concatenate(flat_parts)
+
+  def _psd_ekfac_component_pullback(self, component_name, block_component, prepared_component,
+                                    output_cotangent_component):
+    if any(k in component_name for k in KERNEL_KEYS):
+      q_a, q_g, raw_s = block_component
+      x_matrix = prepared_component
+      d_eff = _psd_diag_from_raw(raw_s, self._eps).astype(x_matrix.dtype)
+      grad_q_a, grad_q_g, grad_d_eff = self._ekfac_effective_diag_pullback(
+        q_a, q_g, d_eff, x_matrix, output_cotangent_component
+      )
+      grad_raw_s = 2.0 * raw_s * grad_d_eff.reshape(raw_s.shape)
+      return grad_q_a, grad_q_g, grad_raw_s
+
+    if any(k in component_name for k in BIAS_KEYS):
+      return output_cotangent_component * prepared_component
+
+    raise ValueError(f"Unknown PSD EKFAC component type {component_name}")
+
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    layer_blocks = blocks[layer_name]
+    output_cotangent_flat = jnp.ravel(jnp.atleast_1d(output_cotangent_flat))
+    offset = 0
+    layer_grads = {}
+
+    for component, vec_component in prepared_layer_vector.items():
+      component_size = vec_component.size
+      component_cotangent = output_cotangent_flat[offset:offset + component_size]
+      layer_grads[component] = self._psd_ekfac_component_pullback(
+        component, layer_blocks[component], vec_component, component_cotangent
+      )
+      offset += component_size
+
+    if offset != output_cotangent_flat.size:
+      raise ValueError(
+        f"Output cotangent size mismatch for layer {layer_name}: consumed {offset}, "
+        f"received {output_cotangent_flat.size}"
+      )
+    return layer_grads
 
 
 class PSDSeparableEKFACBlock(EKFACBlock):
@@ -1953,10 +2086,68 @@ class PSDSeparableEKFACBlock(EKFACBlock):
     return product_dict
 
   def prepare_train_vectors(self, vectors):
-    return BlockStructures.prepare_train_vectors(self, vectors)
+    return EKFACBlock.prepare_train_vectors(self, vectors)
 
   def train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector):
-    return BlockStructures.train_matrix_product_flat_layer(self, blocks, layer_name, prepared_layer_vector)
+    layer_blocks = blocks[layer_name]
+    flat_parts = []
+    for component, vec_component in prepared_layer_vector.items():
+      if any(k in component for k in KERNEL_KEYS):
+        QA, QG, raw_a, raw_g = layer_blocks[component]
+        a = _psd_from_raw(raw_a, self._eps).astype(vec_component.dtype)
+        g = _psd_from_raw(raw_g, self._eps).astype(vec_component.dtype)
+        AX = _apply_QdiagQt(QA, a, vec_component)
+        out2d = _apply_QdiagQt(QG, g, AX.T).T
+        flat_parts.append(jnp.ravel(out2d))
+      elif any(k in component for k in BIAS_KEYS):
+        diag = layer_blocks[component]
+        flat_parts.append(jnp.ravel(diag * vec_component))
+      else:
+        raise ValueError(f"Unknown block type for {component} in layer {layer_name}")
+
+    if len(flat_parts) == 1:
+      return flat_parts[0]
+    return jnp.concatenate(flat_parts)
+
+  def _psd_separable_component_pullback(self, component_name, block_component, prepared_component,
+                                        output_cotangent_component):
+    if any(k in component_name for k in KERNEL_KEYS):
+      q_a, q_g, raw_a, raw_g = block_component
+      x_matrix = prepared_component
+      a_eff = _psd_from_raw(raw_a, self._eps).astype(x_matrix.dtype)
+      g_eff = _psd_from_raw(raw_g, self._eps).astype(x_matrix.dtype)
+      grad_q_a, grad_q_g, grad_a_eff, grad_g_eff = SeparableEKFACBlock._separable_effective_pullback(
+        q_a, q_g, a_eff, g_eff, x_matrix, output_cotangent_component
+      )
+      grad_raw_a = 2.0 * raw_a * grad_a_eff.reshape(raw_a.shape)
+      grad_raw_g = 2.0 * raw_g * grad_g_eff.reshape(raw_g.shape)
+      return grad_q_a, grad_q_g, grad_raw_a, grad_raw_g
+
+    if any(k in component_name for k in BIAS_KEYS):
+      return output_cotangent_component * prepared_component
+
+    raise ValueError(f"Unknown PSD separable EKFAC component type {component_name}")
+
+  def preconditioner_param_pullback_flat_layer(self, blocks, layer_name, prepared_layer_vector, output_cotangent_flat):
+    layer_blocks = blocks[layer_name]
+    output_cotangent_flat = jnp.ravel(jnp.atleast_1d(output_cotangent_flat))
+    offset = 0
+    layer_grads = {}
+
+    for component, vec_component in prepared_layer_vector.items():
+      component_size = vec_component.size
+      component_cotangent = output_cotangent_flat[offset:offset + component_size]
+      layer_grads[component] = self._psd_separable_component_pullback(
+        component, layer_blocks[component], vec_component, component_cotangent
+      )
+      offset += component_size
+
+    if offset != output_cotangent_flat.size:
+      raise ValueError(
+        f"Output cotangent size mismatch for layer {layer_name}: consumed {offset}, "
+        f"received {output_cotangent_flat.size}"
+      )
+    return layer_grads
 
 
 # -----------------------------
