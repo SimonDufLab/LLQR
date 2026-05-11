@@ -80,6 +80,45 @@ def warn_if_ema_schedule_decreases(cfg: DictConfig) -> bool:
   return True
 
 
+def perturbation_rho_scheduler_is_active(cfg: DictConfig) -> bool:
+  scheduler_name = OmegaConf.select(cfg, "perturbation_rho_scheduler.name")
+  return scheduler_name not in (None, "constant")
+
+
+def warn_if_perturbation_rho_scheduler_delayed_by_start_sam(cfg: DictConfig) -> bool:
+  sam_mode = OmegaConf.select(cfg, "sam_mode")
+  if sam_mode in (None, "") or not perturbation_rho_scheduler_is_active(cfg):
+    return False
+  start_step = OmegaConf.select(cfg, "start_sam_after_step")
+  try:
+    start_step = int(start_step)
+  except (TypeError, ValueError):
+    return False
+  if start_step <= 0:
+    return False
+  print(
+    "Warning: perturbation_rho_scheduler is active with "
+    f"start_sam_after_step={start_step} and sam_mode={sam_mode!r}; "
+    "start_sam_after_step takes precedence and delays active SAM updates."
+  )
+  return True
+
+
+def build_perturbation_rho_schedule(cfg: DictConfig, *, steps_per_epoch: float):
+  if perturbation_rho_scheduler_is_active(cfg):
+    rho_sched_kwargs = {
+      _key:_value for _key, _value in cfg.perturbation_rho_scheduler.items()
+      if _key != 'name'
+    }
+    return lr_schedule_choice[cfg.perturbation_rho_scheduler.name](
+      base_lr=cfg.perturbation_rho,
+      total_epochs=cfg.total_epochs,
+      steps_per_epoch=steps_per_epoch,
+      **rho_sched_kwargs,
+    )
+  return lambda _: cfg.perturbation_rho
+
+
 def track_translation_token_validation_metrics(
     run,
     *,
@@ -163,6 +202,7 @@ def build_translation_next_log_probs_fn(*, model, state):
 def main(cfg: DictConfig):
   assert 0.0 <= cfg.ema_decay <= 1.0, f"cfg.ema_decay ({cfg.ema_decay}) must be in [0, 1]"
   warn_if_ema_schedule_decreases(cfg)
+  warn_if_perturbation_rho_scheduler_delayed_by_start_sam(cfg)
   # Print the loaded config
   print(OmegaConf.to_yaml(cfg))
   experiment_name = cfg.dataset.name + "_" + cfg.architecture.name
@@ -402,6 +442,11 @@ def main(cfg: DictConfig):
   else:
     ema_fn = lambda _: cfg.ema_decay
 
+  perturbation_rho_fn = build_perturbation_rho_schedule(
+    cfg,
+    steps_per_epoch=steps_per_epoch,
+  )
+
   # Optional: schedule on how often the preconditioner is updated:
   if cfg.precond_update_scheduler and cfg.precond_update_scheduler.name != "constant":
     precond_update_sched_kwargs = {_key:_value for _key, _value in cfg.precond_update_scheduler.items() if _key!='name'}
@@ -580,6 +625,7 @@ def main(cfg: DictConfig):
     apply_training_update=apply_configured_training_update,
     apply_vanilla_training_update=apply_vanilla_training_update,
     precond_apply_fn=precond_apply_fn,
+    perturbation_rho_fn=perturbation_rho_fn,
   )
 
   def train_step(state, precond_blocks, train_dataloader, dropout_key, step):

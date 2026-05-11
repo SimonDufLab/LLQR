@@ -116,7 +116,10 @@ def build_train_step_jit(
     apply_training_update,
     apply_vanilla_training_update,
     precond_apply_fn,
+    perturbation_rho_fn=None,
 ):
+  if perturbation_rho_fn is None:
+    perturbation_rho_fn = lambda _: cfg.perturbation_rho
   sam_mode = _normalize_sam_mode(cfg.sam_mode)
   builders = {
     None: _build_no_sam_train_step,
@@ -140,8 +143,11 @@ def build_train_step_jit(
   start_sam_after_step = _resolve_start_sam_after_step(cfg)
   if sam_mode is None or start_sam_after_step == 0:
     def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key, *, step=None):
-      del step
-      return sam_train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key)
+      schedule_step = 0 if step is None else step
+      perturbation_rho = perturbation_rho_fn(schedule_step)
+      return sam_train_step_jit(
+        state, precond_blocks, x_acc, y_acc, dropout_key, perturbation_rho
+      )
 
     return train_step_jit
 
@@ -154,9 +160,15 @@ def build_train_step_jit(
   )
 
   def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key, *, step=None):
+    schedule_step = 0 if step is None else step
+    perturbation_rho = perturbation_rho_fn(schedule_step)
     if step is None or int(step) >= start_sam_after_step:
-      return sam_train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key)
-    return no_sam_train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key)
+      return sam_train_step_jit(
+        state, precond_blocks, x_acc, y_acc, dropout_key, perturbation_rho
+      )
+    return no_sam_train_step_jit(
+      state, precond_blocks, x_acc, y_acc, dropout_key, perturbation_rho
+    )
 
   return train_step_jit
 
@@ -172,7 +184,8 @@ def _build_no_sam_train_step(
   del cfg, apply_vanilla_training_update, precond_apply_fn
 
   @jax.jit
-  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key, perturbation_rho):
+    del perturbation_rho
     mean_loss, mean_grads, final_batch_stats, key_out = accumulate_grads(
       state.params, state.batch_stats, dropout_key, x_acc, y_acc
     )
@@ -200,7 +213,7 @@ def _build_base_sam_train_step(
   )
 
   @jax.jit
-  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key, perturbation_rho):
     mean_loss_center, mean_grads_center, _, key_after_center = accumulate_grads(
       state.params, state.batch_stats, dropout_key, x_acc, y_acc
     )
@@ -219,7 +232,7 @@ def _build_base_sam_train_step(
       precond_blocks=precond_blocks,
       vector=perturbation_vector,
       precond_apply_fn=precond_apply_fn,
-      rho=cfg.perturbation_rho,
+      rho=perturbation_rho,
       mode=cfg.perturb_mode,
       norm_mode=cfg.norm_mode,
       eps=cfg.gbar_eps,
@@ -272,7 +285,7 @@ def _build_asam_train_step(
   )
 
   @jax.jit
-  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key, perturbation_rho):
     mean_loss_center, mean_grads_center, _, key_after_center = accumulate_grads(
       state.params, state.batch_stats, dropout_key, x_acc, y_acc
     )
@@ -280,7 +293,7 @@ def _build_asam_train_step(
     eps_tree = utl.make_asam_perturbation_from_grad(
       params=state.params,
       grad=mean_grads_center,
-      rho=cfg.perturbation_rho,
+      rho=perturbation_rho,
       eta=cfg.asam_eta,
     )
 
@@ -321,14 +334,14 @@ def _build_fisher_sam_train_step(
   del apply_training_update, precond_apply_fn
 
   @jax.jit
-  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key, perturbation_rho):
     mean_loss_center, mean_grads_center, _, key_after_center = accumulate_grads(
       state.params, state.batch_stats, dropout_key, x_acc, y_acc
     )
 
     eps_tree = utl.make_fisher_sam_perturbation_from_grad(
       grad=mean_grads_center,
-      rho=cfg.perturbation_rho,
+      rho=perturbation_rho,
       eta=cfg.fisher_sam_eta,
     )
 
@@ -374,13 +387,13 @@ def _build_past_fsam_train_step(
   )
 
   @jax.jit
-  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key, perturbation_rho):
     eps_tree = utl.make_perturbation_from_noise(
       precond_blocks=precond_blocks,
       g_last=state.g_last,
       g_bar=state.gbar,
       precond_apply_fn=precond_apply_fn,
-      rho=cfg.perturbation_rho,
+      rho=perturbation_rho,
       mode=cfg.perturb_mode,
       norm_mode=cfg.norm_mode,
       eps=cfg.gbar_eps,
@@ -431,7 +444,7 @@ def _build_base_fsam_train_step(
   )
 
   @jax.jit
-  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key):
+  def train_step_jit(state, precond_blocks, x_acc, y_acc, dropout_key, perturbation_rho):
     mean_loss_center, mean_grads_center, _, key_after_center = accumulate_grads(
       state.params, state.batch_stats, dropout_key, x_acc, y_acc
     )
@@ -450,7 +463,7 @@ def _build_base_fsam_train_step(
       precond_blocks=precond_blocks,
       vector=perturbation_vector,
       precond_apply_fn=precond_apply_fn,
-      rho=cfg.perturbation_rho,
+      rho=perturbation_rho,
       mode=cfg.perturb_mode,
       norm_mode=cfg.norm_mode,
       eps=cfg.gbar_eps,

@@ -46,8 +46,9 @@ The translation surface is now intentionally narrow but public:
 - batch contract: `x=(src_tokens, prev_output_tokens)` and `y=target_tokens_flat`, with the train loader allowed to pad the flattened target tail using `pad_id` so JAX train-step shapes stay compile-stable
 - preconditioner contract: translation LLQR updates now preserve a loader-provided canonical padded seq2seq signature for both `full_batch` and `chunked_lqr_segment`, while route diagnostics report the separate live target-token count for weighting and debugging
 - model defaults: fairseq-style 6 encoder layers, 6 decoder layers, embed dim `512`, FFN dim `1024`, heads `4`, `relu`, pad-aware sinusoidal positions, fairseq-scaled Q/K/V attention initialization with standard Xavier output projections, and tied decoder input/output embeddings
-- public recipe surface: `main_optimizer=adamw`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=1e-4`, `total_epochs=55`, `architecture.dropout=0.3`, `label_smoothing=0.1`, `dataset.max_tokens=4096`, and a conservative default of LLQR `full_batch` seq2seq updates
+- public recipe surface: `main_optimizer=adamw`, `adam_betas=[0.9, 0.98]`, `lr_scheduler=inverse_sqrt`, `learning_rate=5e-4`, `weight_decay=1e-4`, `total_epochs=133`, `architecture.dropout=0.3`, `label_smoothing=0.1`, `dataset.max_tokens=16384`, and a conservative default of LLQR `full_batch` seq2seq updates
 - SAM policy for this preset: `start_sam_after_step=4000`, aligned with inverse-sqrt `warmup_updates`, so any non-null `sam_mode` begins active SAM updates only after LR warmup completes
+- optional IWSLT14 SAM rho schedule: select `perturbation_rho_scheduler=iwslt14_cosine_ramp_step_increase` with a non-null `sam_mode`; this holds `rho=0.005` through step `4000`, cosine-ramps to `0.2` by step `150000`, then adds `0.05` at step `200000` and every following `50000` steps
 - public eval surface: token validation logs `valid loss` in nats/token, `valid_nll_loss` in fairseq-comparable bits/token, and `valid_ppl = 2 ** valid_nll_loss`; batched beam-search generation uses `beam_size=5`, fairseq-compatible padded-source-width `max_len=1.2*src_len+10`, PAD suppression, `min_len=1` step-0 EOS suppression, top-`2 * beam_size` candidate handling, forced final EOS, length-normalized finalized scoring, `@@ ` BPE removal, Moses detokenization, sacreBLEU scoring, sampled periodic BLEU logged as `valid bleu_sampled`, full BLEU logged as `valid bleu` plus fairseq-style `_bleu_counts_0..3`, `_bleu_totals_0..3`, `_bleu_sys_len`, and `_bleu_ref_len`, and full BLEU-routed best-checkpoint snapshots when `preempt_handling=true`
 - current boundary: generation uses fixed-shape JIT full-prefix beam search without an incremental decoder cache; fixed `next_log_probs_fn` input signatures during decode are part of the contract; periodic BLEU is capped by default and full BLEU is final-only unless `translation_eval.full_eval_freq` is set; translation also keeps `llqr_batch_update_mode=full_batch` as the default preset, while `chunked_lqr_segment` is supported only for `llqr_second_order_mode=batched_exact` and translation `sample_separable_exact` remains intentionally unsupported because the final readout flattens away a stable per-sample output axis
 - maintained validation note: `../tmp/benchmarks/llqr-iwslt14-de-en-translation-smokes/README.md`
@@ -110,6 +111,7 @@ The current public SAM configuration surface is:
 - `sam_mode`: perturbation source selector; current supported values are `null`, `base_sam`, `base_fsam`, `past_fsam`, `asam`, and `fisher_sam`
 - `start_sam_after_step`: optional non-negative step threshold; `null` and `0` preserve immediate SAM behavior, while positive values delay active SAM updates until step `>= start_sam_after_step`
 - `perturbation_rho`: perturbation magnitude
+- `perturbation_rho_scheduler`: optional Hydra scheduler group for step-varying perturbation magnitude; `constant` preserves scalar `perturbation_rho`
 - `asam_eta`: canonical ASAM stability offset on non-bias parameters; default `0.01`
 - `fisher_sam_eta`: canonical Fisher-SAM additive inverse-Fisher diagonal regularizer; default `0.1`
 - `sam_use_preconditioner_on_update`: for supported non-null SAM modes, keep the configured LLQR-backed outer update when `true` and force a vanilla outer update when `false`; default `true`
@@ -118,7 +120,8 @@ The current public SAM configuration surface is:
 
 Current runtime semantics:
 - `sam_mode=null` disables perturbation and treats `sam_use_preconditioner_on_update` as inert
-- before a positive `start_sam_after_step` threshold, active SAM modes use the ordinary non-SAM configured update route rather than a SAM perturbation/update
+- before a positive `start_sam_after_step` threshold, active SAM modes use the ordinary non-SAM configured update route rather than a SAM perturbation/update; if a non-constant `perturbation_rho_scheduler` is also selected, `start_sam_after_step` takes precedence over the scheduled rho value until active SAM begins
+- when `perturbation_rho_scheduler` is non-constant and `sam_mode` is non-null, active SAM train steps receive the scheduled global-step rho value instead of the scalar `perturbation_rho`
 - `base_sam` perturbs from the current gradient and leaves `gbar` / `g_last` untouched
 - `base_fsam` perturbs from `g_current - gbar`
 - `past_fsam` preserves the rolling-buffer variant used before the rename
@@ -127,7 +130,7 @@ Current runtime semantics:
 - `base_sam`, `base_fsam`, `past_fsam`, and `asam` follow `sam_use_preconditioner_on_update` for the outer parameter update; a true LLQR perturbation-only ablation still requires a legacy LLQR-backed perturbation mode such as `perturb_mode=ema_precond_grad` or `ema_direction`
 - canonical `asam` requires neutral `perturb_mode` and `norm_mode`; `sam_research_*`, `gbar_beta`, and `gbar_eps` are ignored by this mode
 - canonical `fisher_sam` requires neutral `perturb_mode` and `norm_mode`, ignores `sam_research_*`, `gbar_beta`, and `gbar_eps`, and intentionally treats `sam_use_preconditioner_on_update` as inert in favor of the vanilla optimizer update
-- `run.py` now delegates mode-specific train-step orchestration to `lqr_optimizer/_src/utils/sam_mode_handlers.py`, while `lqr_optimizer/_src/utils/utils.py` keeps the generic perturbation, canonical ASAM, canonical Fisher-SAM, and buffer helpers
+- `run.py` now delegates mode-specific train-step orchestration to `lqr_optimizer/_src/utils/sam_mode_handlers.py`, while `lqr_optimizer/_src/utils/utils.py` keeps the generic perturbation, canonical ASAM, canonical Fisher-SAM, scheduler, and buffer helpers
 
 For Kronecker-style preconditioners, the current maintained transformer support is:
 

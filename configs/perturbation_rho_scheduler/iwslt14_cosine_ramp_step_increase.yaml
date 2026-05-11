@@ -1,0 +1,9 @@
+name: cosine_ramp_step_increase
+
+init_value: 0.005
+target_value: 0.2
+ramp_start_step: 4000
+ramp_end_step: 150000
+step_start_step: 200000
+step_interval: 50000
+step_delta: 0.05

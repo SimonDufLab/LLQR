@@ -2308,6 +2308,55 @@ def piecewise_constant_schedule(
   optax_boundaries = {steps_per_epoch*key:value for key,value in boundaries.items()}
   return optax.piecewise_constant_schedule(init_value=base_lr, boundaries_and_scales=optax_boundaries)
 
+
+def cosine_ramp_step_increase_schedule(
+        base_lr: float,
+        total_epochs: int,
+        steps_per_epoch: float,
+        init_value: float,
+        ramp_start_step: int,
+        ramp_end_step: int,
+        step_start_step: int,
+        step_interval: int,
+        step_delta: float,
+        target_value: Optional[float] = None,
+) -> optax.Schedule:
+  """Cosine ramp followed by fixed-size step increases on global steps."""
+  del total_epochs, steps_per_epoch
+  if ramp_end_step <= ramp_start_step:
+    raise ValueError(
+      "ramp_end_step must be greater than ramp_start_step; "
+      f"got {ramp_start_step=} and {ramp_end_step=}."
+    )
+  if step_interval <= 0:
+    raise ValueError(f"step_interval must be positive, got {step_interval}.")
+
+  ramp_start_step = float(ramp_start_step)
+  ramp_end_step = float(ramp_end_step)
+  step_start_step = float(step_start_step)
+  step_interval = float(step_interval)
+  init_value = float(init_value)
+  target_value = float(base_lr if target_value is None else target_value)
+  step_delta = float(step_delta)
+
+  def schedule(step):
+    step = jnp.asarray(step, dtype=jnp.float32)
+    ramp_progress = jnp.clip(
+      (step - ramp_start_step) / (ramp_end_step - ramp_start_step),
+      0.0,
+      1.0,
+    )
+    cosine_progress = 0.5 * (1.0 - jnp.cos(jnp.pi * ramp_progress))
+    ramp_value = init_value + (target_value - init_value) * cosine_progress
+    step_count = jnp.where(
+      step >= step_start_step,
+      jnp.floor((step - step_start_step) / step_interval) + 1.0,
+      0.0,
+    )
+    return ramp_value + step_delta * step_count
+
+  return schedule
+
 def warmup_piecewise_decay_schedule(
         base_lr: float,
         total_epochs: int,
