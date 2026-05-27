@@ -27,9 +27,12 @@ your runs with the corresponding paper figures and tables.
 
 | Paper surface | Family | Presets | Main sweep | Data requirement |
 |---|---|---|---|---|
-| LLQR + SAM | CIFAR architecture runs | `resnet18-*`, `vgg16bn-*`, `wide-resnet28x10-*`, `pyramidnet110-*` | `sam_mode` x `(divergence, ema_decay)` x LLQR toggle | CIFAR via configured loader |
-| LLQR + SAM | ImageNet ResNet-50 | `resnet50-imagenet`, `short-resnet50-imagenet` | same as CIFAR | ImageNet 2012 directory |
-| LLQR + SAM | IWSLT14 De-En Transformer | `transformer-iwslt14-de-en` | `sam_mode`, fixed `ngd/0.925`, LLQR toggle | tokenized fairseq-style IWSLT14 directory |
+| Layerwise LQR | CIFAR architecture runs | `resnet18-*`, `vgg16bn-*`, `wide-resnet28x10-*`, `pyramidnet110-*` | `sam_mode=null` x `(divergence, ema_decay)` | CIFAR via configured loader |
+| Layerwise LQR | ImageNet ResNet-50 | `resnet50-imagenet`, `short-resnet50-imagenet` | `sam_mode=null` x `(divergence, ema_decay)` | ImageNet 2012 directory |
+| Layerwise LQR | IWSLT14 De-En Transformer | `transformer-iwslt14-de-en` | `sam_mode=null`, fixed `ngd/0.925` | tokenized fairseq-style IWSLT14 directory |
+| LLQR + SAM | CIFAR architecture runs | `resnet18-*`, `vgg16bn-*`, `wide-resnet28x10-*`, `pyramidnet110-*` | `base_sam`, `base_fsam`, `fisher_sam` x `(divergence, ema_decay)` x LLQR toggle | CIFAR via configured loader |
+| LLQR + SAM | ImageNet ResNet-50 | `resnet50-imagenet`, `short-resnet50-imagenet` | `base_sam`, `base_fsam`, `fisher_sam` x `(divergence, ema_decay)` x LLQR toggle | ImageNet 2012 directory |
+| LLQR + SAM | IWSLT14 De-En Transformer | `transformer-iwslt14-de-en` | `base_sam`, `base_fsam`, `fisher_sam`, fixed `ngd/0.925`, LLQR toggle | tokenized fairseq-style IWSLT14 directory |
 | LLQR large-batch route | ImageNet ResNet-50 | `resnet50-imagenet` | chunked grouped LLQR update route | ImageNet 2012 directory |
 
 ## LLQR Toggle Convention
@@ -53,7 +56,84 @@ For `fisher_sam`, use `perturbation_rho=0.1 perturb_mode=ema_grad`.
 Canonical Fisher-SAM uses the vanilla outer update, so
 `sam_use_preconditioner_on_update` is intentionally inert for that mode.
 
-## CIFAR SAM/LLQR Paper Runs
+## LLQR Paper Runs Without SAM
+
+The Layerwise LQR paper runs use the same experiment presets as the overlapping
+SAM sections, with `sam_mode=null` and LLQR preconditioning enabled.
+
+For CIFAR, use:
+
+```bash
+llqr_experiments=(
+  resnet18-cifar100
+  vgg16bn-cifar100
+  wide-resnet28x10-cifar100
+  pyramidnet110-cifar100
+  resnet18-cifar10
+  vgg16bn-cifar10
+  wide-resnet28x10-cifar10
+  pyramidnet110-cifar10
+)
+
+divergence_pairs=("ngd 0.95" "newton 0.9")
+
+for experiment in "${llqr_experiments[@]}"; do
+  for pair in "${divergence_pairs[@]}"; do
+    read -r divergence ema_decay <<< "${pair}"
+
+    uv run python run.py \
+      experiment="${experiment}" \
+      sam_mode=null \
+      use_preconditioner=true \
+      divergence="${divergence}" \
+      ema_decay="${ema_decay}" \
+      "logging.aim_repo=<aim_repo>"
+  done
+done
+```
+
+For ImageNet ResNet-50, use:
+
+```bash
+llqr_imagenet_experiments=(
+  resnet50-imagenet
+  short-resnet50-imagenet
+)
+
+divergence_pairs=("ngd 0.95" "newton 0.9")
+
+for experiment in "${llqr_imagenet_experiments[@]}"; do
+  for pair in "${divergence_pairs[@]}"; do
+    read -r divergence ema_decay <<< "${pair}"
+
+    uv run python run.py \
+      experiment="${experiment}" \
+      "dataset.dataset_dir=<imagenet2012_location>" \
+      sam_mode=null \
+      use_preconditioner=true \
+      divergence="${divergence}" \
+      ema_decay="${ema_decay}" \
+      "logging.aim_repo=<aim_repo>"
+  done
+done
+```
+
+For IWSLT14 German-to-English translation, use the data preparation flow in
+[IWSLT14 Transformer LLQR + SAM Paper Runs](#iwslt14-transformer-llqr--sam-paper-runs),
+then launch:
+
+```bash
+uv run python run.py \
+  experiment=transformer-iwslt14-de-en \
+  "dataset.dataset_dir=<iwslt14_tokenized_de_en_location>" \
+  sam_mode=null \
+  use_preconditioner=true \
+  divergence=ngd \
+  ema_decay=0.925 \
+  "logging.aim_repo=<aim_repo>"
+```
+
+## CIFAR LLQR + SAM Paper Runs
 
 The CIFAR paper sweep uses these experiment presets:
 
@@ -119,7 +199,7 @@ Add the LLQR-disabled or LLQR-enabled override block from
 [LLQR Toggle Convention](#llqr-toggle-convention) to each `base_sam` and
 `base_fsam` command as needed.
 
-## ImageNet ResNet-50 SAM/LLQR Paper Runs
+## ImageNet ResNet-50 LLQR + SAM Paper Runs
 
 The ImageNet reproduction presets are:
 
@@ -179,7 +259,7 @@ done
 For `base_sam` and `base_fsam`, replace `llqr_args` with the LLQR-disabled
 override block when running the non-LLQR ablation.
 
-## IWSLT14 Transformer SAM/LLQR Paper Runs
+## IWSLT14 Transformer LLQR + SAM Paper Runs
 
 The IWSLT14 reproduction preset is `transformer-iwslt14-de-en`. It expects the
 fairseq-style tokenized IWSLT14 German-to-English directory. Either set
@@ -272,18 +352,3 @@ Keep `llqr_second_order_mode=batched_exact` and
 `llqr_second_order_mode=sample_separable_exact` route is an exact fallback for
 eligible grouped LLQR segments, not the recommended compute path when grouped
 chunked `batched_exact` already fits.
-
-## Run Log Checklist
-
-For your own reproduction notes, save:
-
-- paper figure or table target
-- dataset and model
-- exact command and overrides
-- seed list
-- expected metric and final observed metric
-- compute type and count
-- wall-clock time
-- Aim run hash
-- checkpoint path or download URL
-- known caveats, failed seeds, or evaluation notes
