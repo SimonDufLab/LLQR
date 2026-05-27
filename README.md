@@ -23,19 +23,19 @@ experiment surfaces used by the paper-facing releases.
 - A relaxed LLQR preconditioner implementation in `lqr_optimizer/_src/preconditioner.py`.
 - Exact or benchmark-style second-order helpers in `lqr_optimizer/_src/exact_methods.py`.
 - Structured inverse-preconditioner families, including diagonal, Kronecker,
-  EKFAC-style, separable EKFAC-style, and PSD variants.
-- SAM-family training modes: `base_sam`, `base_fsam`, `past_fsam`, `asam`, and
+  EKFAC-style, and separable EKFAC-style variants.
+- Paper-facing SAM-family training modes: `base_sam`, `base_fsam`, and
   `fisher_sam`.
-- Public experiment presets for CIFAR, ImageNet, WikiText-103, grokking-style
-  transformers, IWSLT14 German-to-English translation, and several CIFAR
-  architecture families.
+- Public experiment presets for CIFAR, ImageNet, grokking-style transformers,
+  IWSLT14 German-to-English translation, and several CIFAR architecture
+  families.
 - Toy and reduced validation paths for local sanity checks.
 
 Current status:
 
 - Maintained: `run.py`, Hydra configs under `configs/`, the relaxed LLQR
-  preconditioner path, SAM-family modes, CIFAR presets, IWSLT14 translation, and
-  current architecture surfaces.
+  preconditioner path, paper-facing SAM modes, CIFAR presets, IWSLT14
+  translation, and current architecture surfaces.
 - Experimental: low-memory LLQR operator modes, sample-separable second-order
   paths, large-batch ImageNet routing, and research-only SAM ablations.
 - Secondary or stale until audited: `run_single_layer_test.py` and any workflow
@@ -149,9 +149,8 @@ Representative public presets include:
 - `wide-resnet28x10-cifar10`, `wide-resnet28x10-cifar100`.
 - `pyramidnet110-cifar10`, `pyramidnet110-cifar100`.
 - `vit-ti16-cifar100-adamw`.
-- `gpt2small-wikitext103`, `grokking`.
-- `transformer-iwslt14-de-en` and
-  `transformer-iwslt14-de-en-ema-cosine0925`.
+- `grokking`.
+- `transformer-iwslt14-de-en`.
 
 For ResNet-50/ImageNet runs that need the validated large-batch update route,
 the current recommended shape is:
@@ -186,9 +185,3 @@ Use external GPU hardware for full large-model training and benchmark claims.
   primaryClass={cs.LG}
 }
 ```
-
-## License
-
-No repository license file is currently declared. Check with the maintainers
-before redistributing or reusing this code outside the intended research-release
-context.
