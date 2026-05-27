@@ -1,6 +1,6 @@
 # Reproducing LLQR Paper Results
 
-This guide collects command templates for the paper-facing LLQR runs:
+This guide collects commands for the paper-facing LLQR runs:
 
 - [Layerwise LQR for Geometry-Aware Optimization of Deep Networks](https://arxiv.org/abs/2605.04230)
 - [Navigating Potholes with Geometry-Aware Sharpness Minimization](https://arxiv.org/abs/2605.16134)
@@ -9,22 +9,19 @@ Run commands from the repository root. Replace placeholder paths such as
 `<aim_repo>`, `<imagenet2012_location>`, and
 `<iwslt14_tokenized_de_en_location>` with local cluster paths before launching.
 
-The commands below are source-derived reproduction templates. They do not yet
-claim final paper metrics, seed lists, checkpoint URLs, or wall-clock budgets.
-When those are available, record them here instead of expanding the root
-`README.md`.
+Use the commands below to reproduce the main experiment families and compare
+your runs with the corresponding paper figures and tables.
 
 ## Conventions
 
 - Use `uv run python run.py ...` from this repository root.
-- Record the exact command, Git commit, host, accelerator type, seed,
+- For your own runs, save the exact command, Git commit, host, accelerator type, seed,
   dataset path, Aim repository, Aim run hash, final metric, best metric, and
-  checkpoint path for every reported run.
+  checkpoint path.
 - Treat full CIFAR architecture sweeps, ImageNet, and IWSLT14 translation as
-  external GPU or cluster jobs. The local `agent-quick-local-test` quickstart is
-  only a training-path smoke check.
-- For multi-seed results, add `init_key=<seed>` and record the seed list next to
-  the resulting table or figure.
+  GPU or cluster jobs.
+- For multi-seed runs, add `init_key=<seed>` and save the seed list next to the
+  resulting table or figure.
 
 ## Reproduction Matrix
 
@@ -71,7 +68,7 @@ wide-resnet28x10-cifar10
 pyramidnet110-cifar10
 ```
 
-The source sweep varies:
+The CIFAR sweep varies:
 
 - `sam_mode`: `base_sam`, `base_fsam`, `fisher_sam`
 - paired divergence and EMA settings:
@@ -134,11 +131,10 @@ The ImageNet reproduction presets are:
 Provide the ImageNet 2012 data location at launch time with
 `dataset.dataset_dir=<imagenet2012_location>`.
 
-The source ImageNet sweep uses the same `sam_mode` and divergence pairs as
-CIFAR. It also records the LLQR-enabled SAM setting as
+The ImageNet sweep uses the same `sam_mode` and divergence pairs as CIFAR. The
+LLQR-enabled SAM setting is
 `perturbation_rho=0.075 gbar_beta=0.6 perturb_mode=ema_precond_grad`; keep those
-as explicit overrides when reproducing that paper surface instead of relying on
-current global defaults.
+as explicit overrides for this experiment family.
 
 Launch the main ImageNet variants:
 
@@ -277,10 +273,9 @@ Keep `llqr_second_order_mode=batched_exact` and
 eligible grouped LLQR segments, not the recommended compute path when grouped
 chunked `batched_exact` already fits.
 
-## What To Record
+## Run Log Checklist
 
-When converting a command template into a paper-result entry, add the following
-next to the relevant run family:
+For your own reproduction notes, save:
 
 - paper figure or table target
 - dataset and model

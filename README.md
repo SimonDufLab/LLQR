@@ -43,24 +43,24 @@ Current status:
 
 ## TL;DR Quickstart
 
-Use the local agent smoke profile when you only want to check that the training
-path, config composition, model construction, and LLQR preconditioner wiring are
-alive.
+Use the quick local profile when you only want to check that the training path,
+config composition, model construction, and LLQR preconditioner wiring are
+working.
 
 ```bash
-uv run python run.py experiment=agent-quick-local-test
+uv run python run.py experiment=quick-local-test
 ```
 
 Expected behavior:
 
-- Hydra composes `configs/experiment/agent-quick-local-test.yaml`.
+- Hydra composes `configs/experiment/quick-local-test.yaml`.
 - The run builds a small MNIST-style training path and an `e-kfac` LLQR
   preconditioner.
 - CLI output reports training and validation progress.
 - Local logging artifacts may appear under `.aim/` and `outputs/`.
 
-This is a smoke test, not a paper reproduction run. Full paper-result command
-templates live in [REPRODUCTION.md](REPRODUCTION.md).
+This is a smoke test, not a paper reproduction run. Full paper-result commands
+are in [REPRODUCTION.md](REPRODUCTION.md).
 
 ## Installation
 
@@ -73,7 +73,7 @@ uv sync --python 3.11
 Then run commands from the repository root:
 
 ```bash
-uv run python run.py experiment=agent-quick-local-test
+uv run python run.py experiment=quick-local-test
 ```
 
 Notes:
@@ -117,13 +117,8 @@ rather than a stable installed optimizer-wrapper API.
 ## Reproducing Paper Results
 
 Paper-result details belong in [REPRODUCTION.md](REPRODUCTION.md). That guide
-contains source-derived command templates for CIFAR, ImageNet, IWSLT14, and the
-large-batch ResNet-50 route. Keep exact metrics, compute notes, seed lists,
-logs, and checkpoint pointers there as they are validated.
-
-Do not use this root README as the paper-result matrix. Keep the root README
-short enough that a first-time reader can find the paper identity, quickstart,
-current status, and main entrypoints quickly.
+contains commands for CIFAR, ImageNet, IWSLT14, and the large-batch ResNet-50
+route.
 
 ## Repository Map
 
@@ -147,7 +142,7 @@ current status, and main entrypoints quickly.
 
 Representative public presets include:
 
-- `agent-quick-local-test`: small local smoke profile.
+- `quick-local-test`: small local smoke profile.
 - `resnet18-cifar10`, `resnet18-cifar100`, `resnet18-cifar100-adamw`.
 - `resnet50-imagenet`, `short-resnet50-imagenet`.
 - `vgg16bn-cifar10`, `vgg16bn-cifar100`.
@@ -169,20 +164,6 @@ uv run python run.py experiment=resnet50-imagenet \
 ```
 
 Use external GPU hardware for full large-model training and benchmark claims.
-
-## Development And Maintenance
-
-- Keep the root README reader-facing.
-- Put exact paper-result commands and expected metrics in `REPRODUCTION.md`.
-- Keep detailed runtime contracts close to the code or in durable maintenance
-  docs, not in long prose inside the root README.
-- When adding a public experiment preset, update the experiment list here and
-  add an appropriate local smoke, config-composition check, or external
-  validation note.
-- When changing LLQR preconditioner behavior, SAM behavior, data loading,
-  evaluation, checkpointing, or model structure, add regression coverage
-  proportional to the risk and validate on a toy or reduced surface before
-  claiming the change is complete.
 
 ## Citation
 
