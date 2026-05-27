@@ -59,8 +59,8 @@ Expected behavior:
 - CLI output reports training and validation progress.
 - Local logging artifacts may appear under `.aim/` and `outputs/`.
 
-This is a smoke test, not a paper reproduction run. Full paper-result commands
-will live in [REPRODUCTION.md](REPRODUCTION.md).
+This is a smoke test, not a paper reproduction run. Full paper-result command
+templates live in [REPRODUCTION.md](REPRODUCTION.md).
 
 ## Installation
 
@@ -116,10 +116,10 @@ rather than a stable installed optimizer-wrapper API.
 
 ## Reproducing Paper Results
 
-Paper-result details belong in [REPRODUCTION.md](REPRODUCTION.md). That file is
-intentionally empty for now and will be filled in a later documentation pass with
-exact configs, commands, expected metrics, compute notes, and log/checkpoint
-pointers.
+Paper-result details belong in [REPRODUCTION.md](REPRODUCTION.md). That guide
+contains source-derived command templates for CIFAR, ImageNet, IWSLT14, and the
+large-batch ResNet-50 route. Keep exact metrics, compute notes, seed lists,
+logs, and checkpoint pointers there as they are validated.
 
 Do not use this root README as the paper-result matrix. Keep the root README
 short enough that a first-time reader can find the paper identity, quickstart,
