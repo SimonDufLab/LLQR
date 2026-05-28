@@ -1,0 +1,4 @@
+name: wide-resnet-28-10
+
+activation: relu
+size: null

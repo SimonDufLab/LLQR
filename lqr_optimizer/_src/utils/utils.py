@@ -1,8 +1,10 @@
 """ Various utilities functions for LQR optimization"""
+import math
 import time
 import os
 import pickle
 import signal
+from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -10,22 +12,30 @@ from jax.flatten_util import ravel_pytree
 import optax
 import tensorflow as tf
 import tensorflow_datasets as tfds
+from aim import Distribution
 
 import flax.linen as nn
 from flax.linen import Sequential
+from flax.core import freeze
 from flax.core.frozen_dict import FrozenDict
+from flax import struct
 from flax.training import train_state
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
 from flax.traverse_util import flatten_dict, unflatten_dict
-from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable
+from typing import List, Tuple, Any, Dict, Optional, TypedDict, Callable, NamedTuple, NotRequired
 from types import FrameType
 from pathlib import Path
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from jax.tree_util import Partial
 
 from lqr_optimizer._src.utils.grokking_dataset import ModSumDataset, ModDivisionDataset, ModSubtractDataset, ModMulDataset, ModExpDataset, PermutationGroup, load_grok_ds
 from lqr_optimizer._src.utils.precond_optimizers import nonlinear_cg
+from lqr_optimizer._src.utils.seq2seq_utils import (
+  SEQ2SEQ_TASK_KIND,
+  infer_seq2seq_batch_layout,
+  validate_seq2seq_dataset_info,
+)
 
 def vjp_f(f, x):
   """ Return the vjp in a form that can be applied directly over a vector
@@ -134,14 +144,255 @@ def get_per_layer_norm(precond):
 #
 #     return params
 
+class StageDescriptor(NamedTuple):
+  name: str
+  kind: str
+  param_name: Optional[str] = None
+  fast_path_kind: Optional[str] = None
+  passive_state_hessian: Optional[str] = None
+
+
+class LqrSegmentDescriptor(NamedTuple):
+  name: str
+  execution_stage_names: Tuple[str, ...]
+  sample_separable_second_order: Optional[bool] = None
+
+
+class ResolvedLqrSegmentDescriptor(NamedTuple):
+  name: str
+  start_index: int
+  stop_index: int
+  execution_stage_descriptors: Tuple[StageDescriptor, ...]
+  controlled_param_names: Tuple[str, ...]
+  sample_separable_second_order: Optional[bool] = None
+
+
+_ALLOWED_STAGE_KINDS = frozenset(("controlled", "passive"))
+_ALLOWED_FAST_PATH_KINDS = frozenset((None, "linear_controlled", "piecewise_linear_passive"))
+_ALLOWED_PASSIVE_STATE_HESSIANS = frozenset((None, "zero", "generic"))
+
+
+def make_controlled_stage_descriptor(name: str, param_name: str, fast_path_kind: Optional[str] = None) -> StageDescriptor:
+  return StageDescriptor(name=name, kind="controlled", param_name=param_name, fast_path_kind=fast_path_kind)
+
+
+def make_passive_stage_descriptor(name: str, fast_path_kind: Optional[str] = None,
+                                  passive_state_hessian: Optional[str] = None) -> StageDescriptor:
+  if passive_state_hessian is None and fast_path_kind == "piecewise_linear_passive":
+    passive_state_hessian = "zero"
+  return StageDescriptor(
+    name=name,
+    kind="passive",
+    param_name=None,
+    fast_path_kind=fast_path_kind,
+    passive_state_hessian=passive_state_hessian,
+  )
+
+
+def make_lqr_segment_descriptor(name: str, execution_stage_names: Tuple[str, ...],
+                                sample_separable_second_order: Optional[bool] = None) -> LqrSegmentDescriptor:
+  return LqrSegmentDescriptor(
+    name=name,
+    execution_stage_names=tuple(execution_stage_names),
+    sample_separable_second_order=sample_separable_second_order,
+  )
+
+
+def validate_stage_descriptors(stage_descriptors: Tuple[StageDescriptor, ...], *, num_layers: int) -> Tuple[StageDescriptor, ...]:
+  if len(stage_descriptors) != num_layers:
+    raise ValueError(
+      f"Stage descriptor count {len(stage_descriptors)} does not match layer count {num_layers}."
+    )
+
+  stage_names = set()
+  controlled_param_names = set()
+  for descriptor in stage_descriptors:
+    if descriptor.kind not in _ALLOWED_STAGE_KINDS:
+      raise ValueError(f"Unknown stage kind '{descriptor.kind}' for stage '{descriptor.name}'.")
+    if descriptor.name in stage_names:
+      raise ValueError(f"Duplicate execution stage name '{descriptor.name}'.")
+    stage_names.add(descriptor.name)
+
+    if descriptor.fast_path_kind not in _ALLOWED_FAST_PATH_KINDS:
+      raise ValueError(
+        f"Unknown fast_path_kind '{descriptor.fast_path_kind}' for stage '{descriptor.name}'."
+      )
+    if descriptor.passive_state_hessian not in _ALLOWED_PASSIVE_STATE_HESSIANS:
+      raise ValueError(
+        f"Unknown passive_state_hessian '{descriptor.passive_state_hessian}' for stage '{descriptor.name}'."
+      )
+
+    if descriptor.kind == "controlled":
+      if descriptor.param_name is None:
+        raise ValueError(f"Controlled stage '{descriptor.name}' must define param_name.")
+      if descriptor.param_name in controlled_param_names:
+        raise ValueError(f"Duplicate controlled param_name '{descriptor.param_name}'.")
+      controlled_param_names.add(descriptor.param_name)
+      if descriptor.fast_path_kind == "piecewise_linear_passive":
+        raise ValueError(
+          f"Controlled stage '{descriptor.name}' cannot use passive fast_path_kind '{descriptor.fast_path_kind}'."
+        )
+      if descriptor.passive_state_hessian is not None:
+        raise ValueError(
+          f"Controlled stage '{descriptor.name}' cannot define passive_state_hessian."
+        )
+    else:
+      if descriptor.param_name is not None:
+        raise ValueError(f"Passive stage '{descriptor.name}' must not define param_name.")
+      if descriptor.fast_path_kind == "linear_controlled":
+        raise ValueError(
+          f"Passive stage '{descriptor.name}' cannot use controlled fast_path_kind '{descriptor.fast_path_kind}'."
+        )
+      if descriptor.fast_path_kind == "piecewise_linear_passive" and descriptor.passive_state_hessian != "zero":
+        raise ValueError(
+          f"Passive stage '{descriptor.name}' with piecewise_linear_passive fast_path_kind must declare zero state Hessian."
+        )
+
+  return stage_descriptors
+
+
+def validate_lqr_segment_descriptors(lqr_segment_descriptors: Tuple[LqrSegmentDescriptor, ...],
+                                     execution_stage_descriptors: Tuple[StageDescriptor, ...]
+                                     ) -> Tuple[ResolvedLqrSegmentDescriptor, ...]:
+  stage_index_by_name = {stage.name: index for index, stage in enumerate(execution_stage_descriptors)}
+  segment_names = set()
+  covered_stage_names = set()
+  expected_start = 0
+  resolved_segments = []
+
+  if not lqr_segment_descriptors and execution_stage_descriptors:
+    raise ValueError("LLQR segment descriptors must not be empty when execution stages exist.")
+
+  for segment in lqr_segment_descriptors:
+    if not segment.name:
+      raise ValueError("LLQR segment names must be non-empty.")
+    if segment.name in segment_names:
+      raise ValueError(f"Duplicate LLQR segment name '{segment.name}'.")
+    if (
+        segment.sample_separable_second_order is not None
+        and not isinstance(segment.sample_separable_second_order, bool)
+    ):
+      raise ValueError(
+        f"LLQR segment '{segment.name}' has invalid sample_separable_second_order policy "
+        f"'{segment.sample_separable_second_order}'. Expected None, True, or False."
+      )
+    segment_names.add(segment.name)
+
+    execution_stage_names = tuple(segment.execution_stage_names)
+    if not execution_stage_names:
+      raise ValueError(f"LLQR segment '{segment.name}' must reference at least one execution stage.")
+
+    segment_indices = []
+    for stage_name in execution_stage_names:
+      if stage_name not in stage_index_by_name:
+        raise ValueError(
+          f"LLQR segment '{segment.name}' references unknown execution stage '{stage_name}'."
+        )
+      if stage_name in covered_stage_names:
+        raise ValueError(
+          f"Execution stage '{stage_name}' appears in more than one LLQR segment."
+        )
+      covered_stage_names.add(stage_name)
+      segment_indices.append(stage_index_by_name[stage_name])
+
+    expected_indices = list(range(expected_start, expected_start + len(segment_indices)))
+    if segment_indices != expected_indices:
+      raise ValueError(
+        f"LLQR segment '{segment.name}' must cover a contiguous execution-stage slice in forward order."
+      )
+
+    segment_stage_descriptors = tuple(execution_stage_descriptors[index] for index in segment_indices)
+    controlled_param_names = tuple(
+      stage.param_name for stage in segment_stage_descriptors if stage.kind == "controlled"
+    )
+    resolved_segments.append(
+      ResolvedLqrSegmentDescriptor(
+        name=segment.name,
+        start_index=expected_start,
+        stop_index=expected_start + len(segment_indices),
+        execution_stage_descriptors=segment_stage_descriptors,
+        controlled_param_names=controlled_param_names,
+        sample_separable_second_order=segment.sample_separable_second_order,
+      )
+    )
+    expected_start += len(segment_indices)
+
+  if expected_start != len(execution_stage_descriptors):
+    raise ValueError("LLQR segments must cover every execution stage exactly once.")
+
+  return tuple(resolved_segments)
+
+
 class EnhancedSequential(nn.Module):
   layers: List[nn.Module]
+  stage_descriptors: Optional[Tuple[StageDescriptor, ...]] = None
+  lqr_segment_descriptors: Optional[Tuple[LqrSegmentDescriptor, ...]] = None
+  legacy_checkpoint_migrator: Optional[Callable[[Any, Any, Any, Any], Tuple[Any, Any]]] = None
 
   def __call__(self, x: Any) -> Any:
     """Applies the blocks sequentially to the input."""
     for block in self.layers:
       x = block(x)
     return x
+
+  @property
+  def execution_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:
+    if self.stage_descriptors is None:
+      stage_descriptors = tuple(
+        make_controlled_stage_descriptor(name=f"layers_{i}", param_name=f"layers_{i}", fast_path_kind=None)
+        for i, _ in enumerate(self.layers)
+      )
+    else:
+      stage_descriptors = tuple(self.stage_descriptors)
+    return validate_stage_descriptors(stage_descriptors, num_layers=len(self.layers))
+
+  def validate_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:
+    stage_descriptors = self.execution_stage_descriptors
+    self.validate_lqr_segment_descriptors()
+    return stage_descriptors
+
+  @property
+  def resolved_lqr_segment_descriptors(self) -> Tuple[ResolvedLqrSegmentDescriptor, ...]:
+    execution_stage_descriptors = self.execution_stage_descriptors
+    if self.lqr_segment_descriptors is None:
+      if self.stage_descriptors is not None:
+        raise ValueError(
+          "Models with explicit execution stage descriptors must also provide explicit LLQR segment descriptors."
+        )
+      lqr_segment_descriptors = tuple(
+        make_lqr_segment_descriptor(stage.name, (stage.name,))
+        for stage in execution_stage_descriptors
+      )
+    else:
+      lqr_segment_descriptors = tuple(self.lqr_segment_descriptors)
+    return validate_lqr_segment_descriptors(lqr_segment_descriptors, execution_stage_descriptors)
+
+  def validate_lqr_segment_descriptors(self) -> Tuple[ResolvedLqrSegmentDescriptor, ...]:
+    return self.resolved_lqr_segment_descriptors
+
+  @property
+  def controlled_stage_descriptors(self) -> Tuple[StageDescriptor, ...]:
+    return tuple(stage for stage in self.execution_stage_descriptors if stage.kind == "controlled")
+
+  @property
+  def controlled_stage_names(self) -> Tuple[str, ...]:
+    return tuple(stage.param_name for stage in self.controlled_stage_descriptors)
+
+  @property
+  def has_passive_stages(self) -> bool:
+    return any(stage.kind == "passive" for stage in self.execution_stage_descriptors)
+
+  def get_execution_stage_index(self, stage_name: str) -> int:
+    for index, stage in enumerate(self.execution_stage_descriptors):
+      if stage.name == stage_name:
+        return index
+    raise ValueError(f"Execution stage '{stage_name}' not found.")
+
+  def get_controlled_stage_execution_index(self, param_name: str) -> int:
+    for index, stage in enumerate(self.execution_stage_descriptors):
+      if stage.param_name == param_name:
+        return index
+    raise ValueError(f"Controlled stage '{param_name}' not found.")
 
   def init(self, rng: jax.random.PRNGKey, *args, **kwargs) -> FrozenDict:
     """
@@ -171,26 +422,34 @@ class EnhancedSequential(nn.Module):
   #   raise ValueError(f"Block name '{block_name}' not found.")
 
   def apply_block_from_name(self, block_name: str, x: Any, params: FrozenDict) -> Any:
-    """Applies a specific block using its parameters."""
-    # Get the list of parameter names
-    layer_names = list(params.keys())
-
-    # Find the index of the block_name
-    try:
-      index = layer_names.index(block_name)
-    except ValueError:
-      raise ValueError(f"Block name '{block_name}' not found.")
-
-    # Retrieve the corresponding block and its parameters
-    block = self.layers[index]
+    """Applies a controlled stage using its explicit stage-to-execution mapping."""
+    block = self.layers[self.get_controlled_stage_execution_index(block_name)]
     block_params = params.get(block_name, {})
-
-    # Apply the block using the provided parameters
     return block.apply({"params": block_params}, x)
+
+  def apply_execution_stage_from_name(self, stage_name: str, x: Any, variables: FrozenDict) -> Any:
+    """Applies one execution stage identified by its explicit stage name."""
+    block = self.layers[self.get_execution_stage_index(stage_name)]
+    return block.apply(variables, x)
 
   def apply_block_from_params(self, block_params: FrozenDict, x: Any, index) -> Any:
     block = self.layers[index]
     return block.apply(block_params, x)
+
+  def maybe_migrate_legacy_checkpoint(self, loaded_params, loaded_batch_stats,
+                                      init_params, init_batch_stats):
+    # Checkpoint round-trips can reorder top-level FrozenDict keys while preserving
+    # the actual split-stage schema. Treat key-set equality as a same-layout match.
+    params_match = set(loaded_params.keys()) == set(init_params.keys())
+    batch_stats_match = set(loaded_batch_stats.keys()) == set(init_batch_stats.keys())
+    if params_match and batch_stats_match:
+      return loaded_params, loaded_batch_stats, False
+    if self.legacy_checkpoint_migrator is None:
+      return loaded_params, loaded_batch_stats, False
+    migrated_params, migrated_batch_stats = self.legacy_checkpoint_migrator(
+      loaded_params, loaded_batch_stats, init_params, init_batch_stats
+    )
+    return migrated_params, migrated_batch_stats, True
 
   ##################################
   # XLA debugging util
@@ -215,13 +474,26 @@ def timed_jit(f):
 ##################################
 # Loading utils
 ##################################
-def load_main_optimizer(cfg, lr_or_sched):
+def load_main_optimizer(cfg, lr_or_sched, mask=None):
+  adam_betas = getattr(cfg, "adam_betas", (0.9, 0.999))
+  if len(adam_betas) != 2:
+    raise ValueError("`adam_betas` must contain exactly two entries.")
+  adam_b1 = float(adam_betas[0])
+  adam_b2 = float(adam_betas[1])
   if cfg.main_optimizer == "polyak":
     model_optimizer = optax.sgd(learning_rate=lr_or_sched, momentum=cfg.momentum)
   elif cfg.main_optimizer == "adam":
-    model_optimizer = optax.adam(learning_rate=lr_or_sched)
+    model_optimizer = optax.adam(learning_rate=lr_or_sched, b1=adam_b1, b2=adam_b2)
   elif cfg.main_optimizer == "sgd":
     model_optimizer = optax.sgd(learning_rate=lr_or_sched)
+  elif cfg.main_optimizer == "adamw":
+    model_optimizer = optax.adamw(
+      learning_rate=lr_or_sched,
+      b1=adam_b1,
+      b2=adam_b2,
+      weight_decay=cfg.weight_decay,
+      mask=mask,
+    )
   elif cfg.main_optimizer == "adamw_b2-98": # Grokking exps #TODO: move to config files...
     model_optimizer = optax.adamw(learning_rate=lr_or_sched, b2=0.98, weight_decay=cfg.weight_decay)
   elif cfg.main_optimizer == "adamw_b2-95": # GPT experiments
@@ -263,6 +535,15 @@ def load_precond_optimizer(cfg, lr):
   return optax.chain(*optax_solver_for_precond)
 
 
+def precond_solver_requires_value_and_grad(precond_solver_name):
+  """Return whether the preconditioner optimizer needs objective values."""
+  if precond_solver_name in ("adam", "momentum", "sgd"):
+    return False
+  if precond_solver_name in ("cg_zoom_hz", "cg_back_pr+"):
+    return True
+  raise ValueError("Unknown precond optimizer")
+
+
 def clip_by_group_norm(max_norm: float) -> optax.GradientTransformation:
   """
   Clip each gradient leaf independently by its L2 norm.
@@ -294,8 +575,32 @@ def clip_by_group_norm(max_norm: float) -> optax.GradientTransformation:
 ##################################
 # Training utils
 ##################################
+def align_log_probs_with_targets(log_probs, y):
+  """Keep the leading logits rows that correspond to the flattened targets."""
+  flat_targets = jnp.ravel(y)
+  if log_probs.shape[0] < flat_targets.shape[0]:
+    raise ValueError(
+      f"log_probs has fewer rows ({log_probs.shape[0]}) than targets ({flat_targets.shape[0]})."
+    )
+  if log_probs.shape[0] == flat_targets.shape[0]:
+    return log_probs
+  return log_probs[: flat_targets.shape[0]]
+
+
+def _flatten_aligned_targets(log_probs, y):
+  flat_targets = jnp.ravel(y)
+  log_probs = align_log_probs_with_targets(log_probs, flat_targets)
+  return log_probs, flat_targets
+
+
+def _target_valid_mask(targets, ignore_index=None):
+  if ignore_index is None:
+    return jnp.ones_like(targets, dtype=bool)
+  return targets != int(ignore_index)
+
+
 # Simple cross-entropy loss for classification
-def cross_entropy_loss(log_probs, y, label_smoothing=0.0):
+def cross_entropy_loss(log_probs, y, label_smoothing=0.0, ignore_index=None):
   """
   Cross-entropy loss with optional label smoothing.
 
@@ -304,8 +609,11 @@ def cross_entropy_loss(log_probs, y, label_smoothing=0.0):
       y: [batch,] integer class labels
       label_smoothing: float in [0, 1]. 0 = no smoothing (standard CE)
   """
+  log_probs, y = _flatten_aligned_targets(log_probs, y)
+  valid_mask = _target_valid_mask(y, ignore_index=ignore_index)
   num_classes = log_probs.shape[-1]
-  one_hot = jax.nn.one_hot(y, num_classes)
+  safe_targets = jnp.where(valid_mask, y, 0)
+  one_hot = jax.nn.one_hot(safe_targets, num_classes)
 
   if label_smoothing > 0.0:
     smooth = label_smoothing / num_classes
@@ -313,7 +621,9 @@ def cross_entropy_loss(log_probs, y, label_smoothing=0.0):
 
   # Negative log-likelihood
   nll = -jnp.sum(one_hot * log_probs, axis=-1)
-  return jnp.mean(nll)
+  valid_weights = valid_mask.astype(log_probs.dtype)
+  normalizer = jnp.maximum(jnp.sum(valid_weights), 1.0)
+  return jnp.sum(nll * valid_weights) / normalizer
 
 
 def loss_eval(state, x, y):
@@ -331,6 +641,102 @@ def loss_eval(state, x, y):
   # We expect the final layer to produce log-softmax output (as defined in MLP),
 
   return cross_entropy_loss(log_probs, y)
+
+
+def split_supervised_batch(batch):
+  """Return `(x, y)` from a supervised batch without flattening nested inputs."""
+  if not isinstance(batch, Sequence) or isinstance(batch, (str, bytes)):
+    raise ValueError("Expected a supervised batch shaped like `(x, y)`.")
+  if len(batch) != 2:
+    raise ValueError(f"Expected a supervised batch with exactly 2 items, got {len(batch)}.")
+  return batch[0], batch[1]
+
+
+def stack_tree_batches(batches):
+  """Stack a list of identically structured batches along a new leading axis."""
+  return jax.tree_util.tree_map(
+    lambda *leaves: jnp.stack([jnp.asarray(leaf) for leaf in leaves], axis=0),
+    *batches,
+  )
+
+
+def tree_axis0_size(tree):
+  leaves = jax.tree_util.tree_leaves(tree)
+  if not leaves:
+    raise ValueError("Expected a non-empty pytree with array leaves.")
+  first_leaf = jnp.asarray(leaves[0])
+  if first_leaf.ndim < 1:
+    raise ValueError("Expected accumulated batch leaves to have a leading axis.")
+  return int(first_leaf.shape[0])
+
+
+def tree_axis0_take(tree, index):
+  return jax.tree_util.tree_map(lambda leaf: jnp.asarray(leaf)[index], tree)
+
+
+def tree_axis0_slice(tree, start, stop=None):
+  return jax.tree_util.tree_map(lambda leaf: jnp.asarray(leaf)[start:stop], tree)
+
+
+def resolve_model_init_kwargs(architecture_name: str, ds_info: Mapping[str, Any]) -> Dict[str, Any]:
+  """Resolve dataset-derived model kwargs while preserving legacy routes."""
+  if not isinstance(ds_info, Mapping):
+    raise ValueError("`ds_info` must be a mapping.")
+
+  model_kwargs = {}
+  raw_model_init_kwargs = ds_info.get("model_init_kwargs", {})
+  if raw_model_init_kwargs and not isinstance(raw_model_init_kwargs, Mapping):
+    raise ValueError("`model_init_kwargs` must be mapping-valued when provided.")
+
+  if ds_info.get("task_kind") == SEQ2SEQ_TASK_KIND:
+    model_kwargs.update(validate_seq2seq_dataset_info(ds_info))
+  else:
+    model_kwargs.update(dict(raw_model_init_kwargs))
+
+  if "grok" in architecture_name and "vocab_size" not in model_kwargs:
+    vocab_size = ds_info.get("vocab_size")
+    if vocab_size is not None:
+      model_kwargs["vocab_size"] = int(vocab_size)
+
+  return model_kwargs
+
+
+def resolve_runner_accounting(ds_info: Mapping[str, Any], *, batch_size: int,
+                              grad_acc_steps: int, total_epochs: int) -> Dict[str, Any]:
+  """Resolve train/eval counts and epoch-step accounting from loader metadata."""
+  if not isinstance(ds_info, Mapping):
+    raise ValueError("`ds_info` must be a mapping.")
+  if batch_size <= 0:
+    raise ValueError(f"`batch_size` must be positive, got {batch_size}.")
+  if grad_acc_steps <= 0:
+    raise ValueError(f"`grad_acc_steps` must be positive, got {grad_acc_steps}.")
+  if total_epochs < 0:
+    raise ValueError(f"`total_epochs` must be non-negative, got {total_epochs}.")
+
+  train_ds_size = int(ds_info["ds_size"])
+  test_ds_size = int(ds_info.get("test_ds_size", train_ds_size))
+  runner_contract = ds_info.get("runner_contract", {})
+  if runner_contract and not isinstance(runner_contract, Mapping):
+    raise ValueError("`runner_contract` must be mapping-valued when provided.")
+
+  train_microbatches_per_epoch = runner_contract.get("train_microbatches_per_epoch")
+  if train_microbatches_per_epoch is None:
+    train_microbatches_per_epoch = train_ds_size / batch_size
+  train_microbatches_per_epoch = float(train_microbatches_per_epoch)
+  if train_microbatches_per_epoch <= 0:
+    raise ValueError("`train_microbatches_per_epoch` must be positive.")
+
+  steps_per_epoch = train_microbatches_per_epoch / grad_acc_steps
+  return {
+    "train_ds_size": train_ds_size,
+    "test_ds_size": test_ds_size,
+    "train_eval_target_count": int(runner_contract.get("train_eval_target_count", train_ds_size)),
+    "test_eval_target_count": int(runner_contract.get("test_eval_target_count", test_ds_size)),
+    "train_microbatches_per_epoch": train_microbatches_per_epoch,
+    "steps_per_epoch": steps_per_epoch,
+    "steps_per_epoch_rounded": int(train_microbatches_per_epoch // grad_acc_steps),
+    "total_steps": int((train_microbatches_per_epoch * total_epochs) // grad_acc_steps) + 1,
+  }
 
 
 def apply_cutout(image, size=16, p=0.5):
@@ -399,8 +805,10 @@ def prepare_dataloader(
     train=True,
     dataset='mnist',
     augment_dataset=False,
+    shuffle: bool = True,
     lt_config=None,  # e.g., {"imbalance_ratio": 100, "distribution": "exp", "seed": 0}
     dataset_dir: str = None,
+    batch_overlap_fraction: float = 0.0,   # NEW (0.0 means disabled)
 ):
   """
   Creates a generator that yields (x, y) from the specified dataset:
@@ -419,6 +827,19 @@ def prepare_dataloader(
       info["num_classes"], info["ds_size"],
       and if LT is used: info["class_counts"] (list length = num_classes).
   """
+  ########
+  # Overlap config
+  overlap_frac = float(batch_overlap_fraction or 0.0)
+  if not (0.0 <= overlap_frac < 1.0):
+    raise ValueError(f"batch_overlap_fraction must be in [0,1), got {overlap_frac}")
+
+  # replace_size = how many new examples per step (stride)
+  replace = int(round(batch_size * (1.0 - overlap_frac)))
+
+  # ensure valid
+  replace = max(1, min(batch_size, replace))
+  enable_overlap = train and (replace < batch_size)  # only meaningful for train
+  ########
   grokking_datasets = {
     'mod_sum': lambda: ModSumDataset(frac_train=0.6, p=97, k=5),
     'mod_subtract': lambda: ModSubtractDataset(frac_train=0.6, p=97, k=5),
@@ -480,7 +901,7 @@ def prepare_dataloader(
 
     # Cache & shuffle like the other branches
     # ds = ds.cache() Oh, no, not caching imagenet...
-    if train:
+    if train and shuffle:
       ds = ds.shuffle(4096, seed=0, reshuffle_each_iteration=True)
 
     # Pre-processing & augmentation
@@ -499,7 +920,38 @@ def prepare_dataloader(
       ds = ds.map(process_test_imagenet_dataset, num_parallel_calls=tf.data.AUTOTUNE)
 
     # Batch → prefetch → repeat
-    ds = ds.batch(batch_size)
+    # Batch (overlapped or standard)
+    if enable_overlap:
+      if batch_size % replace != 0:
+        raise ValueError(
+          f"With overlap enabled, require batch_size % replace == 0. "
+          f"Got batch_size={batch_size}, replace={replace}."
+        )
+      num_chunks = batch_size // replace
+
+      # First, form microbatches of size `replace`
+      ds = ds.batch(replace, drop_remainder=True)
+
+      # Window over consecutive microbatches (overlap achieved by shift=1 microbatch)
+      ds = ds.window(num_chunks, shift=1, drop_remainder=True)
+
+      # IMPORTANT: window returns (x_window_ds, y_window_ds) => flat_map gets 2 args
+      def _pack_window(xw, yw):
+        # Collect `num_chunks` microbatches into tensors:
+        # x: [num_chunks, replace, ...], y: [num_chunks, replace]
+        xy = tf.data.Dataset.zip((xw, yw)).batch(num_chunks, drop_remainder=True)
+
+        # Now reshape to full batch [batch_size, ...]
+        def _merge(x, y):
+          x = tf.reshape(x, (batch_size,) + tuple(x.shape[2:]))
+          y = tf.reshape(y, (batch_size,))
+          return x, y
+
+        return xy.map(_merge, num_parallel_calls=tf.data.AUTOTUNE)
+
+      ds = ds.flat_map(_pack_window)
+    else:
+      ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     ds = ds.repeat()
 
@@ -573,16 +1025,48 @@ def prepare_dataloader(
 
     # Cache & shuffle the final LT dataset
     ds = ds.cache()
-    ds = ds.shuffle(info["ds_size"], seed=lt_seed, reshuffle_each_iteration=True)
+    if shuffle:
+      ds = ds.shuffle(info["ds_size"], seed=lt_seed, reshuffle_each_iteration=True)
   else:
     # Balanced/default path
     size = int(ds.cardinality()) if tf.data.experimental.cardinality(ds) != tf.data.experimental.UNKNOWN_CARDINALITY else int(_info.splits['train' if train else 'test'].num_examples)
     info["ds_size"] = size
     ds = ds.cache()
-    ds = ds.shuffle(info["ds_size"], seed=0, reshuffle_each_iteration=True)
+    if train and (shuffle):
+      ds = ds.shuffle(info["ds_size"], seed=0, reshuffle_each_iteration=True)
 
-  # Batch and (optional) augment
-  ds = ds.batch(batch_size)
+  # Batch (overlapped or standard)
+  if enable_overlap:
+    if batch_size % replace != 0:
+      raise ValueError(
+        f"With overlap enabled, require batch_size % replace == 0. "
+        f"Got batch_size={batch_size}, replace={replace}."
+      )
+    num_chunks = batch_size // replace
+
+    # First, form microbatches of size `replace`
+    ds = ds.batch(replace, drop_remainder=True)
+
+    # Window over consecutive microbatches (overlap achieved by shift=1 microbatch)
+    ds = ds.window(num_chunks, shift=1, drop_remainder=True)
+
+    # IMPORTANT: window returns (x_window_ds, y_window_ds) => flat_map gets 2 args
+    def _pack_window(xw, yw):
+      # Collect `num_chunks` microbatches into tensors:
+      # x: [num_chunks, replace, ...], y: [num_chunks, replace]
+      xy = tf.data.Dataset.zip((xw, yw)).batch(num_chunks, drop_remainder=True)
+
+      # Now reshape to full batch [batch_size, ...]
+      def _merge(x, y):
+        x = tf.reshape(x, (batch_size,) + tuple(x.shape[2:]))
+        y = tf.reshape(y, (batch_size,))
+        return x, y
+
+      return xy.map(_merge, num_parallel_calls=tf.data.AUTOTUNE)
+
+    ds = ds.flat_map(_pack_window)
+  else:
+    ds = ds.batch(batch_size)
 
   if augment_dataset and train:
     if dataset in ('cifar-10', 'cifar-100'):
@@ -610,7 +1094,7 @@ def prepare_dataloader(
   return generator(), info
 
 
-def compute_batch_accuracy(state, x_batch, y_batch):
+def compute_batch_accuracy(state, x_batch, y_batch, *, ignore_index=None):
   """
   Computes accuracy for a single batch.
 
@@ -627,65 +1111,209 @@ def compute_batch_accuracy(state, x_batch, y_batch):
   # Forward pass to compute logits
   variables = {'params': state.params, 'batch_stats': state.batch_stats}
   log_probs = state.apply_inf_fn(variables, x_batch, mutable=False)  # shape [batch_size, num_classes]
+  log_probs, y_batch = _flatten_aligned_targets(log_probs, y_batch)
+  valid_mask = _target_valid_mask(y_batch, ignore_index=ignore_index)
+  safe_targets = jnp.where(valid_mask, y_batch, 0)
 
   # Predicted class (argmax of logits)
   predictions = jnp.argmax(jnp.exp(log_probs), axis=1)
 
   # Compare predictions with ground truth
-  correct_predictions = jnp.sum(predictions == y_batch)
+  correct_predictions = jnp.sum((predictions == safe_targets) & valid_mask)
 
   # Compute accuracy
-  accuracy = (correct_predictions / y_batch.shape[0]) * 100
-  return accuracy, cross_entropy_loss(log_probs, y_batch)
+  valid_count = jnp.maximum(jnp.sum(valid_mask), 1)
+  accuracy = (correct_predictions / valid_count) * 100
+  return accuracy, cross_entropy_loss(log_probs, y_batch, ignore_index=ignore_index)
 
-def compute_accuracy_and_loss(state, dataloader):
+# def compute_accuracy_and_loss(state, dataloader):
+#   """
+#   Computes accuracy for the given model parameters and dataloader.
+#
+#   Args:
+#       params: Model parameters.
+#       model: Flax model.
+#       dataloader: DataLoader for the dataset.
+#
+#   Returns:
+#       Accuracy as a percentage (float).
+#       Averaged loss
+#   """
+#   # If this is a custom loader, reset it to ensure we get a fresh epoch
+#   if hasattr(dataloader, "reset"):
+#     dataloader.reset()
+#   init_batch = next(dataloader)
+#   batch_axis = infer_batch_layout(init_batch)["batch_axis"]
+#   x_batch, y_batch = init_batch
+#   batch_size = x_batch.shape[batch_axis]
+#   pred_size = y_batch.shape[0]
+#   acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
+#   correct_predictions = acc * pred_size
+#   running_loss = loss * pred_size
+#   final_pred_size = pred_size
+#   total_samples = batch_size
+#
+#   for x_batch, y_batch in dataloader:
+#     # Compute model predictions
+#     pred_size = y_batch.shape[0]
+#     acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
+#     correct_predictions += acc * pred_size
+#     running_loss += loss * pred_size
+#     total_samples += batch_size
+#     final_pred_size += pred_size
+#     if total_samples >= 10000:
+#       break
+#
+#   # Compute accuracy as a percentage
+#   accuracy = (correct_predictions / final_pred_size)
+#   return accuracy, running_loss / final_pred_size
+
+def compute_accuracy_and_loss(state, dataloader, num_samples: int, *, ignore_index=None):
   """
-  Computes accuracy for the given model parameters and dataloader.
-
-  Args:
-      params: Model parameters.
-      model: Flax model.
-      dataloader: DataLoader for the dataset.
-
-  Returns:
-      Accuracy as a percentage (float).
-      Averaged loss
+  Evaluate on ~num_samples examples from dataloader (works with infinite repeat()).
   """
-  # If this is a custom loader, reset it to ensure we get a fresh epoch
   if hasattr(dataloader, "reset"):
     dataloader.reset()
-  init_batch = next(dataloader)
-  batch_axis = infer_batch_layout(init_batch)["batch_axis"]
-  x_batch, y_batch = init_batch
-  batch_size = x_batch.shape[batch_axis]
-  pred_size = y_batch.shape[0]
-  acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
-  correct_predictions = acc * pred_size
-  running_loss = loss * pred_size
-  final_pred_size = pred_size
-  total_samples = batch_size
+
+  correct_predictions = 0.0
+  running_loss = 0.0
+  seen = 0
 
   for x_batch, y_batch in dataloader:
-    # Compute model predictions
-    pred_size = y_batch.shape[0]
-    acc, loss = compute_batch_accuracy(state, x_batch, y_batch)
+    pred_size = int(jnp.count_nonzero(jnp.asarray(y_batch) != int(ignore_index))) if ignore_index is not None else y_batch.shape[0]
+    acc, loss = compute_batch_accuracy(state, x_batch, y_batch, ignore_index=ignore_index)
+
     correct_predictions += acc * pred_size
     running_loss += loss * pred_size
-    total_samples += batch_size
-    final_pred_size += pred_size
-    if total_samples >= 10000:
+    seen += pred_size
+
+    if seen >= num_samples:
       break
 
-  # Compute accuracy as a percentage
-  accuracy = (correct_predictions / final_pred_size)
-  return accuracy, running_loss / final_pred_size
+  accuracy = correct_predictions / seen
+  avg_loss = running_loss / seen
+  return accuracy, avg_loss
 
+
+def compute_accuracy_and_loss_with_hists(
+    state,
+    dataloader,
+    num_samples: int,
+    run,                      # Aim Run
+    *,
+    step: int,
+    prefix: str = "eval",     # e.g. "train_eval" or "test"
+    context: dict | None = None,
+    bin_count: int = 50,
+    max_points: int | None = 200_000,   # optional subsample cap (recommended for ImageNet)
+    rng_seed: int = 0,
+    ignore_index=None,
+):
+  """
+  Evaluate on ~num_samples examples from dataloader (works with repeat()) and track:
+    1) Distribution of p(correct class)
+    2) Distribution of per-sample NLL
+
+  Returns:
+    (accuracy_percent, avg_loss)
+  """
+  import numpy as np
+  import jax
+  import jax.numpy as jnp
+  from aim import Distribution
+
+  if hasattr(dataloader, "reset"):
+    dataloader.reset()
+
+  correct_sum = 0.0
+  loss_sum = 0.0
+  seen = 0
+
+  # Optional reservoir sampling so you don't log millions of points
+  rng = np.random.default_rng(rng_seed)
+
+  p_correct_samples = []
+  nll_samples = []
+  if max_points is not None:
+    cap = int(max_points)
+    stream_n = 0  # total points seen in stream for reservoir sampling
+
+    def _reservoir_add(arr_p: np.ndarray, arr_nll: np.ndarray):
+      nonlocal stream_n, p_correct_samples, nll_samples
+      for p, nll in zip(arr_p.tolist(), arr_nll.tolist()):
+        stream_n += 1
+        if len(p_correct_samples) < cap:
+          p_correct_samples.append(p)
+          nll_samples.append(nll)
+        else:
+          j = rng.integers(0, stream_n)
+          if j < cap:
+            p_correct_samples[j] = p
+            nll_samples[j] = nll
+  else:
+    def _reservoir_add(arr_p: np.ndarray, arr_nll: np.ndarray):
+      p_correct_samples.extend(arr_p.tolist())
+      nll_samples.extend(arr_nll.tolist())
+
+  for x_batch, y_batch in dataloader:
+    variables = {'params': state.params, 'batch_stats': state.batch_stats}
+    log_probs = state.apply_inf_fn(variables, x_batch, mutable=False)  # [B, C]
+    log_probs, y_batch = _flatten_aligned_targets(log_probs, y_batch)
+    valid_mask = _target_valid_mask(y_batch, ignore_index=ignore_index)
+    safe_targets = jnp.where(valid_mask, y_batch, 0)
+    valid_count = int(jnp.sum(valid_mask))
+    if valid_count == 0:
+      continue
+
+    # Preds (your version used argmax(exp(log_probs)); argmax(log_probs) is equivalent)
+    preds = jnp.argmax(log_probs, axis=1)
+
+    # Per-sample correctness (0/1)
+    correct = ((preds == safe_targets) & valid_mask).astype(jnp.float32)
+
+    # p(correct class) and per-sample NLL
+    idx = jnp.arange(y_batch.shape[0])
+    lp_true = log_probs[idx, safe_targets]            # log p(y|x)
+    p_true = jnp.exp(lp_true)                         # p(y|x) in [0,1]
+    nll = -lp_true                                    # NLL >= 0
+
+    correct_sum += float(jnp.sum(correct))
+    loss_sum += float(jnp.sum(nll * valid_mask.astype(nll.dtype)))
+    seen += valid_count
+
+    # move to host for Aim histogram
+    valid_mask_np = np.asarray(valid_mask, dtype=bool)
+    _reservoir_add(np.asarray(p_true)[valid_mask_np], np.asarray(nll)[valid_mask_np])
+
+    if seen >= num_samples:
+      break
+
+  acc_percent = (correct_sum / seen) * 100.0
+  avg_loss = loss_sum / seen
+
+  # Track histograms
+  run.track(
+    Distribution(p_correct_samples, bin_count=bin_count),
+    name=f"{prefix}/p_correct_hist",
+    step=step,
+    context=context,
+  )
+  run.track(
+    Distribution(nll_samples, bin_count=bin_count),
+    name=f"{prefix}/nll_hist",
+    step=step,
+    context=context,
+  )
+
+  return acc_percent, avg_loss
 
  # Prepare the train state for the model parameters
   # (Using Flax's train_state for convenience)
 class TrainState(train_state.TrainState):
-  apply_inf_fn: Callable
+  apply_inf_fn: Callable = struct.field(pytree_node=False)
   batch_stats: Any
+  gbar: Any
+  g_last: Any
 
   def apply_gradients(self, *, grads, normalize_conv_params=False, **kwargs):
     """Updates ``step``, ``params``, ``opt_state`` and ``**kwargs`` in return value.
@@ -824,21 +1452,23 @@ def infer_batch_layout(batch): # TODO: potentially not robust, might be preferab
     """
     Infer where the batch dimension lives and how to treat targets.
 
-    Assumes `batch` is (x, y) or a pytree whose first two leaves are (x, y)
+    Assumes `batch` is structurally `(x, y)`.
     with either:
       - CV-style:   x: [B, ...], y: [B] or [B, ...]
       - Text-style: x: [T, B],   y: [T*B]
+      - Seq2seq-style: x: (src_tokens, prev_output_tokens), y: [sum(target_lengths)]
 
     Returns:
       layout = {
-        "mode": "cv" or "text",
+        "mode": "cv", "text", or "seq2seq_translation",
         "batch_axis": int,          # axis of batch dim in x
         "T": int | None,            # sequence length for text mode
       }
     """
-    leaves = jax.tree_util.tree_leaves(batch)
-    assert len(leaves) >= 2, "Expected at least (x, y) in batch pytree"
-    x, y = leaves[0], leaves[1]
+    x, y = split_supervised_batch(batch)
+
+    if isinstance(x, Sequence) and not isinstance(x, (str, bytes)):
+        return infer_seq2seq_batch_layout((x, y))
 
     if not isinstance(x, jnp.ndarray):
         x = jnp.asarray(x)
@@ -860,6 +1490,488 @@ def infer_batch_layout(batch): # TODO: potentially not robust, might be preferab
     # CV fallback: batch axis is 0 (x: [B, ...], y: [B] or [B, ...])
     return layout
 
+
+# ---------------------------------------------------------
+# 1) Jit helpers for train_step
+# ---------------------------------------------------------
+def next_accumulated_batches(train_dataloader, acc_steps):
+  xs, ys = [], []
+  for _ in range(acc_steps):
+    x, y = split_supervised_batch(next(train_dataloader))
+    xs.append(x)
+    ys.append(y)
+
+  x_acc = stack_tree_batches(xs)
+  y_acc = stack_tree_batches(ys)
+  return x_acc, y_acc
+
+
+# ---------------------------------------------------------
+# ASAM (Adaptive SAM) helpers
+# ---------------------------------------------------------
+def tree_zeros_like(tree):
+  return jax.tree_map(jnp.zeros_like, tree)
+
+def tree_add(a, b):
+  return jax.tree_map(jnp.add, a, b)
+
+def tree_sub(a, b):
+  return jax.tree_map(jnp.subtract, a, b)
+
+def tree_add_scalar(tree, s):
+  return jax.tree_map(lambda x: x + s, tree)
+
+def tree_mul_scalar(tree, s):
+  return jax.tree_map(lambda x: x * s, tree)
+
+def tree_dot(a, b):
+  # sum over all leaves of sum(a_leaf * b_leaf)
+  leaves = jax.tree_util.tree_leaves(jax.tree_map(lambda x, y: jnp.sum(x * y), a, b))
+  return jnp.sum(jnp.stack(leaves)) if leaves else jnp.array(0.0, dtype=jnp.float32)
+
+def tree_l2_norm(tree, eps=1e-12):
+  return jnp.sqrt(tree_dot(tree, tree) + eps)
+
+def tree_normalize(tree, eps=1e-12):
+  n = tree_l2_norm(tree, eps)
+  return tree_mul_scalar(tree, 1.0 / n)
+
+def tree_dot_subtree(x_sub, y_sub):
+  leaves = jax.tree_util.tree_leaves(
+    jax.tree_map(lambda x, y: jnp.sum(x * y), x_sub, y_sub)
+  )
+  return jnp.sum(jnp.stack(leaves)) if leaves else jnp.array(0.0, dtype=jnp.float32)
+
+def _from_top_level_items_like(template_tree, items):
+  if isinstance(template_tree, FrozenDict):
+    return FrozenDict(items)
+  return type(template_tree)(items)
+
+def tree_dot_per_layer(a, b):
+  return _from_top_level_items_like(
+    a,
+    {
+      layer_name: tree_dot_subtree(a[layer_name], b[layer_name])
+      for layer_name in a.keys()
+    },
+  )
+
+def tree_l2_norm_per_layer(tree, eps=1e-12):
+  return jax.tree_map(lambda d: jnp.sqrt(d + eps), tree_dot_per_layer(tree, tree))
+
+def tree_normalize_per_layer(tree, eps=1e-12):
+  norms = tree_l2_norm_per_layer(tree, eps)
+  return tree_divide_by_layer_scalars(tree, norms)
+
+def tree_divide_by_layer_scalars(tree, scalars):
+  return _from_top_level_items_like(
+    tree,
+    {
+      layer_name: jax.tree_map(
+        lambda value, denom=scalars[layer_name]: value / denom,
+        layer_tree,
+      )
+      for layer_name, layer_tree in tree.items()
+    },
+  )
+
+VALID_SAM_RESEARCH_BASE_VECTOR_SOURCES = (
+  "current_gradient",
+  "main_optimizer_momentum",
+  "random_direction",
+)
+VALID_SAM_RESEARCH_PERTURB_SIGNS = ("ascent", "descent")
+
+
+def _collect_main_optimizer_momentum_candidates(opt_state, path="opt_state"):
+  candidates = []
+
+  if isinstance(opt_state, tuple) and hasattr(opt_state, "_fields"):
+    if "trace" in opt_state._fields:
+      candidates.append((f"{path}.trace", opt_state.trace))
+    if "mu" in opt_state._fields and "nu" in opt_state._fields:
+      candidates.append((f"{path}.mu", opt_state.mu))
+
+  if isinstance(opt_state, (tuple, list)):
+    for index, child_state in enumerate(opt_state):
+      candidates.extend(
+        _collect_main_optimizer_momentum_candidates(
+          child_state,
+          path=f"{path}[{index}]",
+        )
+      )
+
+  return candidates
+
+
+def extract_main_optimizer_momentum_vector(opt_state):
+  """Return the readable first-moment vector from a supported main optimizer state."""
+  candidates = _collect_main_optimizer_momentum_candidates(opt_state)
+  if len(candidates) != 1:
+    candidate_paths = [path for path, _ in candidates]
+    raise ValueError(
+      "sam_research_base_vector_source=main_optimizer_momentum requires exactly one "
+      "supported main-optimizer momentum state (TraceState.trace or ScaleByAdamState.mu); "
+      f"found {len(candidates)} candidates at {candidate_paths}."
+    )
+  _path, momentum_vector = candidates[0]
+  return jax.lax.stop_gradient(momentum_vector)
+
+
+def validate_sam_research_contract(cfg, opt_state):
+  """Validate the research-only SAM ablation surface before heavy runtime work."""
+  source = cfg.sam_research_base_vector_source
+  sign = cfg.sam_research_perturb_sign
+
+  if source not in VALID_SAM_RESEARCH_BASE_VECTOR_SOURCES:
+    raise ValueError(
+      "sam_research_base_vector_source must be one of "
+      f"{VALID_SAM_RESEARCH_BASE_VECTOR_SOURCES}; got {source!r}."
+    )
+  if sign not in VALID_SAM_RESEARCH_PERTURB_SIGNS:
+    raise ValueError(
+      "sam_research_perturb_sign must be one of "
+      f"{VALID_SAM_RESEARCH_PERTURB_SIGNS}; got {sign!r}."
+    )
+
+  uses_non_default_research_knob = (
+    source != "current_gradient" or sign != "ascent"
+  )
+  if uses_non_default_research_knob and cfg.sam_mode not in ("base_sam", "base_fsam"):
+    raise ValueError(
+      "Non-default SAM research ablation knobs are only supported when "
+      "sam_mode is 'base_sam' or 'base_fsam'."
+    )
+
+  if source == "main_optimizer_momentum" and cfg.sam_mode in ("base_sam", "base_fsam"):
+    extract_main_optimizer_momentum_vector(opt_state)
+
+
+def _sample_gaussian_tree_like(template_tree, rng_key):
+  """Sample a Gaussian pytree with the same structure, shape, and dtype as ``template_tree``."""
+  leaves, treedef = jax.tree_util.tree_flatten(template_tree)
+  if not leaves:
+    return template_tree
+
+  leaf_keys = jax.random.split(rng_key, len(leaves))
+  sampled_leaves = [
+    jax.random.normal(leaf_key, shape=leaf.shape, dtype=leaf.dtype)
+    for leaf_key, leaf in zip(leaf_keys, leaves)
+  ]
+  return jax.tree_util.tree_unflatten(treedef, sampled_leaves)
+
+
+def resolve_sam_ablation_perturbation_vector(
+    *,
+    sam_mode: str,
+    base_vector_source: str,
+    mean_grads_center,
+    g_bar,
+    opt_state,
+    rng_key,
+):
+  """Resolve the effective SAM perturbation vector and the RNG key for the perturbed pass."""
+  if sam_mode not in ("base_sam", "base_fsam"):
+    raise ValueError(
+      "SAM ablation perturbation vectors are only supported for "
+      f"'base_sam' or 'base_fsam'; got {sam_mode!r}."
+    )
+
+  if base_vector_source == "current_gradient":
+    selected_source = jax.lax.stop_gradient(mean_grads_center)
+    rng_out = rng_key
+  elif base_vector_source == "main_optimizer_momentum":
+    selected_source = extract_main_optimizer_momentum_vector(opt_state)
+    rng_out = rng_key
+  elif base_vector_source == "random_direction":
+    random_source_key, rng_out = jax.random.split(rng_key)
+    selected_source = _sample_gaussian_tree_like(mean_grads_center, random_source_key)
+    selected_source = jax.lax.stop_gradient(selected_source)
+  else:
+    raise ValueError(
+      "sam_research_base_vector_source must be one of "
+      f"{VALID_SAM_RESEARCH_BASE_VECTOR_SOURCES}; got {base_vector_source!r}."
+    )
+
+  if sam_mode == "base_fsam":
+    selected_source = tree_sub(selected_source, jax.lax.stop_gradient(g_bar))
+
+  return jax.lax.stop_gradient(selected_source), rng_out
+
+
+def apply_sam_perturb_sign(eps_tree, sign: str):
+  """Apply the research-only SAM ascent/descent sign gate to a perturbation tree."""
+  if sign == "ascent":
+    return jax.lax.stop_gradient(eps_tree)
+  if sign == "descent":
+    return jax.lax.stop_gradient(tree_mul_scalar(eps_tree, -1.0))
+  raise ValueError(
+    "sam_research_perturb_sign must be one of "
+    f"{VALID_SAM_RESEARCH_PERTURB_SIGNS}; got {sign!r}."
+  )
+
+
+def _restore_tree_container_like(template_tree, tree):
+  if isinstance(template_tree, FrozenDict):
+    return freeze(tree)
+  return tree
+
+
+def _build_asam_scale_tree(params, *, eta: float):
+  flat_params = flatten_dict(params)
+  scale_flat = {}
+  for path, leaf_value in flat_params.items():
+    leaf_name = path[-1] if path else None
+    if leaf_name == "bias":
+      scale_flat[path] = jnp.ones_like(leaf_value)
+    else:
+      scale_flat[path] = jnp.abs(leaf_value) + eta
+
+  return _restore_tree_container_like(params, unflatten_dict(scale_flat))
+
+
+def make_asam_perturbation_from_grad(
+    *,
+    params,
+    grad,
+    rho: float,
+    eta: float,
+    eps: float = 1e-12,
+):
+  """Build the canonical ASAM perturbation from params and the center gradient."""
+  if eta < 0:
+    raise ValueError(f"asam_eta must be non-negative; got {eta!r}.")
+
+  params = jax.lax.stop_gradient(params)
+  grad = jax.lax.stop_gradient(grad)
+  scale_tree = _build_asam_scale_tree(params, eta=eta)
+  weighted_grad = jax.tree_util.tree_map(
+    lambda scale, grad_leaf: scale * grad_leaf,
+    scale_tree,
+    grad,
+  )
+  denom = jnp.sqrt(tree_dot(weighted_grad, weighted_grad) + eps)
+  return jax.tree_util.tree_map(
+    lambda scale, grad_leaf: rho * scale * scale * grad_leaf / denom,
+    scale_tree,
+    grad,
+  )
+
+
+def make_fisher_sam_perturbation_from_grad(
+    *,
+    grad,
+    rho: float,
+    eta: float,
+    eps: float = 1e-12,
+):
+  """Build the canonical Fisher-SAM perturbation from the center gradient."""
+  if eta < 0:
+    raise ValueError(f"fisher_sam_eta must be non-negative; got {eta!r}.")
+
+  grad = jax.lax.stop_gradient(grad)
+  inv_fisher_grad = jax.tree_util.tree_map(
+    lambda grad_leaf: grad_leaf / (jnp.square(grad_leaf) + eta),
+    grad,
+  )
+  denom = jnp.sqrt(tree_dot(grad, inv_fisher_grad) + eps)
+  perturbation = jax.tree_util.tree_map(
+    lambda leaf: rho * leaf / denom,
+    inv_fisher_grad,
+  )
+  return _restore_tree_container_like(grad, perturbation)
+
+
+def make_perturbation_from_vector(
+    *,
+    precond_blocks,
+    vector,
+    precond_apply_fn,
+    rho: float,
+    mode: str,
+    norm_mode: str = "euclidean",
+    eps: float = 1e-12,
+):
+  """Build a perturbation tree from an already chosen perturbation vector."""
+  vector = jax.lax.stop_gradient(vector)
+  n_layers = len(vector)
+
+  if mode == "ema_grad":
+    transformed = vector
+  elif mode == "ema_precond_grad":
+    transformed = precond_apply_fn(precond_blocks, vector)
+  elif mode == "ema_direction": # TODO: now redundant with the added various norm_mode below. Remove
+    transformed = precond_apply_fn(precond_blocks, vector)
+    transformed = tree_normalize(transformed, eps)
+  else:
+    raise ValueError(f"Unknown perturb_mode: {mode}")
+
+  if norm_mode == "euclidean": # sqrt(v^T P^T P v). Less principled than sqrt(v^T P v), but more stable.
+    denom = jnp.sqrt(tree_dot(transformed, transformed) + eps)
+    direction = tree_mul_scalar(transformed, 1.0 / denom)
+  elif norm_mode == "matrix_norm":# sqrt(v^T P v)
+    denom = jnp.sqrt(tree_dot(vector, transformed) + eps)
+    direction = tree_mul_scalar(transformed, 1.0 / denom)
+  elif norm_mode == "layer_matrix_norm":
+    denom = jax.tree_map(jnp.sqrt, tree_add_scalar(tree_dot_per_layer(vector, transformed), eps))
+    direction = tree_divide_by_layer_scalars(transformed, denom)
+    direction = tree_mul_scalar(direction, 1.0 / jnp.sqrt(n_layers))
+  elif norm_mode == "layer_euclidean":
+    denom = jax.tree_map(jnp.sqrt, tree_add_scalar(tree_dot_per_layer(transformed, transformed), eps))
+    direction = tree_divide_by_layer_scalars(transformed, denom)
+    direction = tree_mul_scalar(direction, 1.0 / jnp.sqrt(n_layers))
+  else:
+    raise ValueError(f"Unknown norm_mode: {norm_mode}")
+
+  return tree_mul_scalar(direction, rho) # Rho for final scaling
+
+
+def make_perturbation_from_grad(
+    *,
+    precond_blocks,
+    grad,
+    precond_apply_fn,
+    rho: float,
+    mode: str,
+    norm_mode: str = "euclidean",
+    eps: float = 1e-12,
+):
+  """Thin wrapper for SAM-style perturbations built directly from a gradient."""
+  return make_perturbation_from_vector(
+    precond_blocks=precond_blocks,
+    vector=grad,
+    precond_apply_fn=precond_apply_fn,
+    rho=rho,
+    mode=mode,
+    norm_mode=norm_mode,
+    eps=eps,
+  )
+
+
+def make_perturbation_from_noise(
+    precond_blocks,
+    g_last,
+    g_bar,
+    precond_apply_fn,
+    rho: float,
+    mode: str,
+    norm_mode: str = "euclidean",
+    eps: float = 1e-12,
+):
+  """
+  Returns epsilon pytree to add to params, where direction is aligned with
+  the "noise proxy" v = g_last - g_bar.
+  """
+  g_last = jax.lax.stop_gradient(g_last)
+  g_bar  = jax.lax.stop_gradient(g_bar)
+  v = tree_sub(g_last, g_bar)
+  return make_perturbation_from_vector(
+    precond_blocks=precond_blocks,
+    vector=v,
+    precond_apply_fn=precond_apply_fn,
+    rho=rho,
+    mode=mode,
+    norm_mode=norm_mode,
+    eps=eps,
+  )
+
+
+def update_gbar(
+    g_bar,
+    mean_grads_pert,
+    precond_blocks,
+    precond_apply_fn,
+    beta: float,
+    mode: str,
+    eps: float = 1e-12,
+):
+  """
+  Keep the same 3 modes as before, but note the training step now uses g_last - g_bar
+  to build perturbations.
+
+  mean_grads_pert = ∇L(θ + ε) averaged across accumulation steps.
+  """
+  # if mode == "ema_grad":
+  #   target = mean_grads_pert
+  #
+  # elif mode == "ema_precond_grad":
+  #   target = precond_apply_fn(precond_blocks, mean_grads_pert)  # P g^{pert}
+  #
+  # elif mode == "ema_direction":
+  #   Pg = precond_apply_fn(precond_blocks, mean_grads_pert)
+  #   target = tree_normalize(Pg, eps)  # unit direction in P-space
+  #
+  # else:
+  #   raise ValueError(f"Unknown perturb_mode: {mode}")
+
+  target = mean_grads_pert
+
+  new_gbar = tree_add(
+    tree_mul_scalar(g_bar, beta),
+    tree_mul_scalar(target, 1.0 - beta),
+  )
+
+  if mode == "ema_direction":
+    new_gbar = tree_normalize(new_gbar, eps)
+
+  return jax.lax.stop_gradient(new_gbar)
+
+
+def resolve_sam_state_buffers(
+    *,
+    sam_mode: str,
+    g_bar,
+    g_last,
+    mean_grads_center,
+    mean_grads_pert,
+    precond_blocks,
+    precond_apply_fn,
+    beta: float,
+    mode: str,
+    eps: float = 1e-12,
+):
+  """Return the post-step ``(gbar, g_last)`` pair for a SAM-family mode."""
+  if sam_mode in ("base_sam", "asam", "fisher_sam"):
+    return (
+      jax.lax.stop_gradient(g_bar),
+      jax.lax.stop_gradient(g_last),
+    )
+
+  if sam_mode == "base_fsam":
+    if mean_grads_center is None:
+      raise ValueError("base_fsam requires mean_grads_center to update gbar.")
+    return (
+      update_gbar(
+        g_bar=g_bar,
+        mean_grads_pert=mean_grads_center,
+        precond_blocks=precond_blocks,
+        precond_apply_fn=precond_apply_fn,
+        beta=beta,
+        mode=mode,
+        eps=eps,
+      ),
+      jax.lax.stop_gradient(g_last),
+    )
+
+  if sam_mode == "past_fsam":
+    if mean_grads_pert is None:
+      raise ValueError("past_fsam requires mean_grads_pert to update g_last.")
+    return (
+      update_gbar(
+        g_bar=g_bar,
+        mean_grads_pert=g_last,
+        precond_blocks=precond_blocks,
+        precond_apply_fn=precond_apply_fn,
+        beta=beta,
+        mode=mode,
+        eps=eps,
+      ),
+      jax.lax.stop_gradient(mean_grads_pert),
+    )
+
+  raise ValueError(f"Unsupported sam_mode for state-buffer updates: {sam_mode}")
+
+
 #################################
 # Checkpointing utils
 #################################
@@ -878,8 +1990,49 @@ class RunState(TypedDict):  # Taken from https://docs.mila.quebec/examples/good_
   slurm_jobid: str  # Unique experiment identifier attributed by SLURM
   exp_name: str
   dropout_key: Optional[jax.random.PRNGKey]
-  best_accuracy: float  # Best accuracy so far
+  best_metric_name: str  # Best tracked metric so far
+  best_metric_value: float
+  best_metric_step: int
+  best_accuracy: NotRequired[float]  # Legacy field kept for checkpoint compatibility
   training_time: Optional[Any]  # Total training time for the run
+
+
+def metric_improved(metric_value: float, best_metric_value: float, *, maximize: bool) -> bool:
+  if maximize:
+    return float(metric_value) > float(best_metric_value)
+  return float(metric_value) < float(best_metric_value)
+
+
+def update_run_state_best_metric(run_state: RunState, *, metric_name: str, metric_value: float, step: int) -> None:
+  run_state["best_metric_name"] = str(metric_name)
+  run_state["best_metric_value"] = float(metric_value)
+  run_state["best_metric_step"] = int(step)
+  run_state["best_accuracy"] = float(metric_value) if metric_name == "accuracy" else 0.0
+
+
+def save_run_state(run_state: RunState, *, target_dir: str | Path | None = None) -> None:
+  resolved_dir = Path(target_dir) if target_dir is not None else Path(run_state["model_dir"])
+  os.makedirs(resolved_dir, exist_ok=True)
+  payload = dict(run_state)
+  payload["model_dir"] = str(resolved_dir)
+  with open(resolved_dir / "checkpoint_run_state.pkl", "wb") as f:
+    pickle.dump(payload, f)
+
+
+def _normalize_loaded_run_state(checkpoint_state, checkpoint_dir: Path) -> RunState:
+  state = dict(checkpoint_state)
+  if "best_metric_name" not in state:
+    legacy_best_accuracy = float(state.get("best_accuracy", 0.0))
+    state["best_metric_name"] = "accuracy"
+    state["best_metric_value"] = legacy_best_accuracy
+    state["best_metric_step"] = int(state.get("training_step", 0))
+  if "best_accuracy" not in state:
+    state["best_accuracy"] = (
+      float(state["best_metric_value"]) if state["best_metric_name"] == "accuracy" else 0.0
+    )
+  if "model_dir" not in state:
+    state["model_dir"] = str(checkpoint_dir)
+  return state  # type: ignore[return-value]
 
 
 def load_run_state(checkpoint_dir: Path) -> Optional[
@@ -907,7 +2060,7 @@ def load_run_state(checkpoint_dir: Path) -> Optional[
   print(f"Resuming from the checkpoint file at {checkpoint_file}:")
   print(checkpoint_state)
   print()
-  state: RunState = checkpoint_state  # type: ignore
+  state = _normalize_loaded_run_state(checkpoint_state, checkpoint_dir)
   return state
 
 
@@ -974,18 +2127,24 @@ def save_trainstate_and_precond(parent_dir: str, trainstate, preconditioner_bloc
   # Create directories for params, state, and opt_state
   trainstate_dir = os.path.join(parent_dir, "trainstate")
   params_dirs = os.path.join(trainstate_dir, "params")
+  gbar_dirs = os.path.join(trainstate_dir, "gbar")
+  g_last_dirs = os.path.join(trainstate_dir, "g_last")
   opt_state_dir = os.path.join(trainstate_dir, "opt_state")
   batch_stats_dir = os.path.join(trainstate_dir, "batch_stats")
 
   precond_dir = os.path.join(parent_dir, "preconditioner")
   os.makedirs(trainstate_dir, exist_ok=True)
   os.makedirs(params_dirs, exist_ok=True)
+  os.makedirs(gbar_dirs, exist_ok=True)
+  os.makedirs(g_last_dirs, exist_ok=True)
   os.makedirs(opt_state_dir, exist_ok=True)
   os.makedirs(batch_stats_dir, exist_ok=True)
   os.makedirs(precond_dir, exist_ok=True)
 
   # Use the existing save function
   save_pytree_state(params_dirs, trainstate.params)
+  save_pytree_state(gbar_dirs, trainstate.gbar)
+  save_pytree_state(g_last_dirs, trainstate.g_last)
   save_pytree_state(opt_state_dir, trainstate.opt_state)
   save_pytree_state(batch_stats_dir, trainstate.batch_stats)
   save_pytree_state(precond_dir, preconditioner_blocks)
@@ -996,30 +2155,46 @@ def restore_trainstate_and_precond(parent_dir: str):
   trainstate_dir = os.path.join(parent_dir, "trainstate")
   precond_dir = os.path.join(parent_dir, "preconditioner")
   params_dirs = os.path.join(trainstate_dir, "params")
+  gbar_dirs = os.path.join(trainstate_dir, "gbar")
+  g_last_dirs = os.path.join(trainstate_dir, "g_last")
   opt_state_dir = os.path.join(trainstate_dir, "opt_state")
   batch_stats_dir = os.path.join(trainstate_dir, "batch_stats")
 
   # Use the existing restore function
   restored_params = restore_pytree_state(params_dirs)
+  restored_gbar = restore_pytree_state(gbar_dirs)
+  restored_g_last = restore_pytree_state(g_last_dirs)
   restored_opt_state = restore_pytree_state(opt_state_dir)
   restored_batch_stats = restore_pytree_state(batch_stats_dir)
   restored_preconditioner_blocks = restore_pytree_state(precond_dir)
 
-  return {"params": restored_params, "opt_state": restored_opt_state, "batch_stats":restored_batch_stats}, restored_preconditioner_blocks
+  return {"params": restored_params, "gbar":restored_gbar, "g_last":restored_g_last, "opt_state": restored_opt_state, "batch_stats":restored_batch_stats}, restored_preconditioner_blocks
 
 def checkpoint_exp(run_state: RunState, trainstate, precond_blocks, curr_epoch: int, curr_step: int,
-                   dropout_key, best_acc, training_time):
+                   dropout_key, training_time, *, best_metric_name: str | None = None,
+                   best_metric_value: float | None = None, best_metric_step: int | None = None,
+                   target_dir: str | Path | None = None):
   run_state["epoch"] = curr_epoch
   run_state["training_step"] = curr_step
   run_state["dropout_key"] = dropout_key
-  run_state["best_accuracy"] = best_acc
   run_state["training_time"] = training_time
+  if best_metric_name is not None or best_metric_value is not None or best_metric_step is not None:
+    if best_metric_name is None or best_metric_value is None or best_metric_step is None:
+      raise ValueError(
+        "checkpoint_exp requires best_metric_name, best_metric_value, and best_metric_step together."
+      )
+    update_run_state_best_metric(
+      run_state,
+      metric_name=best_metric_name,
+      metric_value=best_metric_value,
+      step=best_metric_step,
+    )
 
-  with open(os.path.join(run_state["model_dir"], "checkpoint_run_state.pkl"), "wb") as f:
-    pickle.dump(run_state, f)
+  resolved_dir = Path(target_dir) if target_dir is not None else Path(run_state["model_dir"])
+  save_run_state(run_state, target_dir=resolved_dir)
 
   # Update weights
-  save_trainstate_and_precond(run_state["model_dir"], trainstate, precond_blocks)
+  save_trainstate_and_precond(str(resolved_dir), trainstate, precond_blocks)
 
 
 def signal_handler(signum: int, frame: Optional[
@@ -1035,12 +2210,13 @@ def signal_handler(signum: int, frame: Optional[
   ##################################
   # Hyperparam utils
   ##################################
-def cosine_annealing_schedule_per_epoch(
+def cosine_annealing_schedule_per_epoch( #TODO: rename, not per epoch anymore
         base_lr: float,
         total_epochs: int,
         steps_per_epoch: float,
         t_max: int,
         eta_min: float = 0.0,
+        cycle: bool = True, # Whether we cycle through lr after t_max is reached, or fix lr to eta_min.
 ) -> optax.Schedule:
   """
   Optax-compatible schedule that mimics PyTorch's CosineAnnealingLR
@@ -1061,12 +2237,18 @@ def cosine_annealing_schedule_per_epoch(
     raise ValueError(f"steps_per_epoch must be positive, got {steps_per_epoch}")
   step_max = steps_per_epoch * t_max
 
-  def schedule(step_count):
-    # t = jnp.floor_divide(step_count, steps_per_epoch).astype(jnp.float32)
-    t = step_count
-    # t = jnp.minimum(t, t_max)  # TODO: double check, but it seems that Pytorch implementation use warm restart ie lr grows back after t_max
-    cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / step_max))
-    return eta_min + (base_lr - eta_min) * cosine_decay
+  if cycle:
+    def schedule(t):
+      # t = jnp.floor_divide(step_count, steps_per_epoch).astype(jnp.float32)
+      # t = jnp.minimum(t, t_max)
+      # cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / t_max))
+      cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / step_max))
+      return eta_min + (base_lr - eta_min) * cosine_decay
+  else:
+    def schedule(t):
+      t = jnp.minimum(t, step_max)
+      cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * t / step_max))
+      return eta_min + (base_lr - eta_min) * cosine_decay
 
   return schedule
 
@@ -1126,6 +2308,55 @@ def piecewise_constant_schedule(
   optax_boundaries = {steps_per_epoch*key:value for key,value in boundaries.items()}
   return optax.piecewise_constant_schedule(init_value=base_lr, boundaries_and_scales=optax_boundaries)
 
+
+def cosine_ramp_step_increase_schedule(
+        base_lr: float,
+        total_epochs: int,
+        steps_per_epoch: float,
+        init_value: float,
+        ramp_start_step: int,
+        ramp_end_step: int,
+        step_start_step: int,
+        step_interval: int,
+        step_delta: float,
+        target_value: Optional[float] = None,
+) -> optax.Schedule:
+  """Cosine ramp followed by fixed-size step increases on global steps."""
+  del total_epochs, steps_per_epoch
+  if ramp_end_step <= ramp_start_step:
+    raise ValueError(
+      "ramp_end_step must be greater than ramp_start_step; "
+      f"got {ramp_start_step=} and {ramp_end_step=}."
+    )
+  if step_interval <= 0:
+    raise ValueError(f"step_interval must be positive, got {step_interval}.")
+
+  ramp_start_step = float(ramp_start_step)
+  ramp_end_step = float(ramp_end_step)
+  step_start_step = float(step_start_step)
+  step_interval = float(step_interval)
+  init_value = float(init_value)
+  target_value = float(base_lr if target_value is None else target_value)
+  step_delta = float(step_delta)
+
+  def schedule(step):
+    step = jnp.asarray(step, dtype=jnp.float32)
+    ramp_progress = jnp.clip(
+      (step - ramp_start_step) / (ramp_end_step - ramp_start_step),
+      0.0,
+      1.0,
+    )
+    cosine_progress = 0.5 * (1.0 - jnp.cos(jnp.pi * ramp_progress))
+    ramp_value = init_value + (target_value - init_value) * cosine_progress
+    step_count = jnp.where(
+      step >= step_start_step,
+      jnp.floor((step - step_start_step) / step_interval) + 1.0,
+      0.0,
+    )
+    return ramp_value + step_delta * step_count
+
+  return schedule
+
 def warmup_piecewise_decay_schedule(
         base_lr: float,
         total_epochs: int,
@@ -1150,6 +2381,139 @@ def warmup_piecewise_decay_schedule(
       boundaries_and_scales=bound_dict)]
   return optax.join_schedules(schedules, [warmup_steps])
 
+
+def inverse_sqrt_schedule(
+        base_lr: float,
+        total_epochs: int,
+        steps_per_epoch: float,
+        warmup_updates: int,
+        warmup_init_lr: float = 0.0,
+) -> optax.Schedule:
+  del total_epochs, steps_per_epoch
+  if warmup_updates <= 0:
+    raise ValueError(f"warmup_updates must be positive, got {warmup_updates}")
+
+  warmup_updates = float(warmup_updates)
+  decay_factor = float(base_lr) * math.sqrt(warmup_updates)
+
+  def schedule(step):
+    step = jnp.asarray(step, dtype=jnp.float32)
+    warmup_lr = warmup_init_lr + ((base_lr - warmup_init_lr) * (step / warmup_updates))
+    decay_lr = decay_factor / jnp.sqrt(jnp.maximum(step, warmup_updates))
+    return jnp.where(step < warmup_updates, warmup_lr, decay_lr)
+
+  return schedule
+
+
+##################################
+# Measuring matrix asymmetry
+##################################
+def _check_square(A: jnp.ndarray):
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError(
+            f"Expected a square matrix, got shape {A.shape}."
+        )
+
+
+@jax.jit
+def rel_skew_energy_fro_vs_sym(A: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    """
+    Relative skew-energy using Frobenius norms, reporting skew vs symmetric part:
+        ||S||_F / (||H||_F + eps)
+    where H = (A + A^T)/2, S = (A - A^T)/2.
+    """
+    H = 0.5 * (A + A.T)
+    S = 0.5 * (A - A.T)
+    return jnp.linalg.norm(S, ord="fro") / (jnp.linalg.norm(H, ord="fro") + eps)
+
+
+def _spectral_norm_power_iteration(
+    M: jnp.ndarray, iters: int = 25, eps: float = 1e-12
+) -> jnp.ndarray:
+    """
+    Estimates ||M||_2 (largest singular value) via power iteration on M^T M.
+    Deterministic initialization (all-ones vector) to avoid RNG in the signature.
+    """
+    n = M.shape[1]
+    v0 = jnp.ones((n,), dtype=M.dtype)
+    v0 = v0 / (jnp.linalg.norm(v0, ord=2) + eps)
+
+    def body(v, _):
+        v = M.T @ (M @ v)
+        v = v / (jnp.linalg.norm(v, ord=2) + eps)
+        return v, None
+
+    v, _ = jax.lax.scan(body, v0, xs=None, length=iters)
+    return jnp.linalg.norm(M @ v, ord=2)
+
+
+@jax.jit
+def rel_skew_operator_norm(
+    A: jnp.ndarray, iters: int = 25, eps: float = 1e-12
+) -> jnp.ndarray:
+    """
+    Relative skew measured in operator (induced 2-) norm:
+        ||A - A^T||_2 / (||A||_2 + eps)
+    with ||·||_2 estimated by power iteration.
+    """
+    D = A - A.T
+    num = _spectral_norm_power_iteration(D, iters=iters, eps=eps)
+    den = _spectral_norm_power_iteration(A, iters=iters, eps=eps)
+    return num / (den + eps)
+
+
+def report_skews(A: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  _check_square(A)
+
+  frob_skew = rel_skew_energy_fro_vs_sym(A)
+  spectral_skew = rel_skew_operator_norm(A)
+  return frob_skew, spectral_skew
+
+
+def get_per_layer_skews(precond):
+  skews_dict = {}
+  for _layer, _block in precond.items():
+    layer_skews = []
+    for leaf in jax.tree_leaves(_block):
+      if leaf.ndim == 2:
+        layer_skews.append(report_skews(leaf))
+    skews_dict[_layer] = layer_skews
+
+  return skews_dict
+
+def average_skews(
+        skews_dict: Dict[str, List[Tuple[jnp.ndarray, jnp.ndarray]]],
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """
+  Averages Frobenius and spectral skews across all leaves in skews_dict.
+
+  Args:
+    skews_dict: {layer: [(frob_skew, spectral_skew), ...], ...}
+    eps: numerical guard in case no leaves are present.
+
+  Returns:
+    (avg_frob_skew, avg_spectral_skew)
+  """
+  frob_vals = []
+  spectral_vals = []
+
+  for layer_skews in skews_dict.values():
+    for frob_skew, spectral_skew in layer_skews:
+      frob_vals.append(frob_skew)
+      spectral_vals.append(spectral_skew)
+
+  if len(frob_vals) == 0:
+    # No valid leaves: return zeros with correct dtype semantics
+    zero = jnp.array(0.0)
+    return zero, zero
+
+  frob_stack = jnp.stack(frob_vals)
+  spectral_stack = jnp.stack(spectral_vals)
+
+  avg_frob = jnp.mean(frob_stack)
+  avg_spectral = jnp.mean(spectral_stack)
+
+  return avg_frob, avg_spectral
 
 ##################################
 # "Trick" utils

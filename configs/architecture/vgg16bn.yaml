@@ -1,0 +1,4 @@
+name: vgg16-bn
+
+activation: relu
+size: null

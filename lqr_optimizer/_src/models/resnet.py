@@ -2,7 +2,14 @@ import flax.linen as nn
 import jax.numpy as jnp
 from typing import Tuple
 
-from lqr_optimizer._src.utils.utils import EnhancedSequential
+from flax.core import freeze
+
+from lqr_optimizer._src.utils.utils import (
+  EnhancedSequential,
+  make_controlled_stage_descriptor,
+  make_lqr_segment_descriptor,
+  make_passive_stage_descriptor,
+)
 
 
 # ============================================================================
@@ -124,6 +131,172 @@ class GPoolDenseLogSoftmax(nn.Module):
     x = nn.log_softmax(x)
     return x
 
+
+class ConvStage(nn.Module):
+  features: int
+  kernel_size: tuple
+  strides: tuple = (1, 1)
+  padding: str = 'SAME'
+  use_bias: bool = False
+  conv_name: str = "Conv_0"
+
+  @nn.compact
+  def __call__(self, x):
+    return nn.Conv(
+      features=self.features,
+      kernel_size=self.kernel_size,
+      strides=self.strides,
+      padding=self.padding,
+      use_bias=self.use_bias,
+      name=self.conv_name,
+    )(x)
+
+
+class BatchNormStage(nn.Module):
+  inference: bool = False
+  bn_name: str = "BatchNorm_0"
+
+  @nn.compact
+  def __call__(self, x):
+    return nn.BatchNorm(use_running_average=self.inference, name=self.bn_name)(x)
+
+
+class ReluStage(nn.Module):
+  def __call__(self, x):
+    return nn.relu(x)
+
+
+class MaxPoolStage(nn.Module):
+  window_shape: tuple = (3, 3)
+  strides: tuple = (2, 2)
+  padding: str = 'SAME'
+
+  def __call__(self, x):
+    return nn.max_pool(x, window_shape=self.window_shape, strides=self.strides, padding=self.padding)
+
+
+class CarryIdentityConvStage(nn.Module):
+  features: int
+  kernel_size: tuple
+  strides: tuple = (1, 1)
+  padding: str = 'SAME'
+  use_bias: bool = False
+  conv_name: str = "Conv_0"
+
+  @nn.compact
+  def __call__(self, x):
+    conv_out = nn.Conv(
+      features=self.features,
+      kernel_size=self.kernel_size,
+      strides=self.strides,
+      padding=self.padding,
+      use_bias=self.use_bias,
+      name=self.conv_name,
+    )(x)
+    return conv_out, x
+
+
+class TupleMainBatchNormStage(nn.Module):
+  inference: bool = False
+  bn_name: str = "BatchNorm_0"
+
+  @nn.compact
+  def __call__(self, inputs):
+    x, identity = inputs
+    return nn.BatchNorm(use_running_average=self.inference, name=self.bn_name)(x), identity
+
+
+class TupleMainConvStage(nn.Module):
+  features: int
+  kernel_size: tuple
+  strides: tuple = (1, 1)
+  padding: str = 'SAME'
+  use_bias: bool = False
+  conv_name: str = "Conv_0"
+
+  @nn.compact
+  def __call__(self, inputs):
+    x, identity = inputs
+    conv_out = nn.Conv(
+      features=self.features,
+      kernel_size=self.kernel_size,
+      strides=self.strides,
+      padding=self.padding,
+      use_bias=self.use_bias,
+      name=self.conv_name,
+    )(x)
+    return conv_out, identity
+
+
+class TupleSkipConvStage(nn.Module):
+  features: int
+  kernel_size: tuple = (1, 1)
+  strides: tuple = (1, 1)
+  padding: str = 'SAME'
+  use_bias: bool = False
+  conv_name: str = "Conv_1"
+
+  @nn.compact
+  def __call__(self, inputs):
+    x, identity = inputs
+    projected = nn.Conv(
+      features=self.features,
+      kernel_size=self.kernel_size,
+      strides=self.strides,
+      padding=self.padding,
+      use_bias=self.use_bias,
+      name=self.conv_name,
+    )(identity)
+    return x, projected
+
+
+class TupleSkipBatchNormStage(nn.Module):
+  inference: bool = False
+  bn_name: str = "BatchNorm_1"
+
+  @nn.compact
+  def __call__(self, inputs):
+    x, identity = inputs
+    return x, nn.BatchNorm(use_running_average=self.inference, name=self.bn_name)(identity)
+
+
+class TupleReluStage(nn.Module):
+  def __call__(self, inputs):
+    x, identity = inputs
+    return nn.relu(x), identity
+
+
+class TupleAddReluStage(nn.Module):
+  def __call__(self, inputs):
+    x, identity = inputs
+    return nn.relu(x + identity)
+
+
+def _extract_migrated_layer(source_layer, subkeys):
+  if subkeys is None:
+    return source_layer
+  return {subkey: source_layer[subkey] for subkey in subkeys if subkey in source_layer}
+
+
+def _migrate_split_stage_tree(loaded_tree, init_tree, legacy_mapping):
+  if not init_tree and not loaded_tree:
+    return loaded_tree
+  if tuple(loaded_tree.keys()) == tuple(init_tree.keys()):
+    return loaded_tree
+
+  loaded_keys = list(loaded_tree.keys())
+  if len(loaded_keys) != len(legacy_mapping):
+    raise ValueError("Legacy checkpoint layer count does not match the expected coarse-stage mapping.")
+
+  migrated = {}
+  for old_key, split_targets in zip(loaded_keys, legacy_mapping):
+    source_layer = loaded_tree[old_key]
+    for new_key, subkeys in split_targets:
+      migrated[new_key] = _extract_migrated_layer(source_layer, subkeys)
+
+  ordered = {key: migrated.get(key, init_tree[key]) for key in init_tree.keys()}
+  return freeze(ordered)
+
 # ============================================================================
 # Now we build ResNet-18 as an EnhancedSequential.
 #
@@ -168,39 +341,139 @@ STARTING_FEATURES = 64 # Lowering down when debugging #TODO make configurable wi
 def create_resnet18(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
   def inference_mode(inference: bool):
     layers = []
-    # Stem and max-pooling
-    layers.append(SmallStemBlock(inference=inference))
-    # layers.append(MaxPool())
+    stage_descriptors = []
+    lqr_segment_descriptors = []
+    legacy_mapping = []
+    legacy_batch_stats_mapping = []
 
-    # Group 1: two basic blocks with 64 filters (no downsampling)
-    layers.append(ResidualBlockPart1(features=STARTING_FEATURES, stride=1, inference=inference))
-    layers.append(ResidualBlockPart2(features=STARTING_FEATURES, stride=1, inference=inference))
-    layers.append(ResidualBlockPart1(features=STARTING_FEATURES, stride=1, inference=inference))
-    layers.append(ResidualBlockPart2(features=STARTING_FEATURES, stride=1, inference=inference))
+    def add_controlled(stage_name, module, fast_path_kind=None):
+      stage_index = len(layers)
+      layers.append(module)
+      param_name = f"layers_{stage_index}"
+      stage_descriptors.append(
+        make_controlled_stage_descriptor(stage_name, param_name, fast_path_kind)
+      )
+      return param_name
 
-    # Group 2: two basic blocks with 128 filters (first block downsamples)
-    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*2, stride=2, inference=inference))
-    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*2, stride=2, inference=inference))
-    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*2, stride=1, inference=inference))
-    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*2, stride=1, inference=inference))
+    def add_passive(stage_name, module, fast_path_kind=None, passive_state_hessian=None):
+      layers.append(module)
+      stage_descriptors.append(
+        make_passive_stage_descriptor(stage_name, fast_path_kind, passive_state_hessian)
+      )
 
-    # Group 3: two basic blocks with 256 filters (first block downsamples)
-    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*4, stride=2, inference=inference))
-    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*4, stride=2, inference=inference))
-    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*4, stride=1, inference=inference))
-    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*4, stride=1, inference=inference))
+    def append_basic_block(prefix, features, stride, projection):
+      part1_mapping = []
+      part2_mapping = []
+      part1_batch_stats_mapping = []
+      part2_batch_stats_mapping = []
+      part1_mapping.append((add_controlled(f"{prefix}_conv1",
+                                           CarryIdentityConvStage(features=features, kernel_size=(3, 3),
+                                                                  strides=(stride, stride), conv_name="Conv_0"),
+                                           fast_path_kind="linear_controlled"),
+                            ("Conv_0",)))
+      bn1_key = add_controlled(f"{prefix}_bn1",
+                               TupleMainBatchNormStage(inference=inference, bn_name="BatchNorm_0"),
+                               fast_path_kind="linear_controlled" if inference else None)
+      part1_mapping.append((bn1_key, ("BatchNorm_0",)))
+      part1_batch_stats_mapping.append((bn1_key, ("BatchNorm_0",)))
+      add_passive(f"{prefix}_relu1", TupleReluStage(), fast_path_kind="piecewise_linear_passive",
+                  passive_state_hessian="zero")
+      part2_mapping.append((add_controlled(f"{prefix}_conv2",
+                                           TupleMainConvStage(features=features, kernel_size=(3, 3),
+                                                              strides=(1, 1), conv_name="Conv_0"),
+                                           fast_path_kind="linear_controlled"),
+                            ("Conv_0",)))
+      bn2_key = add_controlled(f"{prefix}_bn2",
+                               TupleMainBatchNormStage(inference=inference, bn_name="BatchNorm_0"),
+                               fast_path_kind="linear_controlled" if inference else None)
+      part2_mapping.append((bn2_key, ("BatchNorm_0",)))
+      part2_batch_stats_mapping.append((bn2_key, ("BatchNorm_0",)))
+      if projection:
+        part2_mapping.append((add_controlled(f"{prefix}_skip_proj_conv",
+                                             TupleSkipConvStage(features=features, strides=(stride, stride),
+                                                                conv_name="Conv_1"),
+                                             fast_path_kind="linear_controlled"),
+                              ("Conv_1",)))
+        skip_bn_key = add_controlled(f"{prefix}_skip_proj_bn",
+                                     TupleSkipBatchNormStage(inference=inference, bn_name="BatchNorm_1"),
+                                     fast_path_kind="linear_controlled" if inference else None)
+        part2_mapping.append((skip_bn_key, ("BatchNorm_1",)))
+        part2_batch_stats_mapping.append((skip_bn_key, ("BatchNorm_1",)))
+      add_passive(f"{prefix}_add_relu", TupleAddReluStage(), fast_path_kind="piecewise_linear_passive",
+                  passive_state_hessian="zero")
+      part1_stage_names = (f"{prefix}_conv1", f"{prefix}_bn1", f"{prefix}_relu1")
+      part2_stage_names = [f"{prefix}_conv2", f"{prefix}_bn2"]
+      if projection:
+        part2_stage_names.extend((f"{prefix}_skip_proj_conv", f"{prefix}_skip_proj_bn"))
+      part2_stage_names.append(f"{prefix}_add_relu")
+      lqr_segment_descriptors.extend((
+        make_lqr_segment_descriptor(
+          f"{prefix}_part1", part1_stage_names, sample_separable_second_order=bool(inference)
+        ),
+        make_lqr_segment_descriptor(
+          f"{prefix}_part2", tuple(part2_stage_names), sample_separable_second_order=bool(inference)
+        ),
+      ))
+      return (
+        tuple(part1_mapping),
+        tuple(part2_mapping),
+        tuple(part1_batch_stats_mapping),
+        tuple(part2_batch_stats_mapping),
+      )
 
-    # Group 4: two basic blocks with 512 filters (first block downsamples)
-    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*8, stride=2, inference=inference))
-    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*8, stride=2, inference=inference))
-    layers.append(ResidualBlockPart1(features=STARTING_FEATURES*8, stride=1, inference=inference))
-    layers.append(ResidualBlockPart2(features=STARTING_FEATURES*8, stride=1, inference=inference))
+    stem_conv_key = add_controlled("stem_conv", ConvStage(features=64, kernel_size=(3, 3), strides=(1, 1), conv_name="Conv_0"),
+                                   fast_path_kind="linear_controlled")
+    stem_bn_key = add_controlled("stem_bn", BatchNormStage(inference=inference, bn_name="BatchNorm_0"),
+                                 fast_path_kind="linear_controlled" if inference else None)
+    legacy_mapping.append(((stem_conv_key, ("Conv_0",)), (stem_bn_key, ("BatchNorm_0",))))
+    legacy_batch_stats_mapping.append(((stem_bn_key, ("BatchNorm_0",)),))
+    add_passive("stem_relu", ReluStage(), fast_path_kind="piecewise_linear_passive", passive_state_hessian="zero")
+    lqr_segment_descriptors.append(
+      make_lqr_segment_descriptor(
+        "stem", ("stem_conv", "stem_bn", "stem_relu"), sample_separable_second_order=bool(inference)
+      )
+    )
 
-    # Global average pooling and final classification layer.
-    # layers.append(GlobalAvgPool())
-    layers.append(GPoolDenseLogSoftmax(num_classes))
+    block_specs = [
+      (STARTING_FEATURES, 1, False),
+      (STARTING_FEATURES, 1, False),
+      (STARTING_FEATURES * 2, 2, True),
+      (STARTING_FEATURES * 2, 1, False),
+      (STARTING_FEATURES * 4, 2, True),
+      (STARTING_FEATURES * 4, 1, False),
+      (STARTING_FEATURES * 8, 2, True),
+      (STARTING_FEATURES * 8, 1, False),
+    ]
 
-    return EnhancedSequential(layers)
+    for block_index, (features, stride, projection) in enumerate(block_specs):
+      part1_mapping, part2_mapping, part1_batch_stats_mapping, part2_batch_stats_mapping = append_basic_block(
+        f"block_{block_index}", features, stride, projection
+      )
+      legacy_mapping.append(part1_mapping)
+      legacy_mapping.append(part2_mapping)
+      legacy_batch_stats_mapping.append(part1_batch_stats_mapping)
+      legacy_batch_stats_mapping.append(part2_batch_stats_mapping)
+
+    head_key = add_controlled("head", GPoolDenseLogSoftmax(num_classes))
+    legacy_mapping.append(((head_key, None),))
+    lqr_segment_descriptors.append(
+      make_lqr_segment_descriptor("head", ("head",), sample_separable_second_order=bool(inference))
+    )
+
+    def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):
+      return (
+        _migrate_split_stage_tree(loaded_params, init_params, legacy_mapping),
+        _migrate_split_stage_tree(loaded_batch_stats, init_batch_stats, legacy_batch_stats_mapping),
+      )
+
+    model = EnhancedSequential(
+      layers,
+      stage_descriptors=tuple(stage_descriptors),
+      lqr_segment_descriptors=tuple(lqr_segment_descriptors),
+      legacy_checkpoint_migrator=migrate_legacy_checkpoint,
+    )
+    model.validate_stage_descriptors()
+    return model
 
   return inference_mode(False), inference_mode(True)
 
@@ -291,30 +564,155 @@ def create_resnet50(num_classes: int) -> Tuple[EnhancedSequential, nn.Module]:
 
   def inference_mode(inference: bool):
     layers = []
+    stage_descriptors = []
+    lqr_segment_descriptors = []
+    legacy_mapping = []
+    legacy_batch_stats_mapping = []
 
-    # ImageNet stem (7×7/2 + BN + ReLU + 3×3 max-pool/2)
-    layers.append(BigStemBlock(inference=inference))
+    def add_controlled(stage_name, module, fast_path_kind=None):
+      stage_index = len(layers)
+      layers.append(module)
+      param_name = f"layers_{stage_index}"
+      stage_descriptors.append(
+        make_controlled_stage_descriptor(stage_name, param_name, fast_path_kind)
+      )
+      return param_name
 
-    # Build stages conv2_x .. conv5_x
+    def add_passive(stage_name, module, fast_path_kind=None, passive_state_hessian=None):
+      layers.append(module)
+      stage_descriptors.append(
+        make_passive_stage_descriptor(stage_name, fast_path_kind, passive_state_hessian)
+      )
+
+    def append_bottleneck(prefix, planes, stride, projection):
+      part1_mapping = []
+      part2_mapping = []
+      part3_mapping = []
+      part1_batch_stats_mapping = []
+      part2_batch_stats_mapping = []
+      part3_batch_stats_mapping = []
+      out_channels = planes * EXPANSION
+      part1_mapping.append((add_controlled(f"{prefix}_conv1",
+                                           CarryIdentityConvStage(features=planes, kernel_size=(1, 1),
+                                                                  strides=(1, 1), conv_name="Conv_0"),
+                                           fast_path_kind="linear_controlled"),
+                            ("Conv_0",)))
+      bn1_key = add_controlled(f"{prefix}_bn1",
+                               TupleMainBatchNormStage(inference=inference, bn_name="BatchNorm_0"),
+                               fast_path_kind="linear_controlled" if inference else None)
+      part1_mapping.append((bn1_key, ("BatchNorm_0",)))
+      part1_batch_stats_mapping.append((bn1_key, ("BatchNorm_0",)))
+      add_passive(f"{prefix}_relu1", TupleReluStage(), fast_path_kind="piecewise_linear_passive",
+                  passive_state_hessian="zero")
+      part2_mapping.append((add_controlled(f"{prefix}_conv2",
+                                           TupleMainConvStage(features=planes, kernel_size=(3, 3),
+                                                              strides=(stride, stride), conv_name="Conv_0"),
+                                           fast_path_kind="linear_controlled"),
+                            ("Conv_0",)))
+      bn2_key = add_controlled(f"{prefix}_bn2",
+                               TupleMainBatchNormStage(inference=inference, bn_name="BatchNorm_0"),
+                               fast_path_kind="linear_controlled" if inference else None)
+      part2_mapping.append((bn2_key, ("BatchNorm_0",)))
+      part2_batch_stats_mapping.append((bn2_key, ("BatchNorm_0",)))
+      add_passive(f"{prefix}_relu2", TupleReluStage(), fast_path_kind="piecewise_linear_passive",
+                  passive_state_hessian="zero")
+      part3_mapping.append((add_controlled(f"{prefix}_conv3",
+                                           TupleMainConvStage(features=out_channels, kernel_size=(1, 1),
+                                                              strides=(1, 1), conv_name="Conv_0"),
+                                           fast_path_kind="linear_controlled"),
+                            ("Conv_0",)))
+      bn3_key = add_controlled(f"{prefix}_bn3",
+                               TupleMainBatchNormStage(inference=inference, bn_name="BatchNorm_0"),
+                               fast_path_kind="linear_controlled" if inference else None)
+      part3_mapping.append((bn3_key, ("BatchNorm_0",)))
+      part3_batch_stats_mapping.append((bn3_key, ("BatchNorm_0",)))
+      if projection:
+        part3_mapping.append((add_controlled(f"{prefix}_skip_proj_conv",
+                                             TupleSkipConvStage(features=out_channels, strides=(stride, stride),
+                                                                conv_name="Conv_1"),
+                                             fast_path_kind="linear_controlled"),
+                              ("Conv_1",)))
+        skip_bn_key = add_controlled(f"{prefix}_skip_proj_bn",
+                                     TupleSkipBatchNormStage(inference=inference, bn_name="BatchNorm_1"),
+                                     fast_path_kind="linear_controlled" if inference else None)
+        part3_mapping.append((skip_bn_key, ("BatchNorm_1",)))
+        part3_batch_stats_mapping.append((skip_bn_key, ("BatchNorm_1",)))
+      add_passive(f"{prefix}_add_relu", TupleAddReluStage(), fast_path_kind="piecewise_linear_passive",
+                  passive_state_hessian="zero")
+      part1_stage_names = (f"{prefix}_conv1", f"{prefix}_bn1", f"{prefix}_relu1")
+      part2_stage_names = (f"{prefix}_conv2", f"{prefix}_bn2", f"{prefix}_relu2")
+      part3_stage_names = [f"{prefix}_conv3", f"{prefix}_bn3"]
+      if projection:
+        part3_stage_names.extend((f"{prefix}_skip_proj_conv", f"{prefix}_skip_proj_bn"))
+      part3_stage_names.append(f"{prefix}_add_relu")
+      lqr_segment_descriptors.extend((
+        make_lqr_segment_descriptor(
+          f"{prefix}_part1", part1_stage_names, sample_separable_second_order=bool(inference)
+        ),
+        make_lqr_segment_descriptor(
+          f"{prefix}_part2", part2_stage_names, sample_separable_second_order=bool(inference)
+        ),
+        make_lqr_segment_descriptor(
+          f"{prefix}_part3", tuple(part3_stage_names), sample_separable_second_order=bool(inference)
+        ),
+      ))
+      return (
+        tuple(part1_mapping),
+        tuple(part2_mapping),
+        tuple(part3_mapping),
+        tuple(part1_batch_stats_mapping),
+        tuple(part2_batch_stats_mapping),
+        tuple(part3_batch_stats_mapping),
+      )
+
+    stem_conv_key = add_controlled("stem_conv", ConvStage(features=64, kernel_size=(7, 7), strides=(2, 2), conv_name="Conv_0"),
+                                   fast_path_kind="linear_controlled")
+    stem_bn_key = add_controlled("stem_bn", BatchNormStage(inference=inference, bn_name="BatchNorm_0"),
+                                 fast_path_kind="linear_controlled" if inference else None)
+    legacy_mapping.append(((stem_conv_key, ("Conv_0",)), (stem_bn_key, ("BatchNorm_0",))))
+    legacy_batch_stats_mapping.append(((stem_bn_key, ("BatchNorm_0",)),))
+    add_passive("stem_relu", ReluStage(), fast_path_kind="piecewise_linear_passive", passive_state_hessian="zero")
+    add_passive("stem_pool", MaxPoolStage(), passive_state_hessian="zero")
+    lqr_segment_descriptors.append(
+      make_lqr_segment_descriptor(
+        "stem",
+        ("stem_conv", "stem_bn", "stem_relu", "stem_pool"),
+        sample_separable_second_order=bool(inference),
+      )
+    )
+
+    block_id = 0
     for stage_idx, (planes, num_blocks) in enumerate(zip(STAGE_PLANES, STAGE_BLOCKS)):
-      # Downsample on the first block of stages 2/3/4 (i.e., not on the very first stage)
-      # Using v1.5: put stride on the 3×3 (BottleneckPart2).
       stride = 1 if stage_idx == 0 else 2
-
-      # First block in the stage (may downsample)
-      layers.append(BottleneckPart1(planes=planes, stride=1, inference=inference, expansion=EXPANSION))
-      layers.append(BottleneckPart2(planes=planes, stride=stride, inference=inference, expansion=EXPANSION))
-      layers.append(BottleneckPart3(planes=planes, stride=stride, inference=inference, expansion=EXPANSION))
-
-      # Remaining blocks in the stage (no downsampling)
+      bottleneck_mappings = append_bottleneck(f"block_{block_id}", planes, stride, True)
+      legacy_mapping.extend(bottleneck_mappings[:3])
+      legacy_batch_stats_mapping.extend(bottleneck_mappings[3:])
+      block_id += 1
       for _ in range(num_blocks - 1):
-        layers.append(BottleneckPart1(planes=planes, stride=1, inference=inference, expansion=EXPANSION))
-        layers.append(BottleneckPart2(planes=planes, stride=1, inference=inference, expansion=EXPANSION))
-        layers.append(BottleneckPart3(planes=planes, stride=1, inference=inference, expansion=EXPANSION))
+        bottleneck_mappings = append_bottleneck(f"block_{block_id}", planes, 1, False)
+        legacy_mapping.extend(bottleneck_mappings[:3])
+        legacy_batch_stats_mapping.extend(bottleneck_mappings[3:])
+        block_id += 1
 
-    # Head: Global Average Pool → Dense(num_classes) → log_softmax
-    layers.append(GPoolDenseLogSoftmax(num_classes))
+    head_key = add_controlled("head", GPoolDenseLogSoftmax(num_classes))
+    legacy_mapping.append(((head_key, None),))
+    lqr_segment_descriptors.append(
+      make_lqr_segment_descriptor("head", ("head",), sample_separable_second_order=bool(inference))
+    )
 
-    return EnhancedSequential(layers)
+    def migrate_legacy_checkpoint(loaded_params, loaded_batch_stats, init_params, init_batch_stats):
+      return (
+        _migrate_split_stage_tree(loaded_params, init_params, legacy_mapping),
+        _migrate_split_stage_tree(loaded_batch_stats, init_batch_stats, legacy_batch_stats_mapping),
+      )
+
+    model = EnhancedSequential(
+      layers,
+      stage_descriptors=tuple(stage_descriptors),
+      lqr_segment_descriptors=tuple(lqr_segment_descriptors),
+      legacy_checkpoint_migrator=migrate_legacy_checkpoint,
+    )
+    model.validate_stage_descriptors()
+    return model
 
   return inference_mode(False), inference_mode(True)

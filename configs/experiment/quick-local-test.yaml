@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - _default
+
+# Small local CPU smoke profile for quick setup validation.
+total_epochs: 22
+warm_start_precond: false
+block_structure: e-kfac

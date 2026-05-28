@@ -265,7 +265,10 @@ class TextData:
         self.merge = merge
 
     def __len__(self):
-        return int(self.data.shape[0] // self.tgt_len)
+        # Need one extra token for the next-token target, so only expose
+        # windows that can produce full-length (x, y) pairs.
+        usable = max(0, int(self.data.shape[0]) - 1)
+        return int(usable // self.tgt_len)
 
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         start = idx * self.tgt_len
@@ -283,7 +286,8 @@ class TextData:
 def make_epoch_factory(
         ds_obj: TextData,
         batch_size: int,
-        rng: Optional[np.random.Generator] = None
+        rng: Optional[np.random.Generator] = None,
+        drop_remainder: bool = False,
 ):
     """
     Yields batches shaped like your previous collate_fn:
@@ -303,6 +307,8 @@ def make_epoch_factory(
       # same batching / shapes as _batch_iterator
       for i in range(0, n, batch_size):
         idxs = order[i:i + batch_size]
+        if drop_remainder and idxs.shape[0] < batch_size:
+          break
         xs = []
         ys = []
         for k in idxs:
@@ -445,8 +451,12 @@ def wt103_loader(
     # 4) Build per-epoch factories
     rng = np.random.default_rng()  # or pass a seed from cfg if you want determinism
 
-    train_epoch_factory = make_epoch_factory(train_dataset, batch_size, rng=rng)
-    val_epoch_factory = make_epoch_factory(val_dataset, eval_batch_size or batch_size, rng=None)  # no shuffle for eval
+    train_epoch_factory = make_epoch_factory(
+      train_dataset, batch_size, rng=rng, drop_remainder=True
+    )
+    val_epoch_factory = make_epoch_factory(
+      val_dataset, eval_batch_size or batch_size, rng=None, drop_remainder=False
+    )  # no shuffle for eval
 
     # Train: infinite stream with per-epoch shuffling
     train_loader = LoaderAsJaxIterator(train_epoch_factory, prefetch=4, repeat=True)
@@ -462,6 +472,7 @@ def wt103_loader(
       "class_freqs": class_freqs,
       "num_classes": int(num_classes),
       "ds_size": int(len(train_dataset)),
+      "test_ds_size": int(len(val_dataset)),
       "input_shape": np.array([num_classes]),
       "output_shape": np.array([num_classes]),
       "tokenizer_type": "gpt2" if not basic_english_tokenizer else "basic_english",

@@ -4,19 +4,40 @@ eval_batch_size: null
 learning_rate: 0.1
 momentum: 0.9
 main_optimizer: sgd
+adam_betas: [0.9, 0.999]
 weight_decay: null
 wd_mask: null # list of parameters type to exclude from wd
 total_epochs: 250 # used to be total_steps: 97656
 label_smoothing: 0.0 # smoothing applied over cross-entropy labels
 test_eval_freq: 2000
+add_train_eval: false # Record additional metrics on raw train dataset (no augmentation) at the same freq as test_eval
+record_histograms: false # Record histogram over p(correct class) and per-sample NLL, for analysis purpose
 checkpoint_freq: 1000 # Snapshot of model and training for preemption handling
-logging_freq: 10 # Base logging freq for training losses etc. with aim
+logging_freq: 50 # Base logging freq for training losses etc. with aim
 report_freq: 200 # Frequency (in steps) at which current training progress is reported in CLI
 init_key: 42
 rng_seed: 123 # For dropout, etc.
 
+translation_eval:
+  enabled: false
+  freq: null # Null uses test_eval_freq; 0 disables periodic sampled BLEU.
+  max_examples: null # Cap periodic sampled BLEU; full BLEU ignores this.
+  full_eval_at_end: true
+  full_eval_freq: null # Positive integer enables periodic full BLEU/checkpoint selection.
+  progress_freq: 64
+  beam_size: 5
+  max_len_a: 1.2
+  max_len_b: 10
+  remove_bpe: "@@ "
+  detok: moses
+  print_samples: false
+  checkpoint_metric: bleu
+  maximize_checkpoint_metric: true
+
 update_preconditioner_every: 1000
 update_preconditioner_until: null
+precond_rank: null
+precond_identity_scaling: 1.0
 precond_steps: 50
 precond_batch_size: 64
 precond_lr: 0.001
@@ -28,12 +49,20 @@ normalize_grad_for_lqr: false
 normalize_conv_params: false
 allow_grad_inversion: false
 use_preconditioner: true
+measure_asymmetry: false
 
 divergence: ngd
 divergence_order_param: 0.5
 block_structure: diagonal
 block_structure_init: identity
 batch_solve_precond: true
+llqr_operator_mode: cached_exact # "cached_exact" | "lowmem_exact_k" | "lowmem_exact_full"
+llqr_checkpoint_policy: none # "none" | "dots_no_batch_dims"; only active for llqr_operator_mode="lowmem_exact_full"
+llqr_use_fast_paths: true # Optional exact active-stage shortcuts; passive structural zero-curvature stages stay exact-zero even when false
+llqr_batch_update_mode: full_batch # "full_batch" | "chunked_lqr_segment"
+llqr_batch_update_chunk_size: null # Positive integer only for "chunked_lqr_segment"; 128 is current A100-safe ResNet-50/ImageNet setting, precond_batch_size gives one outer chunk
+llqr_second_order_mode: batched_exact # "batched_exact" | "sample_separable_exact"
+llqr_second_order_chunk_size: null # Null for "batched_exact"; for "sample_separable_exact", null uses the current full batch/outer chunk, positive int chunks inner Q/M/M^T/R actions
 warm_start_precond: true
 multibatch_training: false
 damping: 0.0
@@ -42,3 +71,18 @@ ema_decay: 0.0 # EMA decay value for updating the preconditioner
 # Cluster options
 preempt_handling: false
 jobid: null  # To manually restart a previous job
+
+# SAM / Friendly-SAM training options
+sam_mode: null # "base_sam" | "base_fsam" | "past_fsam" | "asam" | "fisher_sam"
+start_sam_after_step: null # Null or 0 starts SAM immediately; positive int delays active SAM updates until step >= this threshold.
+perturbation_rho: 0.1
+asam_eta: 0.01 # Canonical ASAM stability offset on non-bias parameters.
+fisher_sam_eta: 0.1 # Canonical Fisher-SAM additive inverse-Fisher diagonal regularizer.
+sam_use_preconditioner_on_update: true # For non-null SAM modes other than canonical fisher_sam, keep the configured LLQR-backed outer update; false forces a vanilla outer update.
+perturb_mode: 'ema_grad' # "ema_grad" | "ema_precond_grad" | "ema_direction"
+norm_mode: euclidean # "euclidean" | "matrix_norm" | "layer_matrix_norm" | "layer_euclidean"
+sam_research_base_vector_source: current_gradient # Research/ablation only; "current_gradient" | "main_optimizer_momentum" | "random_direction". Neutral default preserves current training behavior.
+sam_research_perturb_sign: ascent # Research/ablation only; "ascent" | "descent". Not part of the final training pipeline.
+gbar_beta: 0.9
+gbar_eps: 1e-12
+batch_overlap_fraction: 0.0 #Roll-out strategy over minibatches, for past_fsam

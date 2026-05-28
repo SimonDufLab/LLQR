@@ -1,5 +1,6 @@
 defaults:
   - _self_
+  - /perturbation_rho_scheduler: constant
   - experiment: _default
 
 logging:

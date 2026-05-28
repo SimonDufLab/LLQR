@@ -1,0 +1,4 @@
+name: pyramidnet-110
+
+activation: relu
+size: null

@@ -1,0 +1,13 @@
+name: iwslt14_de_en
+loader: local_seq2seq_text
+
+dataset_dir: ${oc.env:IWSLT14_DATA_DIR,./data/iwslt14.tokenized.de-en}
+numeric_cache_dir: null
+source_lang: de
+target_lang: en
+max_tokens: 4096
+padding_factor: 8
+train_shape_bucket_mode: percentile
+train_shape_bucket_count: 8
+prefetch: 4
+eval_prefetch: 2
